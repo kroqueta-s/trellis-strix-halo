@@ -6,12 +6,12 @@
 1. `pyvista.decimate(0.95)`（面を 5% まで間引く）
 2. `_fill_holes`：**多視点ラスタライズ → 面ごとの可視率 → min-cut → 小さな穴埋め**
 
-**ここでは 2 だけを、上流のコードをそのまま呼んで実行する。**
+**ここでは 2 だけを、手順と閾値をそのままに実行する**（実装は `fill_holes.py`）。
 1 の間引きは掛けない。上流は色付き GLB を出すのが目的で面数を削るが、こちらは
 下流（`forge`）が実寸化と修復をする前提の素材なので、細部を捨てる理由が無い。
 
-足りないのは `nvdiffrast`（CUDA 専用）のラスタライザだけなので、`raster.install()` で
-`utils3d.torch` の該当関数を差し替えてから呼ぶ。**ベンダーコードは書き換えていない。**
+足りない `nvdiffrast` のラスタライザは `raster.install()` で差し替える。
+**ベンダーコードは書き換えていない。**
 
 ## 上流に無い処理を 1 つだけ足している
 
@@ -81,7 +81,13 @@ def fill_holes(
     progress: Callable[[str, str], None] | None = None,
     stats: CleanStats | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """**上流の `postprocess_mesh` をそのまま呼ぶ**（間引きは掛けない）。
+    """見えない面を切り、小さな穴を塞ぐ（**手順と閾値は上流のまま**）。
+
+    実装は `fill_holes.py` にある。上流の関数をそのまま呼ばずに書き写したのは、
+    **上流の Python 側に病的な無駄が 1 つあり、本機ではそこが支配的だった**ため
+    （CUDA テンソルを 1 要素ずつ走査して 36 万回の GPU 読み出し＝35 秒）。
+    **アルゴリズムも閾値も変えていない**ことは `tests/test_fill_holes.py` が
+    上流と 1 対 1 で突き合わせて確かめている。
 
     Args:
         vertices: `[V, 3]`。
@@ -95,30 +101,21 @@ def fill_holes(
     """
     import time
 
-    repo = str(config.TRELLIS_REPO)
-    if repo not in sys.path:
-        sys.path.insert(0, repo)
+    from . import fill_holes as impl
 
+    impl.ensure_upstream_on_path(str(config.TRELLIS_REPO))
     started = time.perf_counter()
     before = len(faces)
     try:
-        # **`trellis` を import する前にシムを揃える。** 生成を通らずに後処理だけを
-        # 呼ぶ道（既存のメッシュへ掛け直すとき）もあるので、ここでも念のため入れる。
         if "trellis" not in sys.modules:
             shims.install(head_chunk=config.ATTN_HEAD_CHUNK)
-        # nvdiffrast は本機に無い。**触ったら落ちる殻**を置いてから import する
-        # （`postprocessing_utils` は先頭で import するが、使うのはテクスチャ焼き込みだけ）。
         shims.install_absent_nvdiffrast()
         raster.install()
-        from trellis.utils import postprocessing_utils
 
-        _say(
-            progress,
-            "fill_holes",
-            f"見えない面を落とす（{config.FILL_HOLES_VIEWS} 視点 / "
-            f"{config.FILL_HOLES_RESOLUTION}^2・面 {before:,}・上流の実装）",
-        )
-        # **上流の関数は中で数十秒〜数分黙る。** 心拍を出しておかないと
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        v = torch.tensor(vertices, dtype=torch.float32, device=device)
+        f = torch.tensor(faces, dtype=torch.int32, device=device)
+        # **上流の関数は中で数十秒黙る。** 心拍を出しておかないと
         # 「進んでいるのか止まっているのか」が外から分からない（T0 の方針）。
         from .pipeline import _DeviceWatch
 
@@ -128,18 +125,21 @@ def fill_holes(
             heartbeat_sec=config.HEARTBEAT_SEC,
             limit_gb=config.VRAM_LIMIT_GB,
         ):
-            vertices, faces = postprocessing_utils.postprocess_mesh(
-                vertices,
-                faces,
-                simplify=False,  # **間引かない**（下流が実寸化するので細部を残す）
-                fill_holes=True,
-                fill_holes_max_hole_size=config.FILL_HOLES_MAX_SIZE,
-                fill_holes_max_hole_nbe=config.FILL_HOLES_MAX_NBE,
-                fill_holes_resolution=config.FILL_HOLES_RESOLUTION,
-                fill_holes_num_views=config.FILL_HOLES_VIEWS,
+            v, f = impl.fill_holes(
+                v,
+                f,
+                max_hole_size=config.FILL_HOLES_MAX_SIZE,
+                max_hole_nbe=config.FILL_HOLES_MAX_NBE,
+                resolution=config.FILL_HOLES_RESOLUTION,
+                num_views=config.FILL_HOLES_VIEWS,
+                progress=progress,
             )
+        vertices = v.cpu().numpy()
+        faces = f.cpu().numpy()
     except Exception as exc:  # noqa: BLE001 - 後処理の失敗で生成を落とさない
-        message = f"上流の後処理に失敗した（メッシュはそのまま返す）: {type(exc).__name__}: {exc}"
+        message = (
+            f"見えない面の除去に失敗した（メッシュはそのまま返す）: {type(exc).__name__}: {exc}"
+        )
         print(f"[postprocess] {message}", file=sys.stderr)
         if stats is not None:
             stats.warnings.append(message)
