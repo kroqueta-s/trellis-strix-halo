@@ -1,5 +1,5 @@
-[project]
-name = "hearth"
+﻿[project]
+name = "trellis-strix-halo"
 version = "0.0.0"
 description = "TRELLIS runner for AMD Strix Halo (gfx1151) on Windows ROCm"
 requires-python = ">=3.12"

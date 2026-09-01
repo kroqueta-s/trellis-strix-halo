@@ -92,9 +92,13 @@ if (-not (Test-Path $envPath)) {
 Write-Host "==> Verifying the shims (exact agreement with dense reference)"
 & $py (Join-Path $repo "tests\test_shims.py")
 & $py (Join-Path $repo "tests\test_raster.py")
+& $py (Join-Path $repo "tests\test_drop_parts.py")
 
 Write-Host ""
-Write-Host "Done. Point hearth at this checkout:"
+Write-Host "Done. Generate a first mesh with:"
+Write-Host "  $py $repo\tools\run_single.py --image $repo\assets\sample.png --out $Root\out"
+Write-Host ""
+Write-Host "Or point hearth at this checkout:"
 Write-Host "  HEARTH_RUNNER_TRELLIS_PYTHON=$py"
 Write-Host "  HEARTH_RUNNER_TRELLIS_MODULE=runners.trellis"
 Write-Host "  HEARTH_RUNNER_TRELLIS_CWD=$repo"
