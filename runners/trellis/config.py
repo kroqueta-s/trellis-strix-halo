@@ -97,3 +97,9 @@ FILL_HOLES_MAX_NBE: int = _int("TRELLIS_FILL_HOLES_MAX_NBE", 250)
 # 成分の外接箱の最長辺が全体の何割未満なら捨てるか。0 で無効。
 # 実測では 10% で腕と手（15%）は残り、目に見える破片（6.5% 以下）が消えた。
 DROP_SMALL_PARTS: float = _float("TRELLIS_DROP_SMALL_PARTS", 0.10)
+
+# **これも上流に無い追加。** 外接箱の最短辺が全体の最長辺のこの比未満の分離成分
+# （＝紙のような薄片）を落とす。表面から約 1% 浮いた薄片は長さが 11〜29% あるので
+# DROP_SMALL_PARTS だけでは素通りする。実測：薄片は厚み 1.4% 以下・正当な部品は
+# 11.8% 以上（2026-09-02）。0 で無効。
+DROP_THIN_PARTS: float = _float("TRELLIS_DROP_THIN_PARTS", 0.02)
