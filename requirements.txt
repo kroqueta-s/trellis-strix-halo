@@ -1,0 +1,26 @@
+# Pure-python dependencies only. **No CUDA-only package appears here.**
+# spconv / flash-attn / xformers / kaolin / nvdiffrast are replaced at launch
+# time by the shims in runners/trellis/ (see shims.py and raster.py).
+#
+# Versions are the ones this was verified with on 2026-09-01.
+tqdm==4.70.0
+easydict==1.13
+scipy==1.18.1
+trimesh==5.1.0
+transformers==5.16.1
+safetensors==0.8.0
+huggingface_hub==1.29.0
+imageio==2.37.4
+opencv-python-headless==5.0.0.93
+einops==0.8.2
+plyfile==1.1.5
+rembg==2.0.81
+onnxruntime==1.29.0
+python-dotenv==1.2.3
+utils3d @ git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
+
+# Used by the upstream postprocessing that this runner calls (fill_holes).
+pyvista==0.48.4
+pymeshfix==0.18.1
+igraph==1.0.0
+xatlas==0.0.11

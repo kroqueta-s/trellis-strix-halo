@@ -1,0 +1,139 @@
+# SPDX-License-Identifier: MIT
+"""メッシュを PNG にする（**運用者は画面を見ていないので、目視確認は画像で渡す**）。
+
+OpenGL も外部レンダラも使わない。点群スプラッティング＋Z バッファだけの
+素朴な実装で、numpy と trimesh しか要らない（GPU も要らない）。
+形が出ているか・穴が空いていないかを人が見るための道具である。
+
+実行例:
+
+    python tools/render_mesh.py mesh.ply out.png --views 4 --size 512
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import numpy as np
+import trimesh
+from PIL import Image
+
+
+def _vertex_normals(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """面法線を頂点へ集めて正規化する。"""
+    normals = np.zeros_like(verts)
+    tri = verts[faces]
+    face_n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    for i in range(3):
+        np.add.at(normals, faces[:, i], face_n)
+    length = np.linalg.norm(normals, axis=1, keepdims=True)
+    return normals / np.maximum(length, 1e-12)
+
+
+def _rotation(yaw: float, pitch: float) -> np.ndarray:
+    """Y 軸まわり → X 軸まわりの回転行列。"""
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    cx, sx = np.cos(pitch), np.sin(pitch)
+    ry = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]])
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]])
+    return rx @ ry
+
+
+def _render_one(
+    verts: np.ndarray, normals: np.ndarray, size: int, yaw: float, pitch: float, splat: int
+) -> np.ndarray:
+    """1 視点を描く。正射影・Z バッファ・Lambert のフラットシェーディング。"""
+    rot = _rotation(yaw, pitch)
+    p = verts @ rot.T
+    n = normals @ rot.T
+
+    margin = 0.08
+    scale = (size * (1.0 - 2.0 * margin)) / 2.0
+    px = np.clip((p[:, 0] * scale + size / 2.0).astype(np.int32), 0, size - 1)
+    py = np.clip((-p[:, 1] * scale + size / 2.0).astype(np.int32), 0, size - 1)
+    depth = p[:, 2]
+
+    light = np.array([0.4, 0.6, 1.0])
+    light /= np.linalg.norm(light)
+    shade = np.clip(n @ light, 0.0, 1.0) * 0.75 + 0.25
+
+    zbuf = np.full((size, size), -np.inf, dtype=np.float64)
+    img = np.zeros((size, size), dtype=np.float64)
+    # 手前のものが勝つように、奥から順に書く（同じ画素は後勝ちでよい）。
+    order = np.argsort(depth)
+    for dy in range(-splat, splat + 1):
+        for dx in range(-splat, splat + 1):
+            ys = np.clip(py[order] + dy, 0, size - 1)
+            xs = np.clip(px[order] + dx, 0, size - 1)
+            zs = depth[order]
+            keep = zs > zbuf[ys, xs]
+            zbuf[ys[keep], xs[keep]] = zs[keep]
+            img[ys[keep], xs[keep]] = shade[order][keep]
+    return img
+
+
+def render(
+    mesh_path: Path,
+    out_path: Path,
+    size: int = 512,
+    views: int = 4,
+    splat: int = 1,
+    rotx: float = 0.0,
+    largest_only: bool = False,
+) -> None:
+    """メッシュを複数視点で描いて 1 枚の PNG にまとめる。
+
+    Args:
+        rotx: 描く前に X 軸まわりへ回す角度（度）。モデルごとに上方向の約束が違うため。
+        largest_only: 真なら**最大の連結成分だけ**を描く。
+            浮いている破片が「実体か、点描のノイズか」を切り分けるために使う。
+    """
+    mesh = trimesh.load(mesh_path, process=False)
+    if largest_only:
+        parts = mesh.split(only_watertight=False)
+        if len(parts):
+            mesh = max(parts, key=lambda p: len(p.faces))
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    if rotx:
+        verts = verts @ _rotation(0.0, np.deg2rad(rotx)).T
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    center = (verts.min(0) + verts.max(0)) / 2.0
+    verts = verts - center
+    radius = np.abs(verts).max()
+    verts = verts / max(radius, 1e-12)
+    normals = _vertex_normals(verts, faces)
+
+    angles = [(i * 2.0 * np.pi / views, np.deg2rad(15.0)) for i in range(views)]
+    tiles = [_render_one(verts, normals, size, yaw, pitch, splat) for yaw, pitch in angles]
+    strip = np.concatenate(tiles, axis=1)
+    Image.fromarray((strip * 255).astype(np.uint8)).save(out_path)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="メッシュを PNG にする")
+    parser.add_argument("mesh")
+    parser.add_argument("out")
+    parser.add_argument("--size", type=int, default=512)
+    parser.add_argument("--views", type=int, default=4)
+    parser.add_argument("--splat", type=int, default=1)
+    parser.add_argument("--rotx", type=float, default=0.0)
+    parser.add_argument(
+        "--largest-only", action="store_true", help="最大の連結成分だけを描く"
+    )
+    args = parser.parse_args()
+    render(
+        Path(args.mesh),
+        Path(args.out),
+        args.size,
+        args.views,
+        args.splat,
+        args.rotx,
+        args.largest_only,
+    )
+    print(f"wrote {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

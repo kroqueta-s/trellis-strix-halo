@@ -1,0 +1,17 @@
+[project]
+name = "hearth"
+version = "0.0.0"
+description = "ローカル 3D 生成モデルの管理と VRAM の監督（Blender アドオンから操作する）"
+requires-python = ">=3.12"
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "ANN"]
+ignore = ["ANN401"]
