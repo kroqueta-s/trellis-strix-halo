@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any, TextIO
 
-from . import config
+from . import config, gfxlight
 
 # **torch より先に置かないと効かない**（後から os.environ へ入れても無視される）。
 # 立てると gfx1151 で flash / mem-efficient が使えるようになり、実測で 10〜20 倍速い。
@@ -237,8 +237,16 @@ def main() -> int:
         def progress(stage: str, message: str = "", _id: int = request_id) -> None:
             emit(out, {"id": _id, "event": "progress", "stage": stage, "message": message})
 
+        # **3D の常夜灯**（gfxlight.py）。compute だけだとドライバがクロックを上げない。
+        light: gfxlight.GfxLight | None = None
+        if method_name == "image_to_mesh" and config.GFX_KEEPALIVE:
+            light = gfxlight.GfxLight()
+            light.start()
         try:
             result = method(dict(request.get("params") or {}), progress)
+            if light is not None and isinstance(result.get("metrics"), dict):
+                # 生成の終わりまで点いていたか。False なら効いていない可能性がある。
+                result["metrics"]["gfx_keepalive"] = light.is_lit()
             emit(out, {"id": request_id, "event": "result", "result": result})
         except Exception as exc:  # noqa: BLE001 - 何が来ても応答を返しきる
             import traceback
@@ -252,6 +260,9 @@ def main() -> int:
                     "error": {"type": type(exc).__name__, "message": str(exc)},
                 },
             )
+        finally:
+            if light is not None:
+                light.stop()
 
     print(f"[{NAME}] ランナーを終了する。", file=sys.stderr)
     return 0
