@@ -66,18 +66,28 @@ Write-Host "==> Installing ROCm PyTorch"
     "torch==$TorchVersion" "torchvision==$TorchvisionVersion"
 
 # 3. Upstream repository (never forked, never patched) ------------------------
+# git reports progress on stderr. Under output redirection, PowerShell 5.1
+# turns native stderr into error records, and ErrorActionPreference=Stop would
+# kill the script on the first progress line - so git runs with it relaxed and
+# its exit code is checked instead.
+$ErrorActionPreference = "Continue"
 if (-not (Test-Path $upstream)) {
     Write-Host "==> Cloning upstream TRELLIS"
-    # A shallow clone: the full TRELLIS history in particular is so large that
-    # the server-side pack preparation can stall for many minutes. The pinned
-    # commit is fetched right below, also shallow.
-    git clone --depth 1 $UpstreamUrl $upstream
+    # A shallow clone: a full history (TRELLIS in particular) can stall for
+    # minutes in server-side pack preparation. The pinned commit is fetched
+    # right below, also shallow.
+    git clone --depth 1 $UpstreamUrl $upstream 2>&1 | Out-Host
+    if ($LASTEXITCODE) { throw "git clone failed ($LASTEXITCODE)" }
 }
 Push-Location $upstream
-git fetch --depth 1 origin $UpstreamCommit
-git checkout $UpstreamCommit
-git submodule update --init --recursive
+git fetch --depth 1 origin $UpstreamCommit 2>&1 | Out-Host
+if ($LASTEXITCODE) { Pop-Location; throw "git fetch failed ($LASTEXITCODE)" }
+git checkout $UpstreamCommit 2>&1 | Out-Host
+if ($LASTEXITCODE) { Pop-Location; throw "git checkout failed ($LASTEXITCODE)" }
+git submodule update --init --recursive 2>&1 | Out-Host
+if ($LASTEXITCODE) { Pop-Location; throw "git submodule update failed ($LASTEXITCODE)" }
 Pop-Location
+$ErrorActionPreference = "Stop"
 
 # 4. Pure-python dependencies -------------------------------------------------
 Write-Host "==> Installing dependencies"
