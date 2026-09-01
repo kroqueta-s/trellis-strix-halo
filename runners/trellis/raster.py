@@ -1,26 +1,32 @@
 # SPDX-License-Identifier: MIT
-"""`utils3d.torch` のラスタライザを **torch の Z バッファ**で置き換える。
+"""Replace the `utils3d.torch` rasterizer with **a z-buffer written in torch**.
 
-上流 TRELLIS の後処理（`trellis/utils/postprocessing_utils.py` の `_fill_holes`）は、
-**多視点からラスタライズして面ごとの可視率を出し**、可視率 0 の面を min-cut で切る。
-これが「内側に閉じ込められた殻」を落とす本家の手法である。**大きさでは切っていない。**
+Upstream TRELLIS's post-processing (`_fill_holes` in
+`trellis/utils/postprocessing_utils.py`) **rasterizes from many viewpoints to
+get a visibility ratio per face** and min-cuts away the faces with a ratio of
+zero. That is upstream's way of removing shells sealed inside the model.
+**It never cuts by size.**
 
-そのラスタライズだけが `nvdiffrast`（CUDA 専用）に依存していて本機では使えない。
-ここを差し替えれば、**上流の `postprocess_mesh` を 1 行も書き換えずに実行できる。**
+Only that rasterization depends on `nvdiffrast` (CUDA only), which is
+unavailable here. Replacing it means **upstream's `postprocess_mesh` runs
+without a single line being modified.**
 
-## 実装の方針：**近似せずに三角形を塗る**
+## The approach: **fill triangles exactly, do not approximate**
 
-最初は「三角形の上に標本点をばら撒いて Z バッファに載せる」実装にしたが、
-`tests/test_raster.py` が**大きな三角形で破綻すること**を捕まえた。
-標本の隙間から奥の面が漏れて、**箱の中に隠した箱が「見えた」ことになってしまう**。
-可視率 0 を内側の面の判定に使う以上、そこが狂うと本家の仕組みが働かない。
+The first implementation scattered sample points over each triangle and pushed
+them into a z-buffer. `tests/test_raster.py` caught it **breaking down on large
+triangles**: geometry behind leaked through the gaps between samples, so **a box
+hidden inside a box counted as "visible"**. Since a zero visibility ratio is what
+identifies interior faces, upstream's mechanism stops working when that is wrong.
 
-そこで、画素の中心が三角形の内側かを**辺関数の符号で厳密に判定**する。
-三角形ごとの画面上の外接矩形の大きさで束に分け、束ごとに `K×K` の格子を
-まとめて評価する。**この機のメッシュは面がほぼ画素以下**（解像度 256 の格子から出た
-100 万面を 1024² へ落とす）なので、ほとんどの束は `K=1`、すなわち 1 画素の判定で済む。
+So a pixel centre is tested against the triangle **exactly, by the sign of the
+edge functions**. Triangles are bucketed by the size of their screen-space
+bounding box, and each bucket evaluates a `K x K` grid in one go. **Faces on this
+machine are mostly sub-pixel** (a million faces from a resolution-256 grid, drawn
+at 1024^2), so most buckets are `K=1`: a single pixel test.
 
-深度は画面空間の重心座標で線形に補間する（NDC の z は画面空間で線形なので、これが正しい）。
+Depth is interpolated linearly in screen-space barycentrics, which is correct
+because NDC z is linear in screen space.
 """
 
 from __future__ import annotations
@@ -29,20 +35,21 @@ from typing import Any
 
 import torch
 
-# 1 度に評価する「三角形 × 画素」の数の上限。VRAM ピークを決める。
+# Cap on triangle-times-pixel tests evaluated at once. This sets the VRAM peak.
 TILE_BUDGET = 16_000_000
 
-# 深度を詰める幅（ビット）。下位 32 ビットは面の番号に使う。
+# Bits used to pack the depth. The low 32 bits hold the face index.
 _DEPTH_BITS = 21
 _FACE_BITS = 32
 _EMPTY = (1 << 62) - 1
 
 
 class RastContext:
-    """`utils3d.torch.RastContext` の代役。**状態を持たない。**
+    """Stand-in for `utils3d.torch.RastContext`. **It holds no state.**
 
-    本家は nvdiffrast の GL / CUDA コンテキストを抱えるが、こちらは純 torch なので
-    持つものが無い。引数は受け取って捨てる（呼び出し側を変えないため）。
+    Upstream carries an nvdiffrast GL or CUDA context; this implementation is
+    pure torch and has nothing to hold. Arguments are accepted and discarded, so
+    that callers need no change.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -52,17 +59,19 @@ class RastContext:
 def _rasterize(
     screen: torch.Tensor, depth: torch.Tensor, keep: torch.Tensor, width: int, height: int
 ) -> torch.Tensor:
-    """画面座標の三角形を Z バッファへ塗り、画素ごとの詰めた鍵を返す。
+    """Fill screen-space triangles into a z-buffer and return the packed key per pixel.
 
     Args:
-        screen: `[F, 3, 2]` の画面座標（画素単位）。
-        depth: `[F, 3]` の NDC の z（-1 が手前・1 が奥）。
-        keep: `[F]` の真偽。偽の面は捨てる（近平面より手前など）。
-        width: 幅。
-        height: 高さ。
+        screen: `[F, 3, 2]` screen coordinates, in pixels.
+        depth: `[F, 3]` NDC z (-1 near, 1 far).
+        keep: `[F]` booleans; false faces are discarded (in front of the near
+            plane, for instance).
+        width: Width.
+        height: Height.
 
     Returns:
-        `[H*W]` の `int64`。上位に深度、下位に面の番号。空の画素は `_EMPTY`。
+        `[H*W]` of `int64`, depth in the high bits and face index in the low
+        bits. Empty pixels hold `_EMPTY`.
     """
     device = screen.device
     buffer = torch.full((height * width,), _EMPTY, dtype=torch.int64, device=device)
@@ -80,7 +89,7 @@ def _rasterize(
     span = torch.maximum(x1 - x0, y1 - y0) + 1  # [f]
 
     depth_scale = float((1 << _DEPTH_BITS) - 1)
-    # 外接矩形の大きさを 2 の冪へ丸めて束にする。**ほとんどは 1 画素。**
+    # Bucket by bounding-box size rounded up to a power of two. **Mostly 1 pixel.**
     bucket = torch.pow(2, torch.ceil(torch.log2(span.float().clamp(min=1.0)))).long()
     for size in torch.unique(bucket).tolist():
         sel = torch.nonzero(bucket == size, as_tuple=False).squeeze(1)
@@ -100,7 +109,7 @@ def _rasterize(
             ax, ay = v[:, 0, 0][:, None, None], v[:, 0, 1][:, None, None]
             bx, by = v[:, 1, 0][:, None, None], v[:, 1, 1][:, None, None]
             cx, cy = v[:, 2, 0][:, None, None], v[:, 2, 1][:, None, None]
-            # 辺関数。3 つとも面積と同じ符号なら内側。
+            # Edge functions: inside when all three share the sign of the area.
             w0 = (cx - bx) * (sy - by) - (cy - by) * (sx - bx)
             w1 = (ax - cx) * (sy - cy) - (ay - cy) * (sx - cx)
             w2 = (bx - ax) * (sy - ay) - (by - ay) * (sx - ax)
@@ -125,7 +134,7 @@ def _rasterize(
             pixel = (py * width + px)[inside]
             depth_q = (((zz.clamp(-1.0, 1.0) + 1.0) * 0.5) * depth_scale).long()[inside]
             face_idx = faces_here[:, None, None].expand(shape)[inside]
-            # 深度を上位へ、面の番号を下位へ詰めて **最小値をとれば最前面が勝つ**。
+            # Depth high, face index low, so **taking the minimum wins the front face**.
             key = (depth_q << _FACE_BITS) | face_idx
             buffer.scatter_reduce_(0, pixel, key, reduce="amin")
     return buffer
@@ -146,30 +155,33 @@ def rasterize_triangle_faces(
     antialiasing: bool | list[int] = True,
     diff_attrs: list[int] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """面 ID バッファを返す（`_fill_holes` が使うのは `face_id` と `mask` だけ）。
+    """Return the face-ID buffer (`_fill_holes` uses only `face_id` and `mask`).
 
     Args:
-        ctx: 使わない（本家と引数を揃えるためだけに受ける）。
-        vertices: `[B, N, 3 or 4]`。**B は 1 のみ対応**（`_fill_holes` は 1 視点ずつ呼ぶ）。
-        faces: `[F, 3]`。
-        width: 出力の幅。
-        height: 出力の高さ。
-        view: `[4, 4]` のビュー行列。
-        projection: `[4, 4]` の射影行列。
+        ctx: Unused; accepted only to match upstream's signature.
+        vertices: `[B, N, 3 or 4]`. **Only B = 1 is supported**, since
+            `_fill_holes` calls one view at a time.
+        faces: `[F, 3]`.
+        width: Output width.
+        height: Output height.
+        view: `[4, 4]` view matrix.
+        projection: `[4, 4]` projection matrix.
 
     Returns:
-        `face_id`（`[1, H, W]`・**1 始まり。0 は背景**）／`mask`（`[1, H, W]` の float）／
-        `depth`（`[1, H, W]`・0 が手前で 1 が奥）。
+        `face_id` (`[1, H, W]`, **one-based; 0 is background**), `mask`
+        (`[1, H, W]` float) and `depth` (`[1, H, W]`, 0 near and 1 far).
 
     Raises:
-        NotImplementedError: 属性やテクスチャの補間を求められたとき（この経路では来ない）。
+        NotImplementedError: If attribute or texture interpolation is requested,
+            which never happens on this path.
     """
     if attr is not None or uv is not None or texture is not None:
         raise NotImplementedError(
-            "この代役は面 ID しか出せない（属性やテクスチャの補間は nvdiffrast が要る）"
+            "this stand-in produces face IDs only "
+            "(attribute and texture interpolation need nvdiffrast)"
         )
     if vertices.ndim != 3 or vertices.shape[0] != 1:
-        raise NotImplementedError(f"バッチは 1 のみ対応: {tuple(vertices.shape)}")
+        raise NotImplementedError(f"only a batch of 1 is supported: {tuple(vertices.shape)}")
 
     device = vertices.device
     verts = vertices[0].float()
@@ -187,8 +199,9 @@ def rasterize_triangle_faces(
     idx = faces.long()
     tri_clip = pos_clip[idx]  # [F, 3, 4]
     w = tri_clip[..., 3]
-    # **近平面より手前へ回り込む三角形は捨てる。** 割り算が破綻するため。
-    # `_fill_holes` の視点は半径 2・近平面 1 で対象を外から見るので、実際には現れない。
+    # **Discard triangles that wrap in front of the near plane**, where the
+    # division breaks down. `_fill_holes` views the subject from outside at
+    # radius 2 with a near plane of 1, so they never actually occur.
     keep = (w > 1e-6).all(dim=1)
     inv_w = 1.0 / w.clamp(min=1e-6)
     ndc = tri_clip[..., :3] * inv_w.unsqueeze(-1)
@@ -212,10 +225,11 @@ def rasterize_triangle_faces(
 
 
 def install() -> None:
-    """`utils3d.torch` のラスタライザを差し替える。
+    """Replace the `utils3d.torch` rasterizer.
 
-    **`postprocessing_utils` を import する前に呼ぶこと。** あちらは
-    `utils3d.torch.RastContext(...)` と属性で引くので、モジュールの属性を差し替えれば効く。
+    **Call this before importing `postprocessing_utils`.** That module reaches
+    for `utils3d.torch.RastContext(...)` by attribute, so replacing the module
+    attributes is enough.
     """
     import utils3d.torch as u3t
 

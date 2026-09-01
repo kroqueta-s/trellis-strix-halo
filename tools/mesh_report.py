@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
-"""メッシュの健全性を数値で出す（**見た目の印象を数字で裏取りするための道具**）。
+"""Report mesh health as numbers (**to back up visual impressions with data**).
 
-測るのは 3 つ：**連結成分**（浮いている破片）・**境界ループ**（穴）・寸法。
-**これまでのチェックは連結成分と穴を見ておらず、破片と穴を素通しさせた。**
-描画の点描（`tools/render_mesh.py` は点をばら撒くので、輪郭がまばらだと
-小さな白い塊に見えることがある）と、**本当に浮いている破片**は別物である。
+Three things are measured: **connected components** (free-floating debris),
+**boundary loops** (holes), and dimensions. **Earlier checks looked at neither
+components nor holes, so debris and holes passed straight through.** Stippling
+in a render (`tools/render_mesh.py` scatters points, so a sparse silhouette can
+look like a small white blob) and **actual free-floating debris** are different
+things.
 
-実行例::
+Example::
 
     python tools/mesh_report.py mesh.ply [mesh2.ply ...]
 """
@@ -22,10 +24,11 @@ import trimesh
 
 
 def boundary_loops(mesh: trimesh.Trimesh) -> list[dict[str, object]]:
-    """境界辺（面が 1 枚しか接していない辺）をループごとにまとめる。
+    """Group boundary edges (edges with exactly one adjacent face) into loops.
 
-    **穴が「1 か所の大きな口」なのか「細かい割れの散らばり」なのかで手当てが変わる。**
-    数だけ見ても判断できないので、ループごとの大きさと位置まで出す。
+    **The fix differs depending on whether a hole is one large opening or a
+    scatter of small cracks.** A count alone cannot tell them apart, so the size
+    and position of every loop are reported as well.
     """
     edges = mesh.edges_sorted
     uniq, counts = np.unique(edges, axis=0, return_counts=True)
@@ -64,7 +67,7 @@ def boundary_loops(mesh: trimesh.Trimesh) -> list[dict[str, object]]:
 
 
 def report(path: Path, top: int = 8) -> dict[str, object]:
-    """1 個のメッシュを調べて表示し、要点を返す。"""
+    """Inspect one mesh, print the findings, and return the summary."""
     mesh = trimesh.load(path, process=False)
     extents = mesh.bounding_box.extents
     parts = mesh.split(only_watertight=False)
@@ -72,34 +75,36 @@ def report(path: Path, top: int = 8) -> dict[str, object]:
     order = np.argsort(sizes)[::-1]
 
     print(f"\n=== {path.name} ===")
-    print(f"  頂点 {len(mesh.vertices):,} / 面 {len(mesh.faces):,}")
-    print(f"  watertight={mesh.is_watertight}  外形={np.round(extents, 4).tolist()}")
-    print(f"  連結成分 {len(parts)} 個")
+    print(f"  vertices {len(mesh.vertices):,} / faces {len(mesh.faces):,}")
+    print(f"  watertight={mesh.is_watertight}  extents={np.round(extents, 4).tolist()}")
+    print(f"  connected components: {len(parts)}")
 
     main_faces = int(sizes[order[0]]) if len(parts) else 0
     stray = int(sizes.sum() - main_faces)
-    print(f"  最大の成分が全体の {main_faces / max(len(mesh.faces), 1) * 100:.2f}%")
-    print(f"  それ以外の面数 {stray:,}（{stray / max(len(mesh.faces), 1) * 100:.2f}%）")
+    print(f"  largest component holds {main_faces / max(len(mesh.faces), 1) * 100:.2f}% of faces")
+    print(f"  faces outside it: {stray:,} ({stray / max(len(mesh.faces), 1) * 100:.2f}%)")
 
     loops = boundary_loops(mesh)
     if loops:
         stray_edges = sum(int(loop["verts"]) for loop in loops)
-        print(f"  境界ループ {len(loops)} 本（境界の頂点 {stray_edges}）")
+        print(f"  boundary loops: {len(loops)} (boundary vertices {stray_edges})")
         for loop in loops[:top]:
             print(
-                f"    頂点 {loop['verts']:>5}  大きさ {loop['extent']}  "
-                f"最長辺が全体の {float(loop['ratio']) * 100:6.2f}%  中心 {loop['center']}"
+                f"    vertices {loop['verts']:>5}  size {loop['extent']}  "
+                f"longest edge is {float(loop['ratio']) * 100:6.2f}% of the model  "
+                f"center {loop['center']}"
             )
     else:
-        print("  境界ループ 0 本（穴なし）")
+        print("  boundary loops: 0 (no holes)")
 
     for rank, i in enumerate(order[: min(top, len(parts))]):
         part = parts[i]
         size = part.bounding_box.extents
         longest = float(np.max(size)) / float(np.max(extents))
         print(
-            f"    #{rank + 1}: 面 {len(part.faces):>8,}  "
-            f"最長辺が全体の {longest * 100:6.2f}%  中心 {np.round(part.centroid, 3).tolist()}"
+            f"    #{rank + 1}: faces {len(part.faces):>8,}  "
+            f"longest edge is {longest * 100:6.2f}% of the model  "
+            f"center {np.round(part.centroid, 3).tolist()}"
         )
     return {
         "path": str(path),
@@ -111,7 +116,7 @@ def report(path: Path, top: int = 8) -> dict[str, object]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="メッシュの連結成分を調べる")
+    parser = argparse.ArgumentParser(description="Inspect the connected components of a mesh")
     parser.add_argument("meshes", nargs="+")
     parser.add_argument("--top", type=int, default=8)
     args = parser.parse_args()

@@ -1,2 +1,2 @@
 # SPDX-License-Identifier: MIT
-"""TRELLIS のランナー。**このプロセスだけが torch を持つ。**"""
+"""The TRELLIS runner. **This process is the only one that holds torch.**"""

@@ -1,31 +1,33 @@
 # SPDX-License-Identifier: MIT
-"""上流 TRELLIS の `_fill_holes` を、**手順と閾値をそのままに**書き写した実装。
+"""Upstream TRELLIS's `_fill_holes`, transcribed **with its procedure and thresholds intact**.
 
-## なぜ書き写したのか（**独自のアルゴリズムにしたわけではない**）
+## Why it was transcribed (**this is not a different algorithm**)
 
-上流の `trellis/utils/postprocessing_utils.py:_fill_holes` は正しい。ただし
-**Python 側に病的な無駄が 1 つ**あり、本機ではそこが支配的になっていた。
+Upstream's `trellis/utils/postprocessing_utils.py:_fill_holes` is correct, but
+**its Python side has one pathological inefficiency** that dominated on this
+machine.
 
 ```python
-g.add_edges([(f, "s") for f in inner_face_indices], ...)   # ← CUDA テンソルを 1 要素ずつ走査
+g.add_edges([(f, "s") for f in inner_face_indices], ...)   # walks a CUDA tensor element by element
 ```
 
-実測（2026-09-01・面 697,152・150 視点）：
+Measured 2026-09-01 on a 697,152-face mesh with 150 views:
 
-| 段 | 時間 | 割合 |
+| Stage | Time | Share |
 |---|--:|--:|
-| ラスタライズ 150 視点 | 36.15 s | 44% |
-| **source への辺（上の行）** | **21.64 s** | **27%** |
-| **target への辺（同じ形の行）** | **13.52 s** | **17%** |
-| `g.mincut` 本体 | 5.11 s | 6% |
-| その他 | 5.0 s | 6% |
+| Rasterizing 150 views | 36.15 s | 44% |
+| **Edges to source (the line above)** | **21.64 s** | **27%** |
+| **Edges to target (an identical line)** | **13.52 s** | **17%** |
+| `g.mincut` itself | 5.11 s | 6% |
+| Everything else | 5.0 s | 6% |
 
-**min-cut そのものは 5 秒**で、遅かったのは 36 万回の GPU 読み出しだった。
-一括で CPU へ移せば消える。**アルゴリズムも閾値も一切変えていない**ので、
-出力は上流と同じである（`tests/test_fill_holes.py` が小さなメッシュで一致を確認する）。
+**The min-cut itself takes 5 seconds**; the cost was 360,000 GPU reads, which
+disappear once the indices move to the CPU in one go. **Neither the algorithm
+nor any threshold was changed**, so the output matches upstream
+(`tests/test_fill_holes.py` confirms the agreement on a small mesh).
 
-**上流のヘルパはそのまま呼ぶ**（`utils3d.torch.*` / `sphere_hammersley_sequence` /
-`pymeshfix`）。こちらが持っているのは段取りだけである。
+**Upstream's helpers are called as-is** (`utils3d.torch.*`,
+`sphere_hammersley_sequence`, `pymeshfix`). Only the sequencing lives here.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ import torch
 
 
 def _cameras(num_views: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    """上流と同じ視点（Hammersley 列・半径 2.0・画角 40 度）を作る。"""
+    """Build upstream's viewpoints (Hammersley sequence, radius 2.0, 40-degree FOV)."""
     import utils3d
     from trellis.utils.random_utils import sphere_hammersley_sequence
 
@@ -76,7 +78,10 @@ def visibility(
     num_views: int,
     progress: Callable[[str, str], None] | None = None,
 ) -> torch.Tensor:
-    """面ごとの可視率を返す（**上流と同じ定義**：見えた視点の割合）。"""
+    """Return the visibility ratio per face.
+
+    **Upstream's definition**: the fraction of views the face appears in.
+    """
     import utils3d
 
     views, projection = _cameras(num_views, verts.device)
@@ -89,7 +94,7 @@ def visibility(
         face_id = buffers["face_id"][0][buffers["mask"][0] > 0.95] - 1
         seen[torch.unique(face_id).long()] += 1
         if progress is not None and (i + 1) % 50 == 0:
-            progress("raster", f"可視率を測る（{i + 1}/{views.shape[0]} 視点）")
+            progress("raster", f"measuring visibility ({i + 1}/{views.shape[0]} views)")
     return seen.float() / num_views
 
 
@@ -102,19 +107,23 @@ def fill_holes(
     num_views: int = 150,
     progress: Callable[[str, str], None] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """見えない面を min-cut で切り、小さな穴を塞ぐ。**上流と同じ手順・同じ閾値。**
+    """Cut invisible faces with a min-cut and fill small holes.
+
+    **Upstream's procedure, with upstream's thresholds.**
 
     Args:
-        verts: `[V, 3]`（cuda）。
-        faces: `[F, 3]`（cuda）。
-        max_hole_size: 切り口が作る境界ループの面積の上限。これを超える切り方は採らない。
-        max_hole_nbe: `pymeshfix` が塞ぐ境界ループの辺数の上限。
-        resolution: ラスタライズの解像度。
-        num_views: 視点の数。
-        progress: 段の通知先。
+        verts: `[V, 3]` on cuda.
+        faces: `[F, 3]` on cuda.
+        max_hole_size: Maximum area of the boundary loop a cut may open. A cut
+            exceeding it is rejected.
+        max_hole_nbe: Maximum number of edges in a boundary loop `pymeshfix`
+            will fill.
+        resolution: Rasterization resolution.
+        num_views: Number of viewpoints.
+        progress: Where to report the stage.
 
     Returns:
-        `(verts, faces)`。
+        `(verts, faces)`.
     """
     import igraph
     import utils3d
@@ -124,15 +133,15 @@ def fill_holes(
         if progress is not None:
             progress(stage, message)
 
-    say("raster", f"可視率を測る（{num_views} 視点 / {resolution}^2）")
+    say("raster", f"measuring visibility ({num_views} views / {resolution}^2)")
     visblity = visibility(verts, faces, resolution, num_views, progress)
 
-    say("graph", "双対グラフを組む")
+    say("graph", "building the dual graph")
     edges, face2edge, edge_degrees = utils3d.torch.compute_edges(faces)
     boundary_edge_indices = torch.nonzero(edge_degrees == 1).reshape(-1)
     components = utils3d.torch.compute_connected_components(faces, edges, face2edge)
 
-    # 成分ごとに「外側の面」を決める（上流と同じ適応しきい値）。
+    # Decide the "outer faces" per component (upstream's adaptive threshold).
     outer_mask = torch.zeros(faces.shape[0], dtype=torch.bool, device=faces.device)
     for comp in components:
         threshold = min(max(visblity[comp].quantile(0.75).item(), 0.25), 0.5)
@@ -140,7 +149,7 @@ def fill_holes(
     outer_face_indices = outer_mask.nonzero().reshape(-1)
     inner_face_indices = torch.nonzero(visblity == 0).reshape(-1)
     if inner_face_indices.shape[0] == 0:
-        say("graph", "見えない面が無いので切らない")
+        say("graph", "no invisible faces, so nothing is cut")
         return verts, faces
 
     dual_edges, dual_edge2edge = utils3d.torch.compute_dual_graph(face2edge)
@@ -149,28 +158,29 @@ def fill_holes(
 
     n_faces = int(faces.shape[0])
     g = igraph.Graph()
-    g.add_vertices(n_faces + 2)  # 末尾の 2 つが source と target
+    g.add_vertices(n_faces + 2)  # the last two are source and target
     source, target = n_faces, n_faces + 1
     g.add_edges(dual_edges.cpu().numpy())
     weights = dual_weights.cpu().numpy().tolist()
 
-    # **ここが上流との唯一の違い。** 添字を一括で CPU へ落としてから組む。
-    # 上流は CUDA テンソルを Python で 1 要素ずつ走査していて、
-    # 36 万回の GPU 読み出しに 35 秒を使っていた。**追加する辺は同じ。**
+    # **This is the only difference from upstream.** The indices move to the CPU
+    # in one go before the edges are built. Upstream walks a CUDA tensor element
+    # by element in Python, spending 35 seconds on 360,000 GPU reads.
+    # **The edges added are the same.**
     inner_list = inner_face_indices.cpu().numpy().tolist()
     outer_list = outer_face_indices.cpu().numpy().tolist()
     g.add_edges([(f, source) for f in inner_list])
     g.add_edges([(f, target) for f in outer_list])
     weights.extend([1.0] * (len(inner_list) + len(outer_list)))
 
-    say("mincut", f"min-cut を解く（内 {len(inner_list):,} / 外 {len(outer_list):,}）")
+    say("mincut", f"solving the min-cut (inner {len(inner_list):,} / outer {len(outer_list):,})")
     capacities = (np.asarray(weights, dtype=np.float64) * 1000).tolist()
     cut = g.mincut(source, target, capacities)
     remove_face_indices = torch.tensor(
         [v for v in cut.partition[0] if v < n_faces], dtype=torch.long, device=faces.device
     )
     if remove_face_indices.shape[0] == 0:
-        say("mincut", "切る面が無かった")
+        say("mincut", "no faces to cut")
     else:
         remove_face_indices = _validate_cut(
             verts,
@@ -187,9 +197,9 @@ def fill_holes(
             keep[remove_face_indices] = False
             faces = faces[keep]
             faces, verts = utils3d.torch.remove_unreferenced_vertices(faces, verts)
-            say("mincut", f"{int(remove_face_indices.shape[0]):,} 面を切った")
+            say("mincut", f"cut {int(remove_face_indices.shape[0]):,} faces")
 
-    say("meshfix", f"小さな穴を塞ぐ（辺 {max_hole_nbe} 本まで）")
+    say("meshfix", f"filling small holes (up to {max_hole_nbe} edges)")
     fixer = _meshfix.PyTMesh()
     fixer.load_array(verts.cpu().numpy(), faces.cpu().numpy())
     fixer.fill_small_boundaries(nbe=max_hole_nbe, refine=True)
@@ -210,11 +220,12 @@ def _validate_cut(
     remove_face_indices: torch.Tensor,
     max_hole_size: float,
 ) -> torch.Tensor:
-    """切り口ごとに採否を決める（**上流と同じ 2 条件**）。
+    """Accept or reject each cut (**upstream's two conditions**).
 
-    1. その塊の可視率の中央値が 0.25 より大きければ**採らない**（見えている面を切らない）
-    2. 新しくできる境界ループの面積が `max_hole_size` を超えるなら**採らない**
-       （大きな口を開けない）
+    1. **Reject** when the median visibility of the piece exceeds 0.25 (never cut
+       faces that are visible).
+    2. **Reject** when the boundary loop it would open exceeds `max_hole_size`
+       in area (never open a large hole).
     """
     import utils3d
 
@@ -249,6 +260,6 @@ def _validate_cut(
 
 
 def ensure_upstream_on_path(repo: str) -> None:
-    """上流の clone を import できるようにする（ヘルパを借りるため）。"""
+    """Make the upstream clone importable, so its helpers can be used."""
     if repo not in sys.path:
         sys.path.insert(0, repo)

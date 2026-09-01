@@ -1,23 +1,30 @@
 # SPDX-License-Identifier: MIT
-"""TRELLIS を gfx1151 / Windows / ROCm で動かすための**起動側のシム**。
+"""**Launch-time shims** that make TRELLIS run on gfx1151 / Windows / ROCm.
 
-**ベンダーコードは書き換えない**（再 clone・更新で壊れるため）。`trellis` を import する
-**前**に `install()` を呼び、`sys.modules` へ代替を差し込む。`runners/hunyuan3d/shape.py`
-の `_install_sdpa_shim` と同じ流儀である。
+**This file is deliberately identical to the Hi3DGen runner's `shims.py`**
+(`hi3dgen-strix-halo`), whose sparse modules are TRELLIS code. The two runners
+never import each other, since each ships as its own repository. **Fix one and
+fix the other.**
 
-差し替えるのは 4 つ。**どれも「必須経路にあるが Windows+ROCm では入手できない」もの**で、
-実際に使われる API の面積は小さい（`docs/02_port_report.md` の G-1 を見よ）。
+**Upstream code is never modified** (a re-clone or an update would undo it).
+`install()` is called **before** importing `trellis` and puts the replacements
+into `sys.modules`.
 
-- `spconv`：疎な畳み込み。**submanifold・stride 1 の `SubMConv3d` しか使われない**ので、
-  座標の線形化＋近傍の gather で再現する
-- `flash_attn`：疎なアテンション。`F.scaled_dot_product_attention` で再現する
-- `kaolin`：FlexiCubes が `check_tensor`（形の検査だけ）を import する
-- `open3d`：`trellis_text_to_3d` が先頭で import するだけ。**画像→メッシュの経路では
-  1 度も使わない**ので、触ったら落ちる殻を置く
+Four things are replaced. **Each is on the required path but unobtainable on
+Windows + ROCm**, and the surface of API actually used is small.
 
-**正しさは検算できる。** submanifold 畳み込みは「密な `F.conv3d` を活性ボクセルだけに
-制限したもの」と厳密に一致するので、密な参照実装と突き合わせられる
-（`tests/test_trellis_shims.py`）。
+- `spconv`: sparse convolution. **Only submanifold, stride-1 `SubMConv3d` is
+  ever used**, so it is reproduced with coordinate linearization and a gather
+  over neighbours.
+- `flash_attn`: sparse attention, reproduced with
+  `F.scaled_dot_product_attention`.
+- `kaolin`: FlexiCubes imports `check_tensor` (a shape check, nothing more).
+- `open3d`: imported at the top of `trellis_text_to_3d` and **never used on the
+  image-to-mesh path**, so it gets a stand-in that raises if touched.
+
+**Correctness here is verifiable.** Submanifold convolution is exactly a dense
+`F.conv3d` restricted to active voxels, so it can be checked against a dense
+reference implementation (`tests/test_shims.py`).
 """
 
 from __future__ import annotations
@@ -33,24 +40,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# 一度に計算するアテンションのヘッド数。gfx1151 では Hunyuan3D で 4 が最良だった。
+# Attention heads computed at once. Measured best on Hunyuan3D at 4 on gfx1151.
 DEFAULT_HEAD_CHUNK = 4
 
-# 疎畳み込みで一度に処理する出力ボクセル数。**VRAM ピークを決める。**
-# 専用 VRAM は 32GB しかなく、溢れると共有メモリへ落ちて数倍遅くなる。
+# Output voxels processed at once in sparse convolution. **This sets the VRAM
+# peak.** There are only 32 GB of dedicated VRAM, and spilling into shared
+# memory is several times slower.
 VOXEL_CHUNK = 65536
 
-# **差し替える前の本物**を捕まえておく。シムの中から `F.scaled_dot_product_attention` を
-# 呼ぶと、差し替えたあとは自分自身を呼ぶことになり、二重にヘッド分割して遅くなる。
+# **Capture the real function before replacing it.** Calling
+# `F.scaled_dot_product_attention` from inside a shim would otherwise call the
+# shim itself, chunking the heads twice and running slower.
 _TORCH_SDPA = F.scaled_dot_product_attention
 
 
 def _new_module(name: str, is_package: bool = False) -> types.ModuleType:
-    """`__spec__` と `__file__` を持つ空モジュールを作る。
+    """Create an empty module that has `__spec__` and `__file__`.
 
-    **`__spec__` は必須。** `transformers` は `importlib.util.find_spec("flash_attn")` で
-    有無を調べるので、`__spec__` が無いと `ValueError: flash_attn.__spec__ is None` で
-    **無関係な import が落ちる**（2026-09-01 に踏んだ）。
+    **`__spec__` is mandatory.** `transformers` probes with
+    `importlib.util.find_spec("flash_attn")`, and without `__spec__` that fails
+    with `ValueError: flash_attn.__spec__ is None`, **taking an unrelated import
+    down with it** (hit on 2026-09-01).
     """
     module = types.ModuleType(name)
     module.__file__ = f"<hearth shim: {name}>"
@@ -61,21 +71,23 @@ def _new_module(name: str, is_package: bool = False) -> types.ModuleType:
 
 
 # --------------------------------------------------------------------------------------
-# spconv の代替
+# Replacement for spconv
 # --------------------------------------------------------------------------------------
 
 
 class SparseConvTensor:
-    """`spconv.pytorch.SparseConvTensor` の器だけを再現する。
+    """Reproduces the container of `spconv.pytorch.SparseConvTensor`, nothing more.
 
-    TRELLIS の `SparseTensor`（`trellis/modules/sparse/basic.py`）は、この型の
-    **属性を直接触る**：`features` / `indices` / `spatial_shape` / `batch_size` /
-    `grid` / `voxel_num` / `indice_dict` / `benchmark` / `benchmark_record` /
-    `thrust_allocator` / `_timer` / `force_algo` / `int8_scale` / `_features`、および
-    `dense()`。**位置引数の順序も本物に合わせる**（`replace()` が 7 個を位置で渡すため）。
+    TRELLIS's `SparseTensor` (`trellis/modules/sparse/basic.py`) **touches these
+    attributes directly**: `features`, `indices`, `spatial_shape`, `batch_size`,
+    `grid`, `voxel_num`, `indice_dict`, `benchmark`, `benchmark_record`,
+    `thrust_allocator`, `_timer`, `force_algo`, `int8_scale`, `_features`, plus
+    `dense()`. **The positional order matches the real class too**, because
+    `replace()` passes seven of them positionally.
 
-    `features` が `_features` を返すプロパティであることも本物と同じにする。TRELLIS は
-    2 次元へ reshape した特徴で構築したあと `_features` に多次元の実体を入れ直す。
+    `features` being a property backed by `_features` also matches the real
+    class: TRELLIS constructs with features reshaped to two dimensions and then
+    writes the multi-dimensional tensor back into `_features`.
     """
 
     def __init__(
@@ -123,7 +135,7 @@ class SparseConvTensor:
         return self._features.device
 
     def replace_feature(self, feature: torch.Tensor) -> SparseConvTensor:
-        """特徴だけ差し替えた新しいテンソルを返す（座標と rulebook は共有する）。"""
+        """Return a new tensor with only the features replaced (coordinates and rulebook shared)."""
         return SparseConvTensor(
             feature,
             self.indices,
@@ -135,7 +147,7 @@ class SparseConvTensor:
         )
 
     def dense(self, channels_first: bool = True) -> torch.Tensor:
-        """密なテンソルへ展開する（`SparseTensor.dense()` から呼ばれる）。"""
+        """Expand to a dense tensor (called from `SparseTensor.dense()`)."""
         feats = self._features
         channels = feats.shape[1:]
         out = torch.zeros(
@@ -153,7 +165,7 @@ class SparseConvTensor:
 
 
 class ConvAlgo:
-    """`spconv.ConvAlgo` の代替。**値は使わない**（アルゴリズムの選択肢が無いため）。"""
+    """Replacement for `spconv.ConvAlgo`. **The values are unused**, as there is no choice here."""
 
     Native = "native"
     MaskImplicitGemm = "implicit_gemm"
@@ -161,23 +173,26 @@ class ConvAlgo:
 
 
 def _neighbor_index_map(coords: torch.Tensor, kernel_size: int) -> torch.Tensor:
-    """submanifold 畳み込みの rulebook を作る。
+    """Build the rulebook for submanifold convolution.
 
-    出力ボクセル `i` について、カーネル位置 `k` に対応する**入力ボクセルの添字**を返す。
-    活性でない近傍は `-1`。座標の線形化＋ソート済み配列への `searchsorted` で引く
-    （密な索引表を持たないので、解像度が上がっても記憶量は座標の分しか要らない）。
+    For each output voxel `i` and kernel position `k`, return the **index of the
+    input voxel**, or `-1` where the neighbour is not active. Lookup is by
+    linearizing coordinates and running `searchsorted` over the sorted array, so
+    no dense index table is needed and memory grows only with the coordinates.
 
-    **`int32` で返して `[K, N]` の器へ直接書き込む。** `int64` で 27 枚作って
-    `torch.stack` すると、解像度 256（活性ボクセル 180 万）で 400MB を超える一時領域が
-    2 つ同時に生きる。**専用 VRAM は 32GB しかなく、溢れると共有メモリへ落ちて
-    数倍遅くなる**（2026-09-01 に実際に踏んだ。`torch.OutOfMemoryError` まで行った）。
+    **Returns `int32`, written straight into a `[K, N]` buffer.** Building 27
+    `int64` planes and calling `torch.stack` would keep two temporaries of over
+    400 MB alive at once at resolution 256 (1.8 M active voxels). **There are
+    only 32 GB of dedicated VRAM, and spilling into shared memory is several
+    times slower** (hit on 2026-09-01, all the way to `torch.OutOfMemoryError`).
 
     Args:
-        coords: `[N, 4]` の `(batch, z, y, x)`。
-        kernel_size: カーネルの一辺。1 か 3 しか来ない。
+        coords: `[N, 4]` of `(batch, z, y, x)`.
+        kernel_size: Kernel edge length; only 1 and 3 occur.
 
     Returns:
-        `[K, N]` の `int32`。`K = kernel_size ** 3`。活性でない近傍は `-1`。
+        `[K, N]` of `int32`, where `K = kernel_size ** 3`. Inactive neighbours
+        are `-1`.
     """
     n = coords.shape[0]
     device = coords.device
@@ -218,15 +233,17 @@ def _neighbor_index_map(coords: torch.Tensor, kernel_size: int) -> torch.Tensor:
 
 
 class _SubMConv3dImpl(nn.Module):
-    """submanifold な 3D 疎畳み込み（stride 1・出力座標＝入力座標）。
+    """Submanifold sparse 3D convolution (stride 1, output coordinates equal input coordinates).
 
-    **重みの並びは spconv 2.x の KRSC**：`[out_channels, kD, kH, kW, in_channels]`。
-    実際の ckpt で確認した（例：`upsample.0.out_layers.0.conv.weight` が
-    `[192, 3, 3, 3, 768]`）。ここを取り違えると**黙って違う形が出る**ので変えないこと。
+    **Weights are laid out as spconv 2.x KRSC**:
+    `[out_channels, kD, kH, kW, in_channels]`. Confirmed against a real
+    checkpoint (for example `upsample.0.out_layers.0.conv.weight` is
+    `[192, 3, 3, 3, 768]`). Getting this wrong **silently produces a different
+    shape**, so do not change it.
 
-    畳み込みの向きは相関（`out[p] = Σ_k W[k] · in[p + k - center]`）で、
-    これは活性でないボクセルを 0 とした密な `F.conv3d(padding=k//2)` と厳密に一致する。
-    `tests/test_trellis_shims.py` がその一致を検算している。
+    The convolution is a correlation (`out[p] = sum_k W[k] . in[p + k - center]`),
+    which is exactly a dense `F.conv3d(padding=k//2)` with inactive voxels set to
+    zero. `tests/test_shims.py` verifies that agreement.
     """
 
     def __init__(
@@ -242,7 +259,7 @@ class _SubMConv3dImpl(nn.Module):
     ) -> None:
         super().__init__()
         if dilation != 1:
-            raise NotImplementedError("dilation は未対応（TRELLIS の経路では使われない）")
+            raise NotImplementedError("dilation is unsupported (the TRELLIS path never uses it)")
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel_size = kernel_size
@@ -253,7 +270,7 @@ class _SubMConv3dImpl(nn.Module):
         self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
 
     def _rulebook(self, x: SparseConvTensor) -> torch.Tensor:
-        """rulebook を作る。`indice_key` があれば疎テンソルの `indice_dict` へ載せて使い回す。"""
+        """Build the rulebook, reusing it through the tensor's `indice_dict` when keyed."""
         if self.kernel_size == 1:
             return torch.arange(
                 x.indices.shape[0], device=x.indices.device, dtype=torch.int32
@@ -274,7 +291,7 @@ class _SubMConv3dImpl(nn.Module):
             feats = feats.reshape(feats.shape[0], -1)
         rulebook = self._rulebook(x)
         n = feats.shape[0]
-        # [out, K, in] -> [K, in, out]（一度だけ作って使い回す）
+        # [out, K, in] -> [K, in, out] (built once and reused)
         weight = self.weight.reshape(self.out_channels, -1, self.in_channels)
         w_all = weight.permute(1, 2, 0).contiguous().to(feats.dtype)
         kernels = w_all.shape[0]
@@ -282,14 +299,16 @@ class _SubMConv3dImpl(nn.Module):
 
         out = torch.empty(n, self.out_channels, device=feats.device, dtype=feats.dtype)
         bias = None if self.bias is None else self.bias.float()
-        # **出力ボクセルを塊に切って処理する。** 全部まとめてやると、集めた特徴
-        # `[N, in]` だけで解像度 256・入力 192ch のとき 700MB を超える。
+        # **Output voxels are processed in chunks.** Doing them all at once makes
+        # the gathered features `[N, in]` alone exceed 700 MB at resolution 256
+        # with 192 input channels.
         for start in range(0, n, VOXEL_CHUNK):
             end = min(start + VOXEL_CHUNK, n)
             acc = torch.zeros(end - start, self.out_channels, device=feats.device)
             for k in range(kernels):
                 if kernels == 1 or k == center:
-                    # 中心は必ず自分自身（submanifold なので出力座標＝入力座標）。
+                    # The centre is always the voxel itself: submanifold means
+                    # output coordinates equal input coordinates.
                     acc += (feats[start:end] @ w_all[k]).float()
                     continue
                 idx = rulebook[k, start:end].long()
@@ -313,18 +332,19 @@ class _SubMConv3dImpl(nn.Module):
 
 
 class _UnsupportedConv(nn.Module):
-    """この経路では使われないはずの畳み込み。**呼ばれたら必ず落ちる**（黙って通さない）。"""
+    """A convolution this path should never reach. **Always raises**, never passes silently."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__()
         raise NotImplementedError(
-            "stride 付きの SparseConv3d / SparseInverseConv3d は spconv の代替に無い。"
-            "TRELLIS の画像→メッシュの経路には現れないはずなので、来たら経路が変わっている"
+            "strided SparseConv3d / SparseInverseConv3d are not part of the spconv replacement. "
+            "They should not appear on the TRELLIS image-to-mesh path, so reaching this means "
+            "the path has changed"
         )
 
 
 def _install_spconv() -> None:
-    """`spconv` と `spconv.pytorch` を差し込む（**本物があっても差し込む**）。"""
+    """Install `spconv` and `spconv.pytorch` (**even if the real package exists**)."""
     spconv = _new_module("spconv", is_package=True)
     pytorch = _new_module("spconv.pytorch")
 
@@ -341,26 +361,28 @@ def _install_spconv() -> None:
 
 
 # --------------------------------------------------------------------------------------
-# flash_attn の代替
+# Replacement for flash_attn
 # --------------------------------------------------------------------------------------
 
 
 def _attend(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, head_chunk: int, fp32: bool
 ) -> torch.Tensor:
-    """`[B, S, H, D]` の 3 つ組を受けて `[B, S, H, D]` を返す。
+    """Take a `[B, S, H, D]` triple and return `[B, S, H, D]`.
 
-    gfx1151 では flash も mem_efficient も無いので、実際に走るのは math backend である。
-    math は `q @ k^T` を入力 dtype のまま実体化するので、**fp16 だと 65504 を超えて壊れる**
-    （Hunyuan3D で鏡像入力を使い決定論的に再現した実績がある）。だから fp32 で計算し、
-    ヘッドを分割して中間テンソルを小さく保つ。
+    Without flash or mem_efficient on gfx1151 the math backend is what actually
+    runs. It materialises `q @ k^T` in the input dtype, so **fp16 exceeds 65504
+    and breaks** (reproduced deterministically on Hunyuan3D with a mirrored
+    input). Hence fp32 arithmetic, with the heads chunked to keep the
+    intermediate tensors small.
     """
     out_dtype = q.dtype
     qt = q.transpose(1, 2)  # [B, H, S, D]
     kt = k.transpose(1, 2)
     vt = v.transpose(1, 2)
     if not fp32:
-        # flash / mem-efficient が使えるときは online softmax なので fp16 のままで壊れない。
+        # When flash or mem-efficient is available, its online softmax never
+        # overflows, so fp16 is safe as-is.
         return _TORCH_SDPA(qt, kt, vt).transpose(1, 2).contiguous()
     heads = qt.shape[1]
     outs: list[torch.Tensor] = []
@@ -375,16 +397,17 @@ def _attend(
 
 
 def _segments(cu_seqlens: torch.Tensor) -> list[tuple[int, int]]:
-    """`cu_seqlens`（累積長）を `[(start, end), ...]` へ直す。"""
+    """Turn `cu_seqlens` (cumulative lengths) into `[(start, end), ...]`."""
     bounds = cu_seqlens.tolist()
     return [(int(bounds[i]), int(bounds[i + 1])) for i in range(len(bounds) - 1)]
 
 
 def _make_flash_attn(head_chunk: int, fp32: bool) -> types.ModuleType:
-    """`flash_attn` の**実際に呼ばれる 4 関数だけ**を持つモジュールを作る。
+    """Build a module holding **only the four functions actually called**.
 
-    TRELLIS が呼ぶのは `full_attn.py` / `windowed_attn.py` / `serialized_attn.py` の
-    5 箇所で、いずれも位置引数だけを渡す。`causal` も `dropout` も使わない。
+    TRELLIS calls them from five places in `full_attn.py`, `windowed_attn.py`
+    and `serialized_attn.py`, always with positional arguments only. Neither
+    `causal` nor `dropout` is used.
     """
     module = _new_module("flash_attn")
 
@@ -463,15 +486,16 @@ def _make_flash_attn(head_chunk: int, fp32: bool) -> types.ModuleType:
 
 
 # --------------------------------------------------------------------------------------
-# kaolin / open3d の殻
+# Stand-ins for kaolin and open3d
 # --------------------------------------------------------------------------------------
 
 
 def _install_kaolin() -> None:
-    """FlexiCubes が import する `kaolin.utils.testing.check_tensor` だけを用意する。
+    """Provide only `kaolin.utils.testing.check_tensor`, which FlexiCubes imports.
 
-    FlexiCubes は `assert check_tensor(x, shape, throw=False)` の形でしか使わない。
-    **形の検査をそのまま実装する**（真を返すだけにすると assert が意味を失うため）。
+    FlexiCubes uses it exclusively as `assert check_tensor(x, shape, throw=False)`.
+    **The shape check is implemented for real**, because always returning true
+    would make the assertion meaningless.
     """
 
     def check_tensor(
@@ -485,15 +509,15 @@ def _install_kaolin() -> None:
         if shape is not None:
             expected = list(shape)
             if tensor.dim() != len(expected):
-                problems.append(f"次元数が違う: {tensor.dim()} != {len(expected)}")
+                problems.append(f"wrong number of dimensions: {tensor.dim()} != {len(expected)}")
             else:
                 for i, (got, want) in enumerate(zip(tensor.shape, expected, strict=True)):
                     if want is not None and got != want:
-                        problems.append(f"軸 {i} の大きさが違う: {got} != {want}")
+                        problems.append(f"wrong size on axis {i}: {got} != {want}")
         if dtype is not None and tensor.dtype != dtype:
-            problems.append(f"dtype が違う: {tensor.dtype} != {dtype}")
+            problems.append(f"wrong dtype: {tensor.dtype} != {dtype}")
         if device is not None and torch.device(device).type != tensor.device.type:
-            problems.append(f"device が違う: {tensor.device} != {device}")
+            problems.append(f"wrong device: {tensor.device} != {device}")
         if problems and throw:
             raise ValueError("; ".join(problems))
         return not problems
@@ -510,11 +534,12 @@ def _install_kaolin() -> None:
 
 
 class _AbsentAttribute:
-    """**名前を辿るのは許すが、呼んだら落ちる**代役。
+    """A stand-in that **allows name lookup but raises when called**.
 
-    属性の参照だけで落とすと `class Foo: def f(self, m: o3d.geometry.TriangleMesh)` のような
-    **注釈の評価**で巻き込まれる（`trellis_text_to_3d` がまさにそれ）。注釈は通し、
-    **実際に呼ばれたときだけ**落とす。
+    Raising on attribute access alone would break **annotation evaluation** such
+    as `class Foo: def f(self, m: o3d.geometry.TriangleMesh)`, which is exactly
+    what `trellis_text_to_3d` does. Annotations pass; only an **actual call**
+    raises.
     """
 
     def __init__(self, path: str, reason: str) -> None:
@@ -527,18 +552,20 @@ class _AbsentAttribute:
         return _AbsentAttribute(f"{self._path}.{attr}", self._reason)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError(f"{self._path} は本機では使えない（{self._reason}）")
+        raise RuntimeError(f"{self._path} is unavailable on this machine ({self._reason})")
 
     def __repr__(self) -> str:
         return f"<absent {self._path}>"
 
 
 def _install_absent(name: str, reason: str) -> None:
-    """import は通るが**呼んだら落ちる**殻を置く。黙って違う結果を返させない。
+    """Install a stand-in that imports fine but **raises when called**.
 
-    **dunder だけは `AttributeError` を返す。** `inspect.getmodule` は `sys.modules` を
-    総なめして `__file__` を見に来るので、ここで例外を投げると
-    **無関係な import（torchvision）を巻き込んで落ちる**（2026-09-01 に踏んだ）。
+    It never returns a wrong result silently.
+
+    **Dunders alone raise `AttributeError`.** `inspect.getmodule` walks all of
+    `sys.modules` looking for `__file__`, so raising anything else there **takes
+    an unrelated import (torchvision) down with it** (hit on 2026-09-01).
     """
 
     module = _new_module(name, is_package=True)
@@ -553,16 +580,16 @@ def _install_absent(name: str, reason: str) -> None:
 
 
 # --------------------------------------------------------------------------------------
-# 密な SDPA の差し替え（Hunyuan3D と同じ理由）
+# Replacing dense SDPA (the same reason as Hunyuan3D)
 # --------------------------------------------------------------------------------------
 
 
 def _install_dense_sdpa(head_chunk: int) -> None:
-    """`F.scaled_dot_product_attention` を fp32 計算＋ヘッド分割へ差し替える。
+    """Replace `F.scaled_dot_product_attention` with fp32 arithmetic over chunked heads.
 
-    TRELLIS の**密**なアテンション（`ATTN_BACKEND=sdpa`）は seq=4096 の DiT を 24 段
-    通す。Hunyuan3D で同じ規模の math backend が fp16 で破綻したのと同じ条件なので、
-    先回りして同じ手当てをしておく。**根拠は `runners/hunyuan3d/shape.py` の docstring。**
+    TRELLIS's **dense** attention (`ATTN_BACKEND=sdpa`) runs seq=4096 through 24
+    DiT blocks. That is the same regime where the math backend broke down in
+    fp16 on Hunyuan3D, so the same treatment is applied pre-emptively.
     """
     torch.backends.cuda.sdp_kernel = lambda *a, **kw: contextlib.nullcontext()
 
@@ -577,13 +604,14 @@ def _install_dense_sdpa(head_chunk: int) -> None:
         enable_gqa: bool = False,
     ) -> torch.Tensor:
         if attn_mask is not None or is_causal or dropout_p:
-            raise NotImplementedError("差し替えた SDPA は素のアテンションだけを受ける")
+            raise NotImplementedError("the replacement SDPA accepts plain attention only")
         out_dtype = query.dtype
         heads = query.shape[1]
         outs: list[torch.Tensor] = []
         for i in range(0, heads, head_chunk):
-            # **計算は fp32、実装は torch の本物**。自前で softmax を書くと、
-            # 同じ大きさの中間テンソルを作ったうえに融合カーネルを捨てることになる。
+            # **fp32 arithmetic, torch's own implementation.** Writing the
+            # softmax by hand would build intermediates just as large while
+            # giving up the fused kernel.
             o = _TORCH_SDPA(
                 query[:, i : i + head_chunk].float(),
                 key[:, i : i + head_chunk].float(),
@@ -597,16 +625,16 @@ def _install_dense_sdpa(head_chunk: int) -> None:
 
 
 # --------------------------------------------------------------------------------------
-# 入口
+# Entry point
 # --------------------------------------------------------------------------------------
 
 
 def fast_attention_available() -> bool:
-    """flash / mem-efficient が**実際に走るか**を小さなテンソルで試す。
+    """Test on a small tensor whether flash or mem-efficient **actually runs**.
 
-    gfx1151 では `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` を
-    **torch を import する前に**置いたときだけ AOTriton の実装が有効になる
-    （後から `os.environ` へ入れても効かないことを実測した）。
+    On gfx1151 the AOTriton implementations become available only when
+    `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` is set **before torch is
+    imported** (measured: setting `os.environ` afterwards has no effect).
     """
     if not torch.cuda.is_available():
         return False
@@ -620,30 +648,35 @@ def fast_attention_available() -> bool:
             with sdpa_kernel(backend):
                 _TORCH_SDPA(probe, probe, probe)
             return True
-        except Exception:  # noqa: BLE001 - 使えないことを知りたいだけ
+        except Exception:  # noqa: BLE001 - only the availability matters
             continue
     return False
 
 
 def install(head_chunk: int = DEFAULT_HEAD_CHUNK, fp32_attention: bool | None = None) -> bool:
-    """**`trellis` を import する前に呼ぶ。** 代替をすべて `sys.modules` へ置く。
+    """**Call this before importing the upstream package.**
+
+    Puts every replacement into `sys.modules`.
 
     Args:
-        head_chunk: 一度に計算するアテンションのヘッド数。fp32 で計算するときだけ効く。
-        fp32_attention: アテンションを fp32＋ヘッド分割で計算するか。
-            None なら**実測で決める**：flash / mem-efficient が使えるなら False
-            （online softmax なので fp16 でも溢れない・**実測で 10〜20 倍速い**）、
-            使えないなら True（math backend しか無く、fp16 だと 65504 を超えて壊れる）。
+        head_chunk: Attention heads computed at once. Only applies to fp32
+            arithmetic.
+        fp32_attention: Whether to compute attention in fp32 over chunked heads.
+            None **decides by measurement**: False when flash or mem-efficient
+            is available (its online softmax cannot overflow in fp16, and it is
+            **10-20x faster in practice**), True otherwise, because only the
+            math backend remains and fp16 exceeds 65504 there.
 
     Returns:
-        **速いアテンションが有効か。** これを `metrics` へ載せて記録に残す
-        （2026-09-01 に「hearth 経由だと生成が 4 倍遅い」を切り分けるのに要った）。
+        **Whether fast attention is in effect.** This goes into `metrics` as a
+        record; it was what made the "4x slower through hearth" problem of
+        2026-09-01 diagnosable.
     """
     use_fp32 = (not fast_attention_available()) if fp32_attention is None else fp32_attention
     _install_spconv()
     sys.modules["flash_attn"] = _make_flash_attn(head_chunk, use_fp32)
     _install_kaolin()
-    _install_absent("open3d", "text→3D の経路でしか使わない")
+    _install_absent("open3d", "only used on the text-to-3D path")
     if use_fp32:
         _install_dense_sdpa(head_chunk)
     print(
@@ -654,12 +687,13 @@ def install(head_chunk: int = DEFAULT_HEAD_CHUNK, fp32_attention: bool | None = 
 
 
 def install_absent_nvdiffrast() -> None:
-    """`nvdiffrast` の殻を置く。
+    """Install a stand-in for `nvdiffrast`.
 
-    上流の `postprocessing_utils` は先頭で `import nvdiffrast.torch as dr` するが、
-    `dr` を実際に使うのは**テクスチャの焼き込みと UV 展開**だけで、こちらが呼ぶ
-    `postprocess_mesh(fill_holes=True)` の経路には現れない。
-    ラスタライズは `utils3d.torch` 側を `raster.install()` で差し替える。
+    Upstream's `postprocessing_utils` imports `nvdiffrast.torch as dr` at the
+    top, but `dr` is only ever used for **texture baking and UV unwrapping**,
+    neither of which appears on the `postprocess_mesh(fill_holes=True)` path
+    this runner calls. Rasterization is replaced on the `utils3d.torch` side by
+    `raster.install()`.
     """
-    _install_absent("nvdiffrast", "テクスチャ焼き込み専用（本機では出せない）")
-    _install_absent("nvdiffrast.torch", "テクスチャ焼き込み専用（本機では出せない）")
+    _install_absent("nvdiffrast", "texture baking only (not produced on this machine)")
+    _install_absent("nvdiffrast.torch", "texture baking only (not produced on this machine)")

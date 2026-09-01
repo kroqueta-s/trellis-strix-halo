@@ -1,22 +1,25 @@
 # SPDX-License-Identifier: MIT
-"""「3D の常夜灯」：非表示ウィンドウで軽い OpenGL 描画を回し、GPU を高い電力ステートに保つ。
+"""Clock keepalive: a hidden OpenGL render loop that holds the GPU in a high power state.
 
-**なぜ要るか**（2026-09-01 実測・docs/02_port_report.md）：Windows の AMD ドライバは
-compute キューだけの負荷では電力ステート（DPM）を上げない。GPU 使用率 99% でも
-GFXCLK 600 MHz に張り付き、GEMM は 4.8 TFLOPS しか出ない。3D 描画が 1 つ動いていれば
-2.35 GHz へ上がり、同じ GEMM が **20.9 TFLOPS（4.3 倍）** になる。非表示ウィンドウでも効く。
-MyASUS 等の常駐 UI がたまたま描画していると速い——という生成時間のばらつき（3.9 倍）の
-原因もこれで、常夜灯はそれを決定的にする。
+**Why this is needed** (measured 2026-09-01): the AMD Windows driver does not
+raise the GPU power state (DPM) for compute-only work. At 99 % GPU utilisation
+the clock sits at 600 MHz and GEMM reaches only 4.8 TFLOPS. With any 3D
+rendering alive alongside it, the clock rises to 2.35 GHz and the same GEMM
+reaches **20.9 TFLOPS (4.3x)**. A hidden window is enough. This also explains
+the 3.9x spread in generation time: runs were fast only when some resident UI
+happened to be drawing. The keepalive makes that the normal case.
 
-**設計**：ctypes だけで書く（追加パッケージなし・自前バイナリなし＝Smart App Control に
-掛からない）。子プロセスとして走らせ、親が死ねば自分で消える。点かなくても生成は
-従来どおり動く（効果が metrics.gfx_keepalive に載るだけ）。
+**Design**: written with ctypes only (no extra packages, no self-built binaries,
+so Smart App Control has nothing to block). It runs as a child process and exits
+on its own when the parent dies. If it fails to start, generation proceeds
+exactly as before; the difference only shows up in `metrics.gfx_keepalive`.
 
-単体での確認（どのランナーの python でもよい。torch を使わない）::
+Check it on its own (any runner's python works; torch is not used)::
 
     python -m runners.<runner>.gfxlight --seconds 10
 
-このファイルは 3 ランナーで同一内容（各ランナーは独立リポジトリへ出すため共有しない）。
+This file is identical in all three runners, which do not share a module because
+each ships as its own repository.
 """
 
 from __future__ import annotations
@@ -97,16 +100,16 @@ class _PIXELFORMATDESCRIPTOR(ctypes.Structure):
     ]
 
 
-# --- 親（ランナー）側 ---------------------------------------------------------
+# --- Parent (runner) side -----------------------------------------------------
 class GfxLight:
-    """常夜灯の子プロセスを点けたり消したりする。**点かなくても例外は投げない。**"""
+    """Turns the keepalive child process on and off. **Never raises when it fails.**"""
 
     def __init__(self, fps: float = 30.0) -> None:
         self._fps = fps
         self._proc: subprocess.Popen[bytes] | None = None
 
     def start(self) -> None:
-        """子プロセスで常夜灯を点ける。失敗しても生成は続行する。"""
+        """Start the keepalive child. Generation continues even if this fails."""
         try:
             self._proc = subprocess.Popen(
                 [
@@ -123,15 +126,15 @@ class GfxLight:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except OSError as exc:
-            print(f"[gfxlight] 点かない（生成は続行する）: {exc}", file=sys.stderr)
+            print(f"[gfxlight] not started (generation continues): {exc}", file=sys.stderr)
             self._proc = None
 
     def is_lit(self) -> bool:
-        """今も点いているか。metrics に載せて、効いていたかを後から判定できるようにする。"""
+        """Whether it is still alive. Recorded in metrics so a run can be judged later."""
         return self._proc is not None and self._proc.poll() is None
 
     def stop(self) -> None:
-        """消す。子は親の死でも自分で消えるが、正常系では明示的に消す。"""
+        """Stop it. The child also exits when the parent dies; this is the clean path."""
         if self._proc is None:
             return
         if self._proc.poll() is None:
@@ -143,7 +146,7 @@ class GfxLight:
         self._proc = None
 
 
-# --- 子（描画ループ）側 -------------------------------------------------------
+# --- Child (render loop) side -------------------------------------------------
 def _render_loop(parent_pid: int, fps: float, seconds: float) -> int:
     user32 = ctypes.windll.user32
     gdi32 = ctypes.windll.gdi32
@@ -182,7 +185,8 @@ def _render_loop(parent_pid: int, fps: float, seconds: float) -> int:
     if not user32.RegisterClassW(ctypes.byref(cls)):
         return 1
 
-    # **表示しない。** 非表示でも DPM は上がる（実測：GEMM 4.8 → 20.9 TFLOPS）。
+    # **Never shown.** The power state rises even for a hidden window
+    # (measured: GEMM 4.8 -> 20.9 TFLOPS).
     hwnd = user32.CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         "hearth_gfxlight",
@@ -214,18 +218,20 @@ def _render_loop(parent_pid: int, fps: float, seconds: float) -> int:
     if not ctx or not opengl32.wglMakeCurrent(dc, ctx):
         return 1
 
-    # ソフトウェア描画に落ちていたら GPU に効かないので、点いていない扱いで消える。
+    # Software rendering cannot affect the GPU, so exit and report as not lit.
     renderer = opengl32.glGetString(GL_RENDERER) or b""
     if b"GDI Generic" in renderer:
         return 3
 
-    # 親が死んだら消える。フレーム間隔の待ちを親プロセスの監視で兼ねる。
+    # Exit when the parent dies; waiting on the parent handle doubles as the
+    # frame interval.
     #
-    # **`glFinish` はしない・1 フレームの描画量をわざと多めにする。**
-    # 長い compute カーネル（Hunyuan3D の DiT 等）が GPU を独占すると 3D キューが
-    # 飢餓になり、同期待ちのある極小の描画では「3D の需要」がドライバから見えなく
-    # なってクロックが 600 MHz へ落ちた（2026-09-02 実測：gen 179 s・keepalive 生存中）。
-    # 同期せずにフレームを先行投入し、キューに常に仕事が積まれた状態を保つ。
+    # **Do not call `glFinish`, and keep each frame's workload generous.**
+    # When one long compute kernel monopolises the GPU (the Hunyuan3D DiT does),
+    # the 3D queue starves. With a tiny synchronised draw the driver then sees
+    # no 3D demand at all and drops the clock back to 600 MHz (measured
+    # 2026-09-02: 179 s generation with the keepalive still alive). Submitting
+    # frames without synchronising keeps 3D work queued at all times.
     parent = kernel32.OpenProcess(SYNCHRONIZE, False, parent_pid) if parent_pid else None
     wait_ms = max(1, int(1000.0 / fps))
     deadline = time.time() + seconds if seconds > 0 else None
@@ -245,7 +251,7 @@ def _render_loop(parent_pid: int, fps: float, seconds: float) -> int:
         frame += 1
         if parent:
             if kernel32.WaitForSingleObject(parent, wait_ms) != WAIT_TIMEOUT:
-                break  # 親が死んだ
+                break  # the parent died
         else:
             time.sleep(wait_ms / 1000.0)
 
@@ -257,11 +263,11 @@ def _render_loop(parent_pid: int, fps: float, seconds: float) -> int:
 
 
 def main() -> int:
-    """子プロセスとして描画ループを回す（単体実行は --seconds で時間を切る）。"""
-    parser = argparse.ArgumentParser(description="3D の常夜灯（詳細はモジュール docstring）")
-    parser.add_argument("--parent-pid", type=int, default=0, help="このプロセスが死んだら消える")
+    """Run the render loop as a child process (`--seconds` bounds a standalone run)."""
+    parser = argparse.ArgumentParser(description="Clock keepalive (see the module docstring)")
+    parser.add_argument("--parent-pid", type=int, default=0, help="exit when this process dies")
     parser.add_argument("--fps", type=float, default=30.0)
-    parser.add_argument("--seconds", type=float, default=0.0, help="0 なら親が死ぬまで")
+    parser.add_argument("--seconds", type=float, default=0.0, help="0 means until the parent dies")
     args = parser.parse_args()
     return _render_loop(args.parent_pid, args.fps, args.seconds)
 

@@ -1,31 +1,38 @@
 # SPDX-License-Identifier: MIT
-"""生成したメッシュの後処理。**上流の手法に倣い、独自の判断を足さない。**
+"""Post-processing for the generated mesh. **Follow upstream; add no judgement of our own.**
 
-上流 TRELLIS は `to_glb()` の中で `postprocess_mesh()` を呼ぶ。その中身は
+Upstream TRELLIS calls `postprocess_mesh()` from inside `to_glb()`, which does
 
-1. `pyvista.decimate(0.95)`（面を 5% まで間引く）
-2. `_fill_holes`：**多視点ラスタライズ → 面ごとの可視率 → min-cut → 小さな穴埋め**
+1. `pyvista.decimate(0.95)` (reduce to 5 % of the faces), then
+2. `_fill_holes`: **rasterize many views, compute a visibility ratio per face,
+   min-cut, then fill small holes**.
 
-**ここでは 2 だけを、手順と閾値をそのままに実行する**（実装は `fill_holes.py`）。
-1 の間引きは掛けない。上流は色付き GLB を出すのが目的で面数を削るが、こちらは
-下流（`forge`）が実寸化と修復をする前提の素材なので、細部を捨てる理由が無い。
+**Only step 2 runs here, with its procedure and thresholds unchanged** (the
+implementation is in `fill_holes.py`). Step 1 is skipped: upstream decimates
+because it is producing a coloured GLB, whereas this mesh is raw material for
+downstream scaling and repair (`forge`), so there is no reason to discard detail.
 
-足りない `nvdiffrast` のラスタライザは `raster.install()` で差し替える。
-**ベンダーコードは書き換えていない。**
+The missing `nvdiffrast` rasterizer is replaced by `raster.install()`.
+**Upstream code is not modified.**
 
-## 上流に無い処理を 1 つだけ足している
+## One thing is added on top of upstream
 
-**外側に浮いている破片を、大きさと薄さで落とす。**
-（`.env` の `*_DROP_SMALL_PARTS` / `*_DROP_THIN_PARTS`）
+**Free-floating debris is dropped by size and by thinness**
+(`TRELLIS_DROP_SMALL_PARTS` and `TRELLIS_DROP_THIN_PARTS` in `.env`).
 
-上流にこの手当ては無い。可視率で切る仕組みは「見えない面」を狙うので、**空中に浮いた
-破片は見えてしまい、通り抜ける**。実測（2026-09-01・検体 `i2i_00038_.png`）：
+Upstream has no such treatment. Its visibility test targets faces that are never
+visible, so **debris floating in open air is visible and passes straight
+through**. Measured on the sample `i2i_00038_.png` (2026-09-01):
 
-- trellis：本体以外 831 個のうち、**内側 37 個 118,000 面（77.1%）／外側 794 個 35,064 面**
-- hi3dgen：本体以外 968 個のうち、内側 27 個 3,008 面／**外側 941 個 30,048 面（90.9%）**
+- trellis: of the 831 components outside the body, **37 components and 118,000
+  faces (77.1 %) were inside it, and 794 components with 35,064 faces outside**.
+- hi3dgen: of the 968 components outside the body, 27 with 3,008 faces were
+  inside, and **941 with 30,048 faces (90.9 %) outside**.
 
-上流は間引き（0.95）で成分が 832 → 204 まで減るだけで、**完成品にも浮遊片は残る**。
-印刷用途では実害になるので、ここだけ独自の処理を足す。**落とした量は必ず記録に残す。**
+Upstream's decimation (0.95) only takes the count from 832 to 204, so **the
+finished result still contains floating debris**. That is a real defect for
+printing, which is the one place this runner adds something of its own.
+**Always record how much was dropped.**
 """
 
 from __future__ import annotations
@@ -44,7 +51,7 @@ from . import config, raster, shims
 
 @dataclass
 class CleanStats:
-    """後処理で何がどれだけ変わったかの記録。**黙って消さないための数字。**"""
+    """What post-processing changed, and by how much. **Numbers so nothing vanishes silently.**"""
 
     faces_before: int = 0
     faces_after: int = 0
@@ -57,7 +64,7 @@ class CleanStats:
     warnings: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
-        """`metrics` へそのまま載せられる形。"""
+        """The shape that goes straight into `metrics`."""
         return {
             "faces_before": self.faces_before,
             "faces_after": self.faces_after,
@@ -82,23 +89,25 @@ def fill_holes(
     progress: Callable[[str, str], None] | None = None,
     stats: CleanStats | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """見えない面を切り、小さな穴を塞ぐ（**手順と閾値は上流のまま**）。
+    """Cut invisible faces and fill small holes (**upstream's procedure and thresholds**).
 
-    実装は `fill_holes.py` にある。上流の関数をそのまま呼ばずに書き写したのは、
-    **上流の Python 側に病的な無駄が 1 つあり、本機ではそこが支配的だった**ため
-    （CUDA テンソルを 1 要素ずつ走査して 36 万回の GPU 読み出し＝35 秒）。
-    **アルゴリズムも閾値も変えていない**ことは `tests/test_fill_holes.py` が
-    上流と 1 対 1 で突き合わせて確かめている。
+    The implementation lives in `fill_holes.py`. It was transcribed rather than
+    called directly because **upstream's Python side has one pathological
+    inefficiency that dominated on this machine**: it walks a CUDA tensor element
+    by element, spending 35 seconds on 360,000 GPU reads.
+    **Neither the algorithm nor the thresholds were changed**, which
+    `tests/test_fill_holes.py` verifies by comparing against upstream one to one.
 
     Args:
-        vertices: `[V, 3]`。
-        faces: `[F, 3]`。
-        progress: 段の通知先。
-        stats: 記録の置き場。
+        vertices: `[V, 3]`.
+        faces: `[F, 3]`.
+        progress: Where to report the stage.
+        stats: Where to record what happened.
 
     Returns:
-        後処理後の `(vertices, faces)`。**失敗したら入力をそのまま返す**
-        （後処理は品質の改善であって、生成の成否ではない）。
+        The post-processed `(vertices, faces)`. **Returns the input unchanged on
+        failure**, because post-processing improves quality and does not decide
+        whether generation succeeded.
     """
     import time
 
@@ -116,13 +125,13 @@ def fill_holes(
         device = "cuda" if torch.cuda.is_available() else "cpu"
         v = torch.tensor(vertices, dtype=torch.float32, device=device)
         f = torch.tensor(faces, dtype=torch.int32, device=device)
-        # **上流の関数は中で数十秒黙る。** 心拍を出しておかないと
-        # 「進んでいるのか止まっているのか」が外から分からない（T0 の方針）。
+        # **The upstream function goes quiet for tens of seconds.** Without a
+        # heartbeat there is no way to tell progress from a hang.
         from .pipeline import _DeviceWatch
 
         with _DeviceWatch(
             progress=progress,
-            stage="後処理",
+            stage="post-processing",
             heartbeat_sec=config.HEARTBEAT_SEC,
             limit_gb=config.VRAM_LIMIT_GB,
         ):
@@ -137,9 +146,10 @@ def fill_holes(
             )
         vertices = v.cpu().numpy()
         faces = f.cpu().numpy()
-    except Exception as exc:  # noqa: BLE001 - 後処理の失敗で生成を落とさない
+    except Exception as exc:  # noqa: BLE001 - never fail generation over post-processing
         message = (
-            f"見えない面の除去に失敗した（メッシュはそのまま返す）: {type(exc).__name__}: {exc}"
+            f"removing invisible faces failed (mesh returned unchanged): "
+            f"{type(exc).__name__}: {exc}"
         )
         print(f"[postprocess] {message}", file=sys.stderr)
         if stats is not None:
@@ -162,32 +172,38 @@ def drop_small_parts(
     progress: Callable[[str, str], None] | None = None,
     stats: CleanStats | None = None,
 ) -> trimesh.Trimesh:
-    """**外側に浮いた破片を「小ささ」と「薄さ」で落とす**（上流に無い、こちらの追加）。
+    """**Drop free-floating debris by size and thinness** (added on top of upstream).
 
-    判定は成分の外接箱（軸平行）と全体の最長辺の比で、2 つの条件の**両方**を
-    満たす成分だけ残す：
+    Components are judged by their axis-aligned bounding box against the model's
+    longest side, and only components passing **both** tests are kept:
 
-    1. **最長辺が `min_ratio` 以上**（小さな破片を落とす）。面数ではなく空間の大きさで
-       見るのは、細かく分割された小片と、面数が少ないだけの正当な部品を分けるため
-    2. **最短辺が `min_thick_ratio` 以上**（薄片を落とす）。表面から約 1% 浮いて
-       平行に張り付く紙のような薄片は、**長さが 11〜29% あるので 1 だけでは
-       素通りする**（描画では表面の黒い斑点や板状の突起に見える）
+    1. **Longest extent at least `min_ratio`** (drops small debris). Spatial size
+       rather than face count separates finely tessellated crumbs from genuine
+       parts that merely have few faces.
+    2. **Shortest extent at least `min_thick_ratio`** (drops flakes). Paper-thin
+       flakes hovering about 1 % off the surface and lying parallel to it are
+       **11-29 % long, so test 1 alone lets them straight through** (they render
+       as dark speckles and tabs on the surface).
 
-    実測（検体 `i2i_00038_.png`）：しきい値 10% で腕と手（全体の 15%）は残り、
-    目に見える破片（6.5% 以下）は消えた。薄さは、残っていた薄片が**厚み 0.1〜1.4%**、
-    正当な部品（腕・パネル）が**厚み 11.8% 以上**で、2% にすると桁の余裕で分離できた
-    （2026-09-02）。斜めの薄片は軸平行の外接箱では厚めに出るが、実測の薄片はすべて
-    表面に平行＝ほぼ軸平行で問題にならなかった。
+    Measured on the sample `i2i_00038_.png`: at 10 % the arms and hands (15 % of
+    the model) survive and the visible debris (6.5 % and below) is gone. For
+    thinness (2026-09-02), the remaining flakes were **0.1-1.4 % thick** and
+    genuine parts (arms, panels) **11.8 % or more**, so 2 % separates them with
+    an order of magnitude to spare. A tilted flake would measure thicker in an
+    axis-aligned box, but every flake measured lay parallel to the surface and
+    close to axis-aligned, so it did not matter.
 
     Args:
-        mesh: 対象。
-        min_ratio: 残す最小の大きさ（全体の最長辺に対する比）。0 以下なら判定しない。
-        min_thick_ratio: 残す最小の厚み（同）。0 以下なら判定しない。
-        progress: 段の通知先。
-        stats: 記録の置き場。
+        mesh: The mesh to treat.
+        min_ratio: Minimum size to keep, relative to the model's longest side.
+            0 or less skips the test.
+        min_thick_ratio: Minimum thickness to keep, on the same scale. 0 or less
+            skips the test.
+        progress: Where to report the stage.
+        stats: Where to record what happened.
 
     Returns:
-        破片を除いたメッシュ。**最大の成分だけは必ず残す。**
+        The mesh without the debris. **The largest component is always kept.**
     """
     if min_ratio <= 0 and min_thick_ratio <= 0:
         return mesh
@@ -208,7 +224,7 @@ def drop_small_parts(
     if min_thick_ratio > 0:
         thicks = np.array([float(np.min(p.bounding_box.extents)) for p in parts])
         keep &= thicks / whole >= min_thick_ratio
-    keep[int(np.argmax(face_counts))] = True  # 最大の成分は必ず残す
+    keep[int(np.argmax(face_counts))] = True  # always keep the largest component
 
     if stats is not None:
         stats.parts_after = int(keep.sum())
@@ -217,7 +233,8 @@ def drop_small_parts(
     _say(
         progress,
         "drop_parts",
-        f"浮いた破片を落とす（{int((~keep).sum())} 個 / {int(face_counts[~keep].sum())} 面）",
+        f"dropping free-floating debris "
+        f"({int((~keep).sum())} parts / {int(face_counts[~keep].sum())} faces)",
     )
     if not (~keep).any():
         return mesh
@@ -228,10 +245,10 @@ def clean(
     mesh: trimesh.Trimesh,
     progress: Callable[[str, str], None] | None = None,
 ) -> tuple[trimesh.Trimesh, CleanStats]:
-    """後処理をまとめて掛ける。
+    """Apply all post-processing.
 
     Returns:
-        `(後処理後のメッシュ, 記録)`。
+        `(post-processed mesh, record)`.
     """
     stats = CleanStats(faces_before=len(mesh.faces))
 

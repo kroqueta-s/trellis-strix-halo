@@ -1,7 +1,7 @@
 [project]
 name = "hearth"
 version = "0.0.0"
-description = "ローカル 3D 生成モデルの管理と VRAM の監督（Blender アドオンから操作する）"
+description = "TRELLIS runner for AMD Strix Halo (gfx1151) on Windows ROCm"
 requires-python = ">=3.12"
 
 [tool.black]

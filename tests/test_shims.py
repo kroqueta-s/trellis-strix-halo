@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: MIT
-"""TRELLIS 用シムの検算（**推論を回す前に、ここで数値を合わせる**）。
+"""Verify the shims (**get the numbers to agree before running any inference**).
 
-実行は**ランナー側の venv で**（torch が要る）。TRELLIS の venv の python に
-このファイルを渡す。hearth 本体の venv では torch が無いので動かない。
+Run it with this repository's virtual environment (torch is required). It falls
+back to CPU when no GPU is present, which is what CI does.
 
-**このテストは「動いた」ではなく「同じ数が出る」を確かめる。**
+**This checks "the same numbers come out", not "it ran".**
 
-- submanifold 畳み込みは「活性でないボクセルを 0 とした密な `F.conv3d`」と**厳密に一致する**。
-  だから spconv が無くても**参照実装を自前で作れる**。重みの並び（KRSC）と畳み込みの向きを
-  取り違えると、ここで必ず落ちる
-- `flash_attn` の代替は素朴なアテンションと突き合わせる
-
-torch が要るので**ランナー側の venv で動かす**（hearth 本体の venv では動かない）。
+- Submanifold convolution is exactly a dense `F.conv3d` restricted to active
+  voxels, so **a reference implementation can be written without the original
+  library**. Getting the weight layout (KRSC) or the convolution direction wrong
+  fails here, every time.
+- The `flash_attn` replacement is compared against a naive attention
+  implementation.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _random_coords(n: int, res: int, batch: int = 1) -> torch.Tensor:
-    """重複しない `[N, 4]` の座標を作る。"""
+    """Build `[N, 4]` coordinates with no duplicates."""
     g = torch.Generator().manual_seed(0)
     seen: set[tuple[int, int, int, int]] = set()
     while len(seen) < n:
@@ -48,10 +48,11 @@ def _random_coords(n: int, res: int, batch: int = 1) -> torch.Tensor:
 def _dense_reference(
     coords: torch.Tensor, feats: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, res: int
 ) -> torch.Tensor:
-    """密な `F.conv3d` で submanifold 畳み込みの正解を作る。
+    """Produce the ground truth for submanifold convolution with a dense `F.conv3d`.
 
-    活性でないボクセルを 0 で埋めた密なボリュームに普通の畳み込みを掛け、
-    活性ボクセルの位置だけ取り出せば submanifold 畳み込みそのものになる。
+    Filling a dense volume with zeros at inactive voxels, running an ordinary
+    convolution, and reading back only the active positions is submanifold
+    convolution by definition.
     """
     batch = int(coords[:, 0].max().item()) + 1
     out_c, k, _, _, in_c = weight.shape
@@ -59,14 +60,14 @@ def _dense_reference(
     idx = coords.long()
     vol[idx[:, 0], idx[:, 1], idx[:, 2], idx[:, 3]] = feats.float()
     vol = vol.permute(0, 4, 1, 2, 3)  # [B, Cin, D, H, W]
-    # spconv の KRSC [out, kD, kH, kW, in] を torch の [out, in, kD, kH, kW] へ
+    # spconv KRSC [out, kD, kH, kW, in] -> torch [out, in, kD, kH, kW]
     w = weight.permute(0, 4, 1, 2, 3).float()
     dense = F.conv3d(vol, w, bias=bias.float(), padding=k // 2)
     return dense[idx[:, 0], :, idx[:, 1], idx[:, 2], idx[:, 3]]
 
 
 def test_submanifold_conv_matches_dense_conv() -> None:
-    """カーネル 3 の submanifold 畳み込みが密な畳み込みと一致する。"""
+    """Kernel-3 submanifold convolution agrees with dense convolution."""
     shims._install_spconv()
     res, n, in_c, out_c = 16, 400, 8, 6
     coords = _random_coords(n, res)
@@ -79,11 +80,11 @@ def test_submanifold_conv_matches_dense_conv() -> None:
     got = conv(x).features
     want = _dense_reference(coords, feats, conv.weight.data, conv.bias.data, res)
     err = (got - want).abs().max().item()
-    assert err < 2e-4, f"密な畳み込みと一致しない: 最大誤差 {err}"
+    assert err < 2e-4, f"disagrees with dense convolution: max error {err}"
 
 
 def test_submanifold_conv_kernel1() -> None:
-    """カーネル 1（skip connection）も一致する。"""
+    """Kernel 1 (the skip connection) agrees too."""
     shims._install_spconv()
     res, n, in_c, out_c = 12, 200, 5, 7
     coords = _random_coords(n, res)
@@ -96,11 +97,11 @@ def test_submanifold_conv_kernel1() -> None:
     got = conv(x).features
     want = _dense_reference(coords, feats, conv.weight.data, conv.bias.data, res)
     err = (got - want).abs().max().item()
-    assert err < 2e-4, f"カーネル 1 で一致しない: 最大誤差 {err}"
+    assert err < 2e-4, f"disagrees at kernel 1: max error {err}"
 
 
 def test_submanifold_conv_multi_batch() -> None:
-    """バッチが 2 でも隣のバッチの特徴を拾わない。"""
+    """With a batch of 2, features never leak across the batch boundary."""
     shims._install_spconv()
     res, n, in_c, out_c = 10, 300, 4, 4
     coords = _random_coords(n, res, batch=2)
@@ -113,14 +114,15 @@ def test_submanifold_conv_multi_batch() -> None:
     got = conv(x).features
     want = _dense_reference(coords, feats, conv.weight.data, conv.bias.data, res)
     err = (got - want).abs().max().item()
-    assert err < 2e-4, f"バッチ 2 で一致しない: 最大誤差 {err}"
+    assert err < 2e-4, f"disagrees with a batch of 2: max error {err}"
 
 
 def test_submanifold_conv_chunking_matches() -> None:
-    """**塊に切って処理しても結果が変わらない**（境界で取りこぼさない）。
+    """**Chunking does not change the result** (nothing is lost at the seams).
 
-    VRAM を溢れさせないために出力ボクセルを `VOXEL_CHUNK` ずつ処理している。
-    切れ目でずれると、**落ちずに静かに違う形が出る**ので必ず検算する。
+    Output voxels are processed `VOXEL_CHUNK` at a time to avoid overflowing
+    VRAM. A mistake at a seam **produces a different shape without failing**, so
+    it is always verified.
     """
     shims._install_spconv()
     res, n, in_c, out_c = 14, 500, 6, 5
@@ -138,13 +140,13 @@ def test_submanifold_conv_chunking_matches() -> None:
             x = shims.SparseConvTensor(feats, coords, [res, res, res], 1)
             got = conv(x).features
             err = (got - want).abs().max().item()
-            assert err < 2e-4, f"VOXEL_CHUNK={chunk} で一致しない: 最大誤差 {err}"
+            assert err < 2e-4, f"disagrees at VOXEL_CHUNK={chunk}: max error {err}"
     finally:
         shims.VOXEL_CHUNK = original
 
 
 def test_rulebook_cache_is_keyed_by_coords() -> None:
-    """`indice_key` の使い回しは、座標が同じときだけ効く。"""
+    """Reuse through `indice_key` applies only when the coordinates are the same."""
     shims._install_spconv()
     res, n = 8, 50
     coords = _random_coords(n, res)
@@ -152,15 +154,15 @@ def test_rulebook_cache_is_keyed_by_coords() -> None:
     conv = shims._SubMConv3dImpl(3, 3, 3, indice_key="res_16").to(DEVICE)
     x = shims.SparseConvTensor(feats, coords, [res, res, res], 1)
     conv(x)
-    assert "_shim_rb_res_16" in x.indice_dict, "rulebook が載っていない"
+    assert "_shim_rb_res_16" in x.indice_dict, "the rulebook was not cached"
     other = shims.SparseConvTensor(
         feats, coords.clone(), [res, res, res], 1, indice_dict=x.indice_dict
     )
-    conv(other)  # 座標のオブジェクトが違うので作り直されるだけ。落ちないことを見る
+    conv(other)  # a different coordinate object just rebuilds it; check it does not raise
 
 
 def test_dense_expansion() -> None:
-    """`SparseConvTensor.dense()` が座標どおりに散らす。"""
+    """`SparseConvTensor.dense()` scatters to the right coordinates."""
     shims._install_spconv()
     coords = torch.tensor([[0, 1, 2, 3], [0, 0, 0, 0]], dtype=torch.int32, device=DEVICE)
     feats = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device=DEVICE)
@@ -173,14 +175,14 @@ def test_dense_expansion() -> None:
 
 
 def _naive_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """`[S, H, D]` を素朴に計算する参照実装。"""
+    """Reference implementation over `[S, H, D]`, written the obvious way."""
     scale = q.shape[-1] ** -0.5
     attn = torch.softmax((q.transpose(0, 1) @ k.transpose(0, 1).transpose(-2, -1)) * scale, dim=-1)
     return (attn @ v.transpose(0, 1)).transpose(0, 1)
 
 
 def test_flash_attn_varlen_qkvpacked() -> None:
-    """可変長の qkv パック版が素朴な実装と一致する（境界をまたがない）。"""
+    """The variable-length qkv-packed form agrees, never crossing a segment boundary."""
     fa = shims._make_flash_attn(head_chunk=2, fp32=True)
     lens = [7, 13]
     total, heads, dim = sum(lens), 4, 16
@@ -192,11 +194,11 @@ def test_flash_attn_varlen_qkvpacked() -> None:
         dim=0,
     )
     err = (got - want).abs().max().item()
-    assert err < 1e-5, f"varlen qkvpacked が一致しない: 最大誤差 {err}"
+    assert err < 1e-5, f"varlen qkvpacked disagrees: max error {err}"
 
 
 def test_flash_attn_varlen_kvpacked() -> None:
-    """cross attention（q と kv の長さが違う）版が一致する。"""
+    """The cross-attention form (q and kv of different lengths) agrees."""
     fa = shims._make_flash_attn(head_chunk=3, fp32=True)
     tq, tk, heads, dim = 11, 19, 6, 8
     q = torch.randn(tq, heads, dim, device=DEVICE)
@@ -206,22 +208,22 @@ def test_flash_attn_varlen_kvpacked() -> None:
     got = fa.flash_attn_varlen_kvpacked_func(q, kv, cu_q, cu_k, tq, tk)
     want = _naive_attention(q, kv[:, 0], kv[:, 1])
     err = (got - want).abs().max().item()
-    assert err < 1e-5, f"varlen kvpacked が一致しない: 最大誤差 {err}"
+    assert err < 1e-5, f"varlen kvpacked disagrees: max error {err}"
 
 
 def test_flash_attn_qkvpacked_batched() -> None:
-    """バッチ付き（windowed attention が使う）版が一致する。"""
+    """The batched form, used by windowed attention, agrees."""
     fa = shims._make_flash_attn(head_chunk=2, fp32=True)
     batch, seq, heads, dim = 3, 9, 4, 8
     qkv = torch.randn(batch, seq, 3, heads, dim, device=DEVICE)
     got = fa.flash_attn_qkvpacked_func(qkv)
     want = torch.stack([_naive_attention(*qkv[b].unbind(dim=1)) for b in range(batch)], dim=0)
     err = (got - want).abs().max().item()
-    assert err < 1e-5, f"qkvpacked が一致しない: 最大誤差 {err}"
+    assert err < 1e-5, f"qkvpacked disagrees: max error {err}"
 
 
 def test_kaolin_check_tensor() -> None:
-    """FlexiCubes が使う `check_tensor` が形を見ている。"""
+    """The `check_tensor` FlexiCubes uses really does check the shape."""
     shims._install_kaolin()
     from kaolin.utils.testing import check_tensor
 
@@ -232,7 +234,7 @@ def test_kaolin_check_tensor() -> None:
 
 
 def main() -> int:
-    """全テストを実行する。"""
+    """Run every test."""
     print(f"device: {DEVICE}")
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
@@ -243,7 +245,7 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             failed += 1
             print(f"  FAIL {t.__name__}: {type(exc).__name__}: {exc}")
-    print(f"\n{len(tests) - failed}/{len(tests)} 成功")
+    print(f"\n{len(tests) - failed}/{len(tests)} passed")
     return 1 if failed else 0
 
 

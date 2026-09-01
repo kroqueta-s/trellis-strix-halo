@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
-"""メッシュを PNG にする（**運用者は画面を見ていないので、目視確認は画像で渡す**）。
+"""Render a mesh to PNG (**visual checks travel as images**).
 
-OpenGL も外部レンダラも使わない。点群スプラッティング＋Z バッファだけの
-素朴な実装で、numpy と trimesh しか要らない（GPU も要らない）。
-形が出ているか・穴が空いていないかを人が見るための道具である。
+No OpenGL and no external renderer: a plain point-splatting rasterizer with a
+z-buffer, needing only numpy and trimesh (and no GPU). It exists so a human can
+see whether the shape came out and whether there are holes in it.
 
-実行例:
+Example:
 
     python tools/render_mesh.py mesh.ply out.png --views 4 --size 512
 """
@@ -21,7 +21,7 @@ from PIL import Image
 
 
 def _vertex_normals(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
-    """面法線を頂点へ集めて正規化する。"""
+    """Accumulate face normals onto vertices and normalize."""
     normals = np.zeros_like(verts)
     tri = verts[faces]
     face_n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
@@ -32,7 +32,7 @@ def _vertex_normals(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
 
 
 def _rotation(yaw: float, pitch: float) -> np.ndarray:
-    """Y 軸まわり → X 軸まわりの回転行列。"""
+    """Rotation matrix: about Y, then about X."""
     cy, sy = np.cos(yaw), np.sin(yaw)
     cx, sx = np.cos(pitch), np.sin(pitch)
     ry = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]])
@@ -43,7 +43,7 @@ def _rotation(yaw: float, pitch: float) -> np.ndarray:
 def _render_one(
     verts: np.ndarray, normals: np.ndarray, size: int, yaw: float, pitch: float, splat: int
 ) -> np.ndarray:
-    """1 視点を描く。正射影・Z バッファ・Lambert のフラットシェーディング。"""
+    """Draw one view: orthographic projection, z-buffer, flat Lambert shading."""
     rot = _rotation(yaw, pitch)
     p = verts @ rot.T
     n = normals @ rot.T
@@ -60,7 +60,7 @@ def _render_one(
 
     zbuf = np.full((size, size), -np.inf, dtype=np.float64)
     img = np.zeros((size, size), dtype=np.float64)
-    # 手前のものが勝つように、奥から順に書く（同じ画素は後勝ちでよい）。
+    # Draw back to front so nearer points win (last write to a pixel is fine).
     order = np.argsort(depth)
     for dy in range(-splat, splat + 1):
         for dx in range(-splat, splat + 1):
@@ -82,12 +82,14 @@ def render(
     rotx: float = 0.0,
     largest_only: bool = False,
 ) -> None:
-    """メッシュを複数視点で描いて 1 枚の PNG にまとめる。
+    """Draw the mesh from several viewpoints into a single PNG strip.
 
     Args:
-        rotx: 描く前に X 軸まわりへ回す角度（度）。モデルごとに上方向の約束が違うため。
-        largest_only: 真なら**最大の連結成分だけ**を描く。
-            浮いている破片が「実体か、点描のノイズか」を切り分けるために使う。
+        rotx: Degrees to rotate about the X axis before drawing, because models
+            disagree about which axis points up.
+        largest_only: If true, draw **only the largest connected component**.
+            Use it to tell whether floating debris is real geometry or just
+            splatting noise.
     """
     mesh = trimesh.load(mesh_path, process=False)
     if largest_only:
@@ -111,7 +113,7 @@ def render(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="メッシュを PNG にする")
+    parser = argparse.ArgumentParser(description="Render a mesh to PNG")
     parser.add_argument("mesh")
     parser.add_argument("out")
     parser.add_argument("--size", type=int, default=512)
@@ -119,7 +121,7 @@ def main() -> int:
     parser.add_argument("--splat", type=int, default=1)
     parser.add_argument("--rotx", type=float, default=0.0)
     parser.add_argument(
-        "--largest-only", action="store_true", help="最大の連結成分だけを描く"
+        "--largest-only", action="store_true", help="draw only the largest connected component"
     )
     args = parser.parse_args()
     render(

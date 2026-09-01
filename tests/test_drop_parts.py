@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
-"""`drop_small_parts`（小ささ＋薄さ）の検算。
+"""Verify `drop_small_parts` (size and thinness).
 
-合成メッシュで「本体・正当な部品・小さな破片・表面の薄片」を作り、
-**残るべきものが残り、消えるべきものが消える**ことを確かめる。
+A synthetic mesh is built from a body, a genuine detached part, a small crumb
+and a surface flake, to confirm that **what should survive survives and what
+should go is gone**.
 
-実行はこの venv で（trimesh が要る。torch は postprocess の import が引く）::
+Run it with this repository's virtual environment (trimesh is required; torch
+comes in through the postprocess import)::
 
     .venv\\Scripts\\python.exe .\\tests\\test_drop_parts.py
 """
@@ -30,15 +32,15 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def build_specimen() -> tuple[trimesh.Trimesh, int]:
-    """本体＋部品＋破片＋薄片。返り値は (メッシュ, 残るべき面数)。"""
+    """Body, part, crumb and flake. Returns (mesh, face count that should survive)."""
     body = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
-    # 正当な部品：大きさ 20%・厚み 20%（腕のつもり）
+    # A genuine part: 20 % long, 20 % thick (an arm, say).
     limb = trimesh.creation.box(extents=(0.2, 0.2, 0.2))
     limb.apply_translation((0.8, 0.0, 0.0))
-    # 小さな破片：大きさ 5%（従来の基準で消える）
+    # A small crumb: 5 % long (the size test alone already removes it).
     crumb = trimesh.creation.box(extents=(0.05, 0.05, 0.05))
     crumb.apply_translation((0.0, 0.8, 0.0))
-    # 表面の薄片：長さ 30%・厚み 0.5%（従来の基準を素通りしていたゴミ）
+    # A surface flake: 30 % long, 0.5 % thick (this is what used to slip through).
     flake = trimesh.creation.box(extents=(0.3, 0.3, 0.005))
     flake.apply_translation((0.0, 0.0, 0.51))
     mesh = trimesh.util.concatenate([body, limb, crumb, flake])
@@ -49,24 +51,27 @@ def run(label: str, drop_small_parts) -> None:  # noqa: ANN001
     mesh, want_faces = build_specimen()
     out = drop_small_parts(mesh, min_ratio=0.10, min_thick_ratio=0.02)
     parts = out.split(only_watertight=False)
-    check(f"{label}: 本体と部品の 2 成分が残る", len(parts) == 2, f"got {len(parts)}")
-    check(f"{label}: 面数が本体＋部品と一致する", len(out.faces) == want_faces)
+    check(f"{label}: body and part survive as two components", len(parts) == 2, f"got {len(parts)}")
+    check(f"{label}: face count matches body plus part", len(out.faces) == want_faces)
 
-    # 薄さ判定を切れば薄片は残る（0 で無効の約束）
+    # With the thinness test off, the flake stays (0 must mean disabled).
     out2 = drop_small_parts(mesh, min_ratio=0.10, min_thick_ratio=0.0)
     check(
-        f"{label}: min_thick_ratio=0 なら薄片は残る",
+        f"{label}: min_thick_ratio=0 keeps the flake",
         len(out2.split(only_watertight=False)) == 3,
     )
 
-    # 両方 0 なら何もしない
+    # Both at 0 does nothing at all.
     out3 = drop_small_parts(mesh, min_ratio=0.0, min_thick_ratio=0.0)
-    check(f"{label}: 両方 0 なら何もしない", len(out3.faces) == len(mesh.faces))
+    check(f"{label}: both at 0 changes nothing", len(out3.faces) == len(mesh.faces))
 
-    # 本体が薄くても最大成分は必ず残る
+    # The largest component survives even when it is itself thin.
     thin_body = trimesh.creation.box(extents=(1.0, 1.0, 0.01))
     out4 = drop_small_parts(thin_body.copy(), min_ratio=0.10, min_thick_ratio=0.02)
-    check(f"{label}: 最大成分は必ず残る", len(out4.faces) == len(thin_body.faces))
+    check(
+        f"{label}: the largest component always survives",
+        len(out4.faces) == len(thin_body.faces),
+    )
 
 
 def main() -> int:
@@ -75,7 +80,7 @@ def main() -> int:
     run("trellis", tre.drop_small_parts)
 
     total = 5
-    print(f"\n{total - len(FAILURES)}/{total} 成功")
+    print(f"\n{total - len(FAILURES)}/{total} passed")
     return 1 if FAILURES else 0
 
 

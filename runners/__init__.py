@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""モデルランナー群。**各ランナーは自分の中で閉じている**（hearth を import しない）。
+"""Model runners. **Each runner is self-contained** and never imports hearth.
 
-将来それぞれ独立リポジトリ（`hunyuan3d-strix-halo` 等）へ出す。
+Each one ships as its own repository (`hunyuan3d-strix-halo` and friends).
 """

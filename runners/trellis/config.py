@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
-"""TRELLIS ランナーの設定（`.env` から読み込む）。
+"""Configuration for the TRELLIS runner, read from `.env`.
 
-**このランナーは自分の中で閉じている。** hearth の設定を参照しないので、
-`trellis-strix-halo` として独立リポジトリへ出しても、そのまま動く。
+**This runner is self-contained.** It never reads hearth's configuration, so it
+works unchanged as the standalone `trellis-strix-halo` repository.
 """
 
 from __future__ import annotations
@@ -12,8 +12,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# runners/trellis/config.py -> リポジトリのルート。
-# 独立リポジトリへ出したときも、同じ位置関係になるよう配置する。
+# runners/trellis/config.py -> the repository root.
 REPO_ROOT: Path = Path(__file__).resolve().parent.parent.parent
 load_dotenv(REPO_ROOT / ".env")
 
@@ -40,66 +39,77 @@ def _bool(key: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-# 上流の clone（**フォークしない**。素の clone をそのまま使う）。
+# The upstream clone (**never a fork**; the plain clone is used as-is).
 TRELLIS_REPO: Path = Path(_str("TRELLIS_REPO"))
-# 重みの置き場（`pipeline.json` があるディレクトリ）。
+# Where the weights live (the directory holding `pipeline.json`).
 TRELLIS_WEIGHTS_DIR: Path = Path(_str("TRELLIS_WEIGHTS_DIR"))
 
-# 上流の既定は `pipeline.json` の 25 / 5.0。
+# Upstream defaults, from `pipeline.json`: 25 steps and cfg 5.0.
 SS_STEPS: int = _int("TRELLIS_SS_STEPS", 25)
 SLAT_STEPS: int = _int("TRELLIS_SLAT_STEPS", 25)
 SS_GUIDANCE: float = _float("TRELLIS_SS_GUIDANCE", 5.0)
 SLAT_GUIDANCE: float = _float("TRELLIS_SLAT_GUIDANCE", 5.0)
 
-# アテンションを何ヘッドずつ計算するか。gfx1151 では Hunyuan3D 実測で 4 が最良だった。
-# **根拠なく変えない。**
+# Attention heads computed at once. Measured best on Hunyuan3D at 4 on gfx1151.
+# **Do not change it without evidence.**
 ATTN_HEAD_CHUNK: int = _int("TRELLIS_ATTN_HEAD_CHUNK", 4)
 
-# **torch を import する前に** TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL を立てるか。
-# 実測（2026-09-01・gfx1151）：立てると flash / mem-efficient が使えるようになり、
-# seq=4096 で 0.135s -> 0.012s、seq=9216 で 1.167s -> 0.059s。出力は一致する。
-# **後から os.environ へ入れても効かない**ので、`__main__.py` の先頭で置く。
+# Whether to set TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL **before torch is
+# imported**. Measured 2026-09-01 on gfx1151: it makes the flash and
+# memory-efficient kernels available, taking seq=4096 from 0.135s to 0.012s and
+# seq=9216 from 1.167s to 0.059s, with identical output. **Setting it afterwards
+# has no effect**, so it goes at the top of `__main__.py`.
 FAST_ATTENTION: bool = _bool("TRELLIS_FAST_ATTENTION", True)
 
-# 生成中だけ「3D の常夜灯」を点けるか（`gfxlight.py`）。Windows の AMD ドライバは
-# compute だけの負荷ではクロックを上げない（実測：GEMM 単独 600 MHz / 3D 併用 2.35 GHz・
-# 4.3 倍）。点かなくても生成は従来どおり動く。効いたかは metrics.gfx_keepalive に載る。
+# Whether to run the clock keepalive during generation (`gfxlight.py`). The AMD
+# Windows driver does not raise the clock for compute-only work (measured: GEMM
+# alone 600 MHz, with 3D alongside 2.35 GHz, a 4.3x difference). Generation
+# works as before if it fails to start; `metrics.gfx_keepalive` records whether
+# it was alive.
 GFX_KEEPALIVE: bool = _bool("TRELLIS_GFX_KEEPALIVE", True)
 
 
-# **専用 VRAM の上限（GB）。** gfx1151 の専用 VRAM は 32GB だが、
-# `torch.cuda.mem_get_info` の total は共有メモリ込みの 43.87GB を返す。
-# そのため溢れても例外にならず、**黙って数倍遅くなる**（2026-09-01 に実測で踏んだ）。
-# ここを torch にも伝えて、超えたら OOM で**すぐ落ちる**ようにする。
+# **Cap on dedicated VRAM (GB).** gfx1151 has 32 GB of dedicated VRAM, but the
+# total from `torch.cuda.mem_get_info` is 43.87 GB because it counts shared
+# memory. Overflow therefore raises nothing and **silently becomes several times
+# slower** (measured on 2026-09-01). Passing the cap to torch as well turns that
+# into an **immediate OOM**.
 VRAM_LIMIT_GB: float = _float("TRELLIS_VRAM_LIMIT_GB", 30.0)
 
-# 生存確認を流す間隔（秒）。**黙って長時間走らせない**ためのもの。
+# Heartbeat interval in seconds. It exists so that **nothing runs silently for a
+# long time**.
 HEARTBEAT_SEC: float = _float("TRELLIS_HEARTBEAT_SEC", 10.0)
 
 
-# --- 後処理（上流の postprocess_mesh に倣う） -------------------------------
-# **上流の `_fill_holes` を掛けるか。** 多視点ラスタライズで可視率を出し、
-# 可視率 0 の面（内側に閉じ込められた殻）を min-cut で落とす本家の手法。
+# --- Post-processing (following upstream's postprocess_mesh) ------------------
+# **Whether to run upstream's `_fill_holes`**: their method of rasterizing many
+# views, computing a visibility ratio per face, and cutting the faces with zero
+# visibility (shells sealed inside) with a min-cut.
 FILL_HOLES: bool = _bool("TRELLIS_FILL_HOLES", True)
 
-# 視点数と解像度。**本家の既定は 1000 視点 / 1024^2 だが、本機では 244 秒かかる**
-# （面 697,152 での実測）。150 視点なら約 37 秒。TRELLIS-AMD も 100 視点へ落として
-# 「見た目に区別がつかない」と報告している。
+# View count and resolution. **Upstream defaults to 1000 views at 1024^2, which
+# takes 244 seconds on this machine** (measured on a 697,152-face mesh); 150
+# views take about 37 seconds. TRELLIS-AMD also dropped to 100 views and
+# reported no visible difference.
 FILL_HOLES_VIEWS: int = _int("TRELLIS_FILL_HOLES_VIEWS", 150)
 FILL_HOLES_RESOLUTION: int = _int("TRELLIS_FILL_HOLES_RESOLUTION", 1024)
 FILL_HOLES_MAX_SIZE: float = _float("TRELLIS_FILL_HOLES_MAX_SIZE", 0.04)
-# **上流の既定 32 では足りない。** 上流は先に 0.95 で間引くので境界ループの辺が少ないが、
-# こちらは間引かないので同じ穴でも辺が数倍多くなる（実測：最大 146 頂点のループが残り、
-# watertight が崩れた）。250 にすると境界ループ 0 本・watertight に戻ることを確認した。
+# **Upstream's default of 32 is not enough here.** Upstream decimates to 0.95
+# first, so its boundary loops have few edges; this runner does not decimate, so
+# the same hole has several times as many (measured: a 146-vertex loop survived
+# and watertightness was lost). At 250 there are zero boundary loops and the
+# mesh is watertight again.
 FILL_HOLES_MAX_NBE: int = _int("TRELLIS_FILL_HOLES_MAX_NBE", 250)
 
-# **上流に無い、こちらの追加。** 外側に浮いた破片を大きさで落とす。
-# 成分の外接箱の最長辺が全体の何割未満なら捨てるか。0 で無効。
-# 実測では 10% で腕と手（15%）は残り、目に見える破片（6.5% 以下）が消えた。
+# **Added on top of upstream.** Drop free-floating debris by size: the fraction
+# of the model's longest side below which a component's longest bounding-box
+# extent is discarded. 0 disables it. Measured: at 10 % the arms and hands
+# (15 %) survive and the visible debris (6.5 % and below) is gone.
 DROP_SMALL_PARTS: float = _float("TRELLIS_DROP_SMALL_PARTS", 0.10)
 
-# **これも上流に無い追加。** 外接箱の最短辺が全体の最長辺のこの比未満の分離成分
-# （＝紙のような薄片）を落とす。表面から約 1% 浮いた薄片は長さが 11〜29% あるので
-# DROP_SMALL_PARTS だけでは素通りする。実測：薄片は厚み 1.4% 以下・正当な部品は
-# 11.8% 以上（2026-09-02）。0 で無効。
+# **Also added on top of upstream.** Drop detached components whose bounding-box
+# minimum extent is below this fraction of the model's longest side (paper-thin
+# flakes). Flakes hovering about 1 % off the surface are 11-29 % long, so
+# DROP_SMALL_PARTS alone lets them through. Measured 2026-09-02: flakes are
+# 1.4 % thick or less, genuine parts 11.8 % or more. 0 disables it.
 DROP_THIN_PARTS: float = _float("TRELLIS_DROP_THIN_PARTS", 0.02)
