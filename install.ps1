@@ -22,12 +22,17 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Root = (Join-Path (Split-Path -Parent $PSScriptRoot) "trellis-strix-halo-data"),
+    # Where the virtual environment, the upstream clone and the weights go.
+    # Empty means: next to this repository, in trellis-strix-halo-data.
+    [string]$Root = "",
     [string]$Python = "py -3.12"
 )
 
 $ErrorActionPreference = "Stop"
-$repo = $PSScriptRoot
+# $PSScriptRoot can be empty while param defaults are evaluated under
+# Windows PowerShell 5.1, so the paths are resolved here instead.
+$repo = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $Root) { $Root = Join-Path (Split-Path -Parent $repo) "trellis-strix-halo-data" }
 
 # Pinned versions. Do not float these: the ROCm wheels and the upstream commit
 # are the two things that decide whether this works at all.
