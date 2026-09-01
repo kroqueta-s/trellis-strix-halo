@@ -68,7 +68,10 @@ Write-Host "==> Installing ROCm PyTorch"
 # 3. Upstream repository (never forked, never patched) ------------------------
 if (-not (Test-Path $upstream)) {
     Write-Host "==> Cloning upstream TRELLIS"
-    git clone $UpstreamUrl $upstream
+    # A shallow clone: the full TRELLIS history in particular is so large that
+    # the server-side pack preparation can stall for many minutes. The pinned
+    # commit is fetched right below, also shallow.
+    git clone --depth 1 $UpstreamUrl $upstream
 }
 Push-Location $upstream
 git fetch --depth 1 origin $UpstreamCommit
