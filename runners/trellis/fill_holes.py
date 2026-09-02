@@ -38,6 +38,8 @@ from collections.abc import Callable
 import numpy as np
 import torch
 
+from .steps import StepCounter, counted
+
 
 def _cameras(num_views: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     """Build upstream's viewpoints (Hammersley sequence, radius 2.0, 40-degree FOV)."""
@@ -87,14 +89,26 @@ def visibility(
     views, projection = _cameras(num_views, verts.device)
     seen = torch.zeros(faces.shape[0], dtype=torch.int32, device=verts.device)
     ctx = utils3d.torch.RastContext(backend="cuda")
-    for i in range(views.shape[0]):
-        buffers = utils3d.torch.rasterize_triangle_faces(
-            ctx, verts[None], faces, resolution, resolution, view=views[i], projection=projection
-        )
-        face_id = buffers["face_id"][0][buffers["mask"][0] > 0.95] - 1
-        seen[torch.unique(face_id).long()] += 1
-        if progress is not None and (i + 1) % 50 == 0:
-            progress("raster", f"measuring visibility ({i + 1}/{views.shape[0]} views)")
+    # **This loop is ours**, so it is counted directly rather than through a
+    # hook. It used to report only every 50th view, which said almost nothing
+    # over the 36 s it takes.
+    counter = StepCounter()
+    counter.bind(progress, "raster", "measuring visibility")
+    try:
+        for i in counted(range(int(views.shape[0])), counter):
+            buffers = utils3d.torch.rasterize_triangle_faces(
+                ctx,
+                verts[None],
+                faces,
+                resolution,
+                resolution,
+                view=views[i],
+                projection=projection,
+            )
+            face_id = buffers["face_id"][0][buffers["mask"][0] > 0.95] - 1
+            seen[torch.unique(face_id).long()] += 1
+    finally:
+        counter.bind(None, "raster")
     return seen.float() / num_views
 
 

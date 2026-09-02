@@ -25,12 +25,15 @@ import trimesh
 from PIL import Image
 
 from . import config, postprocess, shims
+from .steps import StepCounter, count_tqdm
 
 NAME = "trellis"
 VERSION = "image-large"
 
 _PIPELINE: Any = None
 _LOAD_SEC: float = 0.0
+# Counts whichever sampling loop is running. Rebound for each stage.
+_STEPS = StepCounter()
 # Whether fast attention (AOTriton) is in effect. **Recorded in metrics.**
 _FAST_ATTENTION: bool = False
 
@@ -200,6 +203,15 @@ def load_pipeline(progress: Callable[[str, str], None] | None = None) -> Any:
     _say("to_gpu", "moving to the GPU")
     pipeline.cuda()
     _LOAD_SEC = time.perf_counter() - started
+
+    # **Count the sampling steps.** Both samplers loop inside
+    # `flow_euler.py` over a `tqdm`, so replacing that one module's `tqdm`
+    # covers the sparse-structure pass and the latent pass alike. The stage name
+    # comes from whichever call is running (see `generate_mesh`).
+    from trellis.pipelines.samplers import flow_euler
+
+    count_tqdm(flow_euler, _STEPS)
+
     _say("loaded", f"loading finished ({_LOAD_SEC:.1f}s)")
     _PIPELINE = pipeline
     return _PIPELINE
@@ -305,18 +317,28 @@ def generate_mesh(
             if progress is not None:
                 progress("structure", f"sampling the sparse structure (steps={ss})")
             step_started = time.perf_counter()
-            coords = pipeline.sample_sparse_structure(
-                cond, 1, {"steps": ss, "cfg_strength": ss_cfg}
-            )
+            # **The count belongs to the stage that is running.** Both samplers
+            # share one loop, so the stage is named here rather than in the hook.
+            _STEPS.bind(progress, "structure", "sampling the sparse structure")
+            try:
+                coords = pipeline.sample_sparse_structure(
+                    cond, 1, {"steps": ss, "cfg_strength": ss_cfg}
+                )
+            finally:
+                _STEPS.bind(None, "structure")
             structure_sec = time.perf_counter() - step_started
             n_voxels = int(coords.shape[0])
 
             if progress is not None:
                 progress("slat", f"sampling the latent (steps={slat} / {n_voxels} active voxels)")
             step_started = time.perf_counter()
-            slat_latent = pipeline.sample_slat(
-                cond, coords, {"steps": slat, "cfg_strength": slat_cfg}
-            )
+            _STEPS.bind(progress, "slat", "sampling the latent")
+            try:
+                slat_latent = pipeline.sample_slat(
+                    cond, coords, {"steps": slat, "cfg_strength": slat_cfg}
+                )
+            finally:
+                _STEPS.bind(None, "slat")
             slat_sec = time.perf_counter() - step_started
 
             if progress is not None:

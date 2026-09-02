@@ -54,10 +54,22 @@ Generate a mesh from the bundled sample, no JSON required:
 .venv\Scripts\python.exe tools\run_single.py --image assets\sample.png --out C:\out
 ```
 
-Progress streams to the console; the mesh lands in `C:\out\raw.ply`. To
-reproduce the benchmark below, run the same command **twice and time the second
-run**: the first run includes MIOpen's one-time convolution tuning, which says
-nothing about steady-state speed.
+The mesh lands in `C:\out\raw.ply`. Progress streams to the console, with a bar
+for every stage whose steps can be counted:
+
+```
+[   32.1s] structure  [############------------]  50%  (12/25)
+[   58.4s] slat       [######------------------]  25%  (6/25)
+```
+
+**The percentage is counted, never estimated**, and there is no ETA on purpose:
+on this hardware the first run of a loop can be an order of magnitude slower
+than every run after it, so a prediction would mislead exactly when it mattered.
+Stages whose length is not known report a step number and nothing more.
+
+To reproduce the benchmark below, run the same command **twice and time the
+second run**: the first run includes MIOpen's one-time convolution tuning, which
+says nothing about steady-state speed.
 
 ## Use
 

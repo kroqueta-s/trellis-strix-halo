@@ -238,8 +238,18 @@ def main() -> int:
             )
             continue
 
-        def progress(stage: str, message: str = "", _id: int = request_id) -> None:
-            emit(out, {"id": _id, "event": "progress", "stage": stage, "message": message})
+        def progress(
+            stage: str,
+            message: str = "",
+            _id: int = request_id,
+            **extra: Any,
+        ) -> None:
+            # `extra` carries `step` and, when the length is known, `total`.
+            # **Nothing estimated ever goes in here** (see steps.py).
+            emit(
+                out,
+                {"id": _id, "event": "progress", "stage": stage, "message": message, **extra},
+            )
 
         # **Clock keepalive** (gfxlight.py). Compute alone does not make the
         # driver raise the clock.
