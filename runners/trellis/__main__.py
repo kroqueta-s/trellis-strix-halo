@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 from typing import Any, TextIO
 
-from . import config, gfxlight
+from . import config, displaykeep, gfxlight
 
 # **Has no effect unless it precedes torch** (setting os.environ later is
 # ignored). It makes the flash and memory-efficient kernels available on
@@ -267,12 +267,23 @@ def main() -> int:
         if method_name == "image_to_mesh" and config.GFX_KEEPALIVE:
             light = gfxlight.GfxLight()
             light.start()
+        # **Display keepalive** (displaykeep.py). With the console display off
+        # the driver pins the GPU near 600 MHz and generation runs ~4x slower;
+        # holding the display awake prevents that. **Off by default** - it
+        # keeps the panel lit (see config.py and gfx1151-gemm
+        # docs/displayoff.md).
+        keep: displaykeep.DisplayKeep | None = None
+        if method_name == "image_to_mesh" and config.DISPLAY_KEEPALIVE:
+            keep = displaykeep.DisplayKeep()
+            keep.start()
         try:
             result = method(dict(request.get("params") or {}), progress)
             if light is not None and isinstance(result.get("metrics"), dict):
                 # Whether it stayed alive to the end. False means it may not
                 # have taken effect.
                 result["metrics"]["gfx_keepalive"] = light.is_lit()
+            if keep is not None and isinstance(result.get("metrics"), dict):
+                result["metrics"]["display_keepalive"] = keep.is_held()
             emit(out, {"id": request_id, "event": "result", "result": result})
         except Exception as exc:  # noqa: BLE001 - always answer, whatever happens
             import traceback
@@ -289,6 +300,8 @@ def main() -> int:
         finally:
             if light is not None:
                 light.stop()
+            if keep is not None:
+                keep.stop()
 
     print(f"[{NAME}] runner exiting.", file=sys.stderr)
     return 0

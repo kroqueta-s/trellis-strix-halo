@@ -155,7 +155,13 @@ three runners in this family.
   silently spilling into shared memory and becoming several times slower. If
   you hit it, close other GPU consumers (check dedicated-VRAM usage in Task
   Manager's Performance tab); peak use for the defaults is about 12 GB.
-- **The first run looks hung.** It is not. MIOpen tunes convolution kernels
+- **Generation is ~4x slower when you are away.** If the console display
+  turns off (lid, or the display-off timeout, locked or not), the driver
+  pins the GPU near 600 MHz until it comes back
+  ([details](https://github.com/kroqueta-s/gfx1151-gemm/blob/main/docs/displayoff.md)).
+  Either keep the display from sleeping in Windows power settings, or set
+  `TRELLIS_DISPLAY_KEEPALIVE`=on to hold it awake during generation
+  (off by default because it keeps the panel lit).- **The first run looks hung.** It is not. MIOpen tunes convolution kernels
   once per machine, with the GPU busy the whole time. Do not kill it; every
   later run reuses the tuned kernels. The runner emits a `heartbeat` line every
   10 s — as long as those keep coming, it is working.

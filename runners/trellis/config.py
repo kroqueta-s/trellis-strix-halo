@@ -78,6 +78,15 @@ PREFER_HIPBLASLT: bool = _bool("TRELLIS_PREFER_HIPBLASLT", True)
 # `metrics.gfx_keepalive` records whether it was alive.
 GFX_KEEPALIVE: bool = _bool("TRELLIS_GFX_KEEPALIVE", True)
 
+# Whether to hold the console display awake during generation
+# (`displaykeep.py`, SetThreadExecutionState). When the display turns off -
+# lid, or the display-off timeout, locked or not - the driver pins the GPU
+# near 600 MHz and generation runs ~4x slower until it comes back (measured
+# 2026-09-02; gfx1151-gemm docs/displayoff.md). **Off by default**: it keeps
+# the panel lit, and a machine whose display never sleeps needs nothing here.
+# `metrics.display_keepalive` records whether the hold took effect.
+DISPLAY_KEEPALIVE: bool = _bool("TRELLIS_DISPLAY_KEEPALIVE", False)
+
 
 # **Cap on dedicated VRAM (GB).** gfx1151 has 32 GB of dedicated VRAM, but the
 # total from `torch.cuda.mem_get_info` is 43.87 GB because it counts shared
