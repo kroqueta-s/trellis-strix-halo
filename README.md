@@ -109,7 +109,7 @@ Submanifold convolution is exactly a dense convolution restricted to occupied
 voxels, so it can be checked against a reference without the original library.
 That is the reason this approach is trustworthy rather than merely plausible.
 
-## Measurements (gfx1151, Radeon 8060S, 32 GB dedicated VRAM)
+## Measurements (ASUS ProArt PX13: Ryzen AI MAX+ 395, Radeon 8060S / gfx1151, 32 GB dedicated VRAM, factory power limits)
 
 One image (`assets/sample.png`), upstream defaults
 `ss_steps = slat_steps = 25`, torch 2.13.0+rocm10.0.0 (the pins in
