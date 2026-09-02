@@ -113,16 +113,17 @@ That is the reason this approach is trustworthy rather than merely plausible.
 
 One image (`assets/sample.png`), upstream defaults
 `ss_steps = slat_steps = 25`, torch 2.13.0+rocm10.0.0 (the pins in
-`install.ps1`), 2026-09-02:
+`install.ps1`). **Median of 5 runs** (each a fresh process, reference GEMM
+and GPU clock recorded alongside every run), 2026-09-03:
 
-| Stage | Time |
+| Stage | Time (median) |
 |---|--:|
-| Load weights | 15 s |
-| Conditioning | 5 s |
-| Sparse structure | 14 s |
-| Structured latent | 33 s |
-| Decode to mesh | 3 s |
-| **Generate total** | **~56 s** |
+| Load weights | 13 s |
+| Conditioning | 0.8 s |
+| Sparse structure | 13.8 s |
+| Structured latent | 32.0 s |
+| Decode to mesh | 2.9 s |
+| **Generate total** | **49.6 s** (range 49.4–49.8) |
 | Post-processing (150 views, 1024²) | 60 s |
 
 Peak VRAM 11.9 GB. Output 525,912 faces after post-processing, watertight, no

@@ -51,21 +51,25 @@ records which backend a run used.
 
 ## After the ROCm 10.0 update (torch 2.13.0+rocm10.0.0)
 
-Second-run stage walls, same sample and settings, 2026-09-02. Reference GEMM
-alongside: 30.3 / 30.9 TFLOPS at 2048³ / 4096³.
+Same sample and settings, 2026-09-03. The 10.0 column is the **median of 5
+fresh-process runs**, each bracketed by a 4096³ reference GEMM (all within
+30.9–31.5 TFLOPS) with the GPU clock traced throughout; the 7.2.1 column is
+a single pre-upgrade measurement.
 
-| Stage | 7.2.1 + hipBLASLt | 10.0 |
+| Stage | 7.2.1 + hipBLASLt (single) | 10.0 (median of 5) |
 |---|--:|--:|
-| structure | 22.9 s | **14.3 s** |
-| slat | 39.1 s | **32.8 s** |
-| decode | 3.0 s | 3.0 s |
-| whole generation | 66.1 s | **~56 s (1.42× over the 7.2.1 baseline)** |
+| conditioning | — | 0.8 s (0.8–0.9) |
+| structure | 22.9 s | **13.8 s** (13.8–14.0) |
+| slat | 39.1 s | **32.0 s** (31.9–32.1) |
+| decode | 3.0 s | 2.9 s (2.9–2.9) |
+| whole generation | 66.1 s | **49.6 s (1.60× over the 7.2.1 baseline)** |
 
 The attention-bound structure stage dropped by a third (newer AOTriton flash
-kernels), and the skinny-GEMM fix is part of the default path. One open item:
-the conditioning stage grew from ~1 s to ~5 s — unexplained, small, noted.
-The install traps and the full measurement set are in gfx1151-gemm's
-`docs/rocm10.md`.
+kernels), and the skinny-GEMM fix is part of the default path. The ~5 s
+conditioning readings seen on the first post-upgrade runs were MIOpen
+3.6.0's one-time tuning of the DINOv2 convolutions, not a regression; with
+the cache in place conditioning is back to 0.8 s. The install traps and the
+full measurement set are in gfx1151-gemm's `docs/rocm10.md`.
 
 TRELLIS shares its architecture (and therefore these shapes, modulo the voxel
 count) with Hi3DGen; Hunyuan3D looks completely different. The three-pipeline
