@@ -148,6 +148,14 @@ Attention is 10–20× faster when `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` i
 set **before** torch is imported (4096-token attention: 135 ms → 12 ms). The
 runner sets it for you; setting it afterwards has no effect.
 
+A per-stage profile of where the GPU time goes (GEMM shapes, attention,
+sparse-conv overhead) is in [`docs/gemm_profile.md`](docs/gemm_profile.md),
+taken with [`tools/profile_gemm.py`](tools/profile_gemm.py). Everything about
+this GPU that does not depend on the model — GEMM baselines, the 600 MHz
+clock behaviour, BLAS backend switches — lives in
+[gfx1151-gemm](https://github.com/kroqueta-s/gfx1151-gemm), shared by all
+three runners in this family.
+
 ## Troubleshooting
 
 - **Out of VRAM.** The runner caps torch at `TRELLIS_VRAM_LIMIT_GB` (default
