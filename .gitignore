@@ -2,3 +2,9 @@
 __pycache__/
 *.pyc
 .venv/
+
+# **Internal documents: design notes, verification reports, this machine's setup.**
+# These are deliberately not tracked. They are written in the author's language
+# and carry the operator's environment and reasoning, which would mislead anyone
+# reading them as documentation. See the language rules in CLAUDE.md.
+docs/local/

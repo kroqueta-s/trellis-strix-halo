@@ -36,6 +36,7 @@ import types
 from collections.abc import Iterable, Sequence
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -653,6 +654,66 @@ def fast_attention_available() -> bool:
     return False
 
 
+def _make_numba() -> types.ModuleType:
+    """A stand-in for `numba` holding only what PyMatting imports from it.
+
+    PyMatting asks for `njit`, `prange` and `pndindex` and nothing else. Without
+    the JIT its functions still compute the same values, just slowly - and on
+    this path they are **imported and never called**, because background removal
+    runs with alpha matting off.
+    """
+    module = _new_module("numba")
+
+    def njit(*args: Any, **kwargs: Any) -> Any:
+        """Accept both `@njit` and `@njit(...)`, and change nothing."""
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+
+        def decorate(function: Any) -> Any:
+            return function
+
+        return decorate
+
+    module.njit = njit  # type: ignore[attr-defined]
+    module.jit = njit  # type: ignore[attr-defined]
+    module.prange = range  # type: ignore[attr-defined]
+    module.pndindex = np.ndindex  # type: ignore[attr-defined]
+    return module
+
+
+def install_numba_fallback() -> bool:
+    """Stand in for `numba` **only when the real one will not load**.
+
+    Smart App Control blocks unsigned binaries, and `numba/_devicearray.pyd` is
+    one it blocks **intermittently** on this class of machine: the same file
+    loads one hour and is refused the next (confirmed in the CodeIntegrity log,
+    events 3033 and 3077). Every path through `rembg` imports it, because
+    `rembg` imports PyMatting eagerly and PyMatting imports numba at module
+    level - so an intermittently blocked file becomes an intermittently failing
+    generation, tens of seconds in.
+
+    **The real numba is tried first and kept whenever it works.** This is not a
+    replacement for it; it is what keeps a generation alive on the runs where
+    the operating system refuses to load it.
+
+    Returns:
+        True if the real numba is in use, False if the stand-in was installed.
+    """
+    if "numba" in sys.modules:
+        return True
+    try:
+        import numba  # noqa: F401  - imported for the side effect of proving it loads
+    except Exception as exc:  # noqa: BLE001 - ImportError, OSError, anything the loader raises
+        sys.modules["numba"] = _make_numba()
+        print(
+            f"[shims] numba would not load ({type(exc).__name__}: {exc}); "
+            "using a stand-in so background removal still runs",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
 def install(head_chunk: int = DEFAULT_HEAD_CHUNK, fp32_attention: bool | None = None) -> bool:
     """**Call this before importing the upstream package.**
 
@@ -673,6 +734,7 @@ def install(head_chunk: int = DEFAULT_HEAD_CHUNK, fp32_attention: bool | None = 
         2026-09-01 diagnosable.
     """
     use_fp32 = (not fast_attention_available()) if fp32_attention is None else fp32_attention
+    install_numba_fallback()
     _install_spconv()
     sys.modules["flash_attn"] = _make_flash_attn(head_chunk, use_fp32)
     _install_kaolin()
