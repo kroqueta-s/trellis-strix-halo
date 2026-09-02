@@ -114,7 +114,7 @@ That is the reason this approach is trustworthy rather than merely plausible.
 One image (`assets/sample.png`), upstream defaults
 `ss_steps = slat_steps = 25`, torch 2.13.0+rocm10.0.0 (the pins in
 `install.ps1`). **Median of 5 runs** (each a fresh process, reference GEMM
-and GPU clock recorded alongside every run), 2026-09-03:
+and GPU clock recorded alongside every run), 2026-09-02:
 
 | Stage | Time (median) |
 |---|--:|

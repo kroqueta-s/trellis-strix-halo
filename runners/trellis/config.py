@@ -71,7 +71,7 @@ FAST_ATTENTION: bool = _bool("TRELLIS_FAST_ATTENTION", True)
 PREFER_HIPBLASLT: bool = _bool("TRELLIS_PREFER_HIPBLASLT", True)
 
 # Whether to run the render-loop keepalive during generation (`gfxlight.py`).
-# Re-measured 2026-09-03: no effect on this machine (the GPU reaches full
+# Re-measured 2026-09-02: no effect on this machine (the GPU reaches full
 # clock for compute alone), kept because it costs nothing and driver power
 # management is outside this runner's control. Generation works as before if
 # it fails to start; `metrics.gfx_keepalive` records whether it was alive.

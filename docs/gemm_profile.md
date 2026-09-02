@@ -52,7 +52,7 @@ records which backend a run used.
 
 ## After the ROCm 10.0 update (torch 2.13.0+rocm10.0.0)
 
-Same sample and settings, 2026-09-03. The 10.0 column is the **median of 5
+Same sample and settings, 2026-09-02. The 10.0 column is the **median of 5
 fresh-process runs**, each bracketed by a 4096³ reference GEMM (all within
 30.9–31.5 TFLOPS) with the GPU clock traced throughout; the 7.2.1 column is
 a single pre-upgrade measurement.

@@ -3,7 +3,7 @@
 
 Windows drivers decide the GPU power state, and whether compute-only work is
 enough to raise it can depend on driver version and session state. Re-measured
-2026-09-03 (unlocked session, ROCm 10.0 wheels): **no effect on this machine**
+2026-09-02 (unlocked session, ROCm 10.0 wheels): **no effect on this machine**
 - the GPU reaches full clock for compute alone and generation time is the same
 with or without this loop. It stays available, default on, because it costs
 nothing and driver power management is outside this runner's control.
