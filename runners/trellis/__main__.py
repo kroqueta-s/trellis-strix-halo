@@ -261,8 +261,8 @@ def main() -> int:
                 {"id": _id, "event": "progress", "stage": stage, "message": message, **extra},
             )
 
-        # **Clock keepalive** (gfxlight.py). Compute alone does not make the
-        # driver raise the clock.
+        # **Render-loop keepalive** (gfxlight.py). Measured to change nothing
+        # on the current driver; kept because it costs nothing.
         light: gfxlight.GfxLight | None = None
         if method_name == "image_to_mesh" and config.GFX_KEEPALIVE:
             light = gfxlight.GfxLight()

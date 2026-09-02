@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: MIT
-"""Clock keepalive: a hidden OpenGL render loop that holds the GPU in a high power state.
+"""A hidden OpenGL render loop, for testing GPU power-management behaviour.
 
-**Why this is needed** (measured 2026-09-01): the AMD Windows driver does not
-raise the GPU power state (DPM) for compute-only work. At 99 % GPU utilisation
-the clock sits at 600 MHz and GEMM reaches only 4.8 TFLOPS. With any 3D
-rendering alive alongside it, the clock rises to 2.35 GHz and the same GEMM
-reaches **20.9 TFLOPS (4.3x)**. A hidden window is enough. This also explains
-the 3.9x spread in generation time: runs were fast only when some resident UI
-happened to be drawing. The keepalive makes that the normal case.
+Windows drivers decide the GPU power state, and whether compute-only work is
+enough to raise it can depend on driver version and session state. Re-measured
+2026-09-03 (unlocked session, ROCm 10.0 wheels): **no effect on this machine**
+- the GPU reaches full clock for compute alone and generation time is the same
+with or without this loop. It stays available, default on, because it costs
+nothing and driver power management is outside this runner's control.
 
 **Design**: written with ctypes only (no extra packages, no self-built binaries,
 so Smart App Control has nothing to block). It runs as a child process and exits
 on its own when the parent dies. If it fails to start, generation proceeds
-exactly as before; the difference only shows up in `metrics.gfx_keepalive`.
+exactly as before; `metrics.gfx_keepalive` records whether it was alive.
 
 Check it on its own (any runner's python works; torch is not used)::
 
@@ -185,8 +184,8 @@ def _render_loop(parent_pid: int, fps: float, seconds: float) -> int:
     if not user32.RegisterClassW(ctypes.byref(cls)):
         return 1
 
-    # **Never shown.** The power state rises even for a hidden window
-    # (measured: GEMM 4.8 -> 20.9 TFLOPS).
+    # **Never shown.** A hidden window is enough to present 3D demand to the
+    # driver, which is all this experiment needs.
     hwnd = user32.CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         "hearth_gfxlight",
@@ -227,11 +226,10 @@ def _render_loop(parent_pid: int, fps: float, seconds: float) -> int:
     # frame interval.
     #
     # **Do not call `glFinish`, and keep each frame's workload generous.**
-    # When one long compute kernel monopolises the GPU (the Hunyuan3D DiT does),
-    # the 3D queue starves. With a tiny synchronised draw the driver then sees
-    # no 3D demand at all and drops the clock back to 600 MHz (measured
-    # 2026-09-02: 179 s generation with the keepalive still alive). Submitting
-    # frames without synchronising keeps 3D work queued at all times.
+    # When one long compute kernel monopolises the GPU, the 3D queue starves;
+    # a tiny synchronised draw would then present no 3D demand at all.
+    # Submitting frames without synchronising keeps 3D work queued the whole
+    # time, which is the condition this switch exists to create.
     parent = kernel32.OpenProcess(SYNCHRONIZE, False, parent_pid) if parent_pid else None
     wait_ms = max(1, int(1000.0 / fps))
     deadline = time.time() + seconds if seconds > 0 else None
@@ -264,7 +262,7 @@ def _render_loop(parent_pid: int, fps: float, seconds: float) -> int:
 
 def main() -> int:
     """Run the render loop as a child process (`--seconds` bounds a standalone run)."""
-    parser = argparse.ArgumentParser(description="Clock keepalive (see the module docstring)")
+    parser = argparse.ArgumentParser(description="Render-loop keepalive (see the module docstring)")
     parser.add_argument("--parent-pid", type=int, default=0, help="exit when this process dies")
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--seconds", type=float, default=0.0, help="0 means until the parent dies")

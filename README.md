@@ -109,25 +109,11 @@ Submanifold convolution is exactly a dense convolution restricted to occupied
 voxels, so it can be checked against a reference without the original library.
 That is the reason this approach is trustworthy rather than merely plausible.
 
-## The GPU idles at 600 MHz unless something renders
-
-The AMD Windows driver does not raise the GPU power state for compute-only
-work: at 99 % compute utilisation the clock sits at **600 MHz** (measured,
-2026-09-01). With any 3D rendering alive alongside, the same workload sustains
-**2.3–2.9 GHz** — a 4.3× difference on GEMM throughput. This also means
-generation time swings wildly depending on whether some UI happens to be
-animating on the desktop.
-
-The runner therefore keeps a **hidden 3D render loop** (`gfxlight.py`, pure
-ctypes, ~0.4 % of the 3D engine) alive during `image_to_mesh`. It is on by
-default (`TRELLIS_GFX_KEEPALIVE`), costs nothing measurable, and whether it was
-alive is reported in `metrics.gfx_keepalive`.
-
 ## Measurements (gfx1151, Radeon 8060S, 32 GB dedicated VRAM)
 
 One image (`assets/sample.png`), upstream defaults
-`ss_steps = slat_steps = 25`, clock keepalive on, torch 2.13.0+rocm10.0.0
-(the pins in `install.ps1`), 2026-09-02:
+`ss_steps = slat_steps = 25`, torch 2.13.0+rocm10.0.0 (the pins in
+`install.ps1`), 2026-09-02:
 
 | Stage | Time |
 |---|--:|
@@ -156,8 +142,8 @@ runner sets it for you; setting it afterwards has no effect.
 A per-stage profile of where the GPU time goes (GEMM shapes, attention,
 sparse-conv overhead) is in [`docs/gemm_profile.md`](docs/gemm_profile.md),
 taken with [`tools/profile_gemm.py`](tools/profile_gemm.py). Everything about
-this GPU that does not depend on the model — GEMM baselines, the 600 MHz
-clock behaviour, BLAS backend switches — lives in
+this GPU that does not depend on the model — GEMM baselines, clock
+behaviour, BLAS backend switches — lives in
 [gfx1151-gemm](https://github.com/kroqueta-s/gfx1151-gemm), shared by all
 three runners in this family.
 
@@ -189,9 +175,9 @@ three runners in this family.
   29 % long that pass the size test but render as dark speckles and tabs.
   Measured margins: flakes ≤ 1.4 % thick, real detached parts ≥ 11.8 %. How much
   was dropped is always recorded. Set either to 0 to disable.
-- Generation time on this hardware depends on the GPU power state (see the
-  600 MHz section above). The keepalive pins the fast case, but do not use
-  wall-clock time as a pass/fail signal.
+- Do not use wall-clock time as a pass/fail signal: it depends on driver
+  power management and one-time kernel tuning, neither of which this runner
+  controls.
 
 ## License
 

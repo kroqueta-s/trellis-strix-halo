@@ -14,9 +14,9 @@ kernels themselves, so **speed comes from the first run and ratios and
 per-shape throughput from the second**.
 
 A fixed reference GEMM is measured before and after everything else and
-reported as TFLOPS. On this hardware the GPU clock depends on whether anything
-renders (600 MHz against 2.3-2.9 GHz), so the reference doubles as a clock
-check: if the two readings disagree, the run in between is suspect.
+reported as TFLOPS. The GPU clock idles near 700 MHz and ramps above 2.3 GHz
+at the driver's discretion, so the reference doubles as a clock check: if the
+two readings disagree, the run in between is suspect.
 
 Results are written as JSON (default: under ``docs/local/profile/``, which is
 not tracked) and summarised on the console.

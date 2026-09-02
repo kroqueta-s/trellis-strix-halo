@@ -1,8 +1,8 @@
 # Where the GPU time goes in one generation
 
 Measured with [`tools/profile_gemm.py`](../tools/profile_gemm.py) on gfx1151
-(Radeon 8060S), Windows 11, ROCm 7.2.1, torch 2.9.1+rocm7.2.1, clock keepalive
-on, fast attention on, 2026-09-02. Reference fp16 GEMM taken alongside:
+(Radeon 8060S), Windows 11, ROCm 7.2.1, torch 2.9.1+rocm7.2.1, fast
+attention on, 2026-09-02. Reference fp16 GEMM taken alongside:
 25 TFLOPS at 2048³, 31 TFLOPS at 4096³ (rocBLAS). Sample:
 `assets/sample.png`, upstream defaults (`ss_steps=slat_steps=25`), 23 215
 active voxels.
