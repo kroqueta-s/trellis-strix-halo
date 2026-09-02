@@ -61,6 +61,15 @@ ATTN_HEAD_CHUNK: int = _int("TRELLIS_ATTN_HEAD_CHUNK", 4)
 # has no effect**, so it goes at the top of `__main__.py`.
 FAST_ATTENTION: bool = _bool("TRELLIS_FAST_ATTENTION", True)
 
+# Whether to set TORCH_BLAS_PREFER_HIPBLASLT and ROCBLAS_USE_HIPBLASLT **before
+# torch is imported**. Measured 2026-09-02 on gfx1151 (ROCm 7.2.1): hipBLASLt
+# runs the sparse-conv shim's skinny GEMM (M=voxels, N=128, K=2048) at
+# 14 TFLOPS where rocBLAS delivers 1.0, taking the slat stage from 52.4 s to
+# 39.1 s and one generation from 79 s to 66 s; the attention-bound structure
+# stage does not move. Which backend was in effect is recorded in
+# `metrics.blas_backend`.
+PREFER_HIPBLASLT: bool = _bool("TRELLIS_PREFER_HIPBLASLT", True)
+
 # Whether to run the clock keepalive during generation (`gfxlight.py`). The AMD
 # Windows driver does not raise the clock for compute-only work (measured: GEMM
 # alone 600 MHz, with 3D alongside 2.35 GHz, a 4.3x difference). Generation

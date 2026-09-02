@@ -34,6 +34,21 @@ attention, and the elementwise machinery of the sparse-convolution shim
 (N = 128): 14.5 s of the slat stage at 1.0 TFLOPS** — a 30× gap to what the
 same silicon does at 4096³.
 
+## With hipBLASLt (now the default)
+
+Same measurement with `TORCH_BLAS_PREFER_HIPBLASLT=1` and
+`ROCBLAS_USE_HIPBLASLT=1` (what `TRELLIS_PREFER_HIPBLASLT=on` sets):
+
+| Stage | rocBLAS | hipBLASLt | Speedup |
+|---|--:|--:|--:|
+| structure | 22.9 s | 22.9 s | 1.00× (attention-bound) |
+| slat | 52.4 s | **39.1 s** | **1.34×** |
+| whole generation | 79.4 s | 66.1 s | **1.20×** |
+
+The gain is almost entirely the skinny sparse-conv GEMM: 14.5 s at 1.0 TFLOPS
+under rocBLAS, 1.0 s at 14.3 TFLOPS under hipBLASLt. `metrics.blas_backend`
+records which backend a run used.
+
 TRELLIS shares its architecture (and therefore these shapes, modulo the voxel
 count) with Hi3DGen; Hunyuan3D looks completely different. The three-pipeline
 comparison, the shape-overlap analysis, and everything about this GPU that

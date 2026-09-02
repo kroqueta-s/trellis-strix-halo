@@ -259,9 +259,12 @@ def main() -> int:
         key, _, value = pair.partition("=")
         os.environ[key] = value
 
-    # Mirrors the runner: this must precede the first torch import to matter.
+    # Mirrors the runner: these must precede the first torch import to matter.
     if config.FAST_ATTENTION:
         os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
+    if config.PREFER_HIPBLASLT:
+        os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "1")
+        os.environ.setdefault("ROCBLAS_USE_HIPBLASLT", "1")
 
     import torch
     from PIL import Image

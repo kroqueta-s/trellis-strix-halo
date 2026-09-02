@@ -115,6 +115,22 @@ class _DeviceWatch:
         self._t.join(timeout=5)
 
 
+def blas_backend() -> str:
+    """Name the BLAS backend torch prefers ("hipblaslt" or "rocblas").
+
+    Recorded in metrics because the two differ by up to 14x on some of this
+    pipeline's shapes (see docs/gemm_profile.md), so a timing cannot be
+    interpreted without knowing which one produced it. Torch reuses the CUDA
+    names on ROCm; they are translated here.
+    """
+    try:
+        name = str(torch.backends.cuda.preferred_blas_library())
+    except (AttributeError, RuntimeError):
+        return "unknown"
+    lowered = name.rsplit(".", 1)[-1].lower()
+    return {"cublaslt": "hipblaslt", "cublas": "rocblas"}.get(lowered, lowered)
+
+
 def apply_vram_limit() -> float:
     """Make exceeding dedicated VRAM **fail immediately instead of silently slowing down**.
 

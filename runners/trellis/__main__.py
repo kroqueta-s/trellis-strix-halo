@@ -30,6 +30,13 @@ from . import config, gfxlight
 if config.FAST_ATTENTION:
     os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
 
+# Same rule: **only effective before torch is imported.** hipBLASLt runs the
+# sparse-conv shim's skinny GEMM ~14x faster than rocBLAS (measured 2026-09-02,
+# see docs/gemm_profile.md). `metrics.blas_backend` records what was used.
+if config.PREFER_HIPBLASLT:
+    os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "1")
+    os.environ.setdefault("ROCBLAS_USE_HIPBLASLT", "1")
+
 NAME = "trellis"
 VERSION = "image-large"
 
@@ -173,6 +180,9 @@ def m_image_to_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
             # **Whether fast attention is in effect.** Without it generation is
             # several times slower.
             "fast_attention": result.fast_attention,
+            # **Which BLAS backend served the GEMMs.** They differ by up to 14x
+            # on some shapes, so a timing means nothing without this.
+            "blas_backend": pipeline.blas_backend(),
             # **Breakdown of generation.** Without knowing which stage is slow
             # there is nothing to act on.
             "cond_sec": round(result.cond_sec, 2),
