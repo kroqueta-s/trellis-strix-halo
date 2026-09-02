@@ -2,11 +2,13 @@
 """A hidden OpenGL render loop, for testing GPU power-management behaviour.
 
 Windows drivers decide the GPU power state, and whether compute-only work is
-enough to raise it can depend on driver version and session state. Re-measured
-2026-09-02 (unlocked session, ROCm 10.0 wheels): **no effect on this machine**
-- the GPU reaches full clock for compute alone and generation time is the same
-with or without this loop. It stays available, default on, because it costs
-nothing and driver power management is outside this runner's control.
+enough to raise it can depend on driver version and session state. Measured
+2026-09-02: **no effect on this machine in any state** - with the display on
+there is nothing to fix (compute alone reaches full clock), and with the
+display off (the condition it was built for) the GPU stays pinned at 600 MHz
+with the loop alive; keeping the display awake is what works (see
+gfx1151-gemm docs/displayoff.md). It stays available as an experiment
+switch, default on, because it costs nothing.
 
 **Design**: written with ctypes only (no extra packages, no self-built binaries,
 so Smart App Control has nothing to block). It runs as a child process and exits
