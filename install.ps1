@@ -44,9 +44,19 @@ if (-not $Root) { $Root = Join-Path (Split-Path -Parent $repo) "trellis-strix-ha
 
 # Pinned versions. Do not float these: the ROCm wheels and the upstream commit
 # are the two things that decide whether this works at all.
-$TorchIndex = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/"
-$TorchVersion = "2.9.1+rocm7.2.1"
-$TorchvisionVersion = "0.24.1+rocm7.2.1"
+# The device packages matter: torch ships its GPU kernels as external kernel
+# packs, and **both** the family (gfx115x: flash-attention images) and the
+# exact-arch (gfx1151: torch kernel pack + ROCm library kernels) wheels are
+# required. Without the exact-arch one, the first kernel launch fails with
+# `hipErrorInvalidImage`. On another GPU, replace both suffixes with yours.
+$TorchIndex = "https://stable.repo.amd.com/rocm/whl-next/"
+$TorchVersion = "2.13.0+rocm10.0.0"
+$TorchvisionVersion = "0.28.0+rocm10.0.0"
+$TorchDeviceWheels = @(
+    "amd-torch-device-gfx115x==$TorchVersion",
+    "amd-torch-device-gfx1151==$TorchVersion",
+    "amd-torchvision-device-gfx1151==$TorchvisionVersion"
+)
 $UpstreamUrl = "https://github.com/microsoft/TRELLIS.git"
 $UpstreamCommit = "442aa1e1afb9014e80681d3bf604e8d728a86ee7"
 $WeightsRepo = "microsoft/TRELLIS-image-large"
@@ -69,11 +79,13 @@ if (-not (Test-Path $py)) {
 Assert-Ok "pip upgrade"
 
 # 2. ROCm PyTorch -------------------------------------------------------------
-# torch requires the `rocm` meta-package, which lives on the same index.
-# Passing the wheel URL directly fails with "No matching distribution for rocm".
+# torch pulls the `rocm` runtime packages from the same index; PyPI stays as a
+# fallback for the pure-python dependencies only (the exact +rocm pins can
+# never match anything on PyPI).
 Write-Host "==> Installing ROCm PyTorch"
-& $py -m pip install --no-cache-dir --find-links $TorchIndex `
-    "torch==$TorchVersion" "torchvision==$TorchvisionVersion"
+& $py -m pip install --no-cache-dir --index-url $TorchIndex `
+    --extra-index-url https://pypi.org/simple `
+    "torch==$TorchVersion" "torchvision==$TorchvisionVersion" @TorchDeviceWheels
 Assert-Ok "PyTorch installation"
 
 # 3. Upstream repository (never forked, never patched) ------------------------

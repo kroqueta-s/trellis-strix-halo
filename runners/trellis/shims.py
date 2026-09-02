@@ -714,6 +714,61 @@ def install_numba_fallback() -> bool:
     return True
 
 
+def _miopen_batch_norm_works() -> bool:
+    """Try one tiny batch norm on the GPU and report whether MIOpen served it.
+
+    On the ROCm 10.0 Windows wheels (2026-09-02), MIOpen compiles its
+    batch-norm kernels with hiprtc at first use and the compile fails with
+    `'type_traits' file not found` — the wheels ship no C++ standard library
+    for hiprtc to include — surfacing as `miopenStatusUnknownError`.
+    Convolutions use precompiled solvers and are unaffected.
+    """
+    if not torch.cuda.is_available():
+        return True
+    try:
+        # Weight and bias are what routes the call to MIOpen; without them
+        # torch already picks its native kernel and the probe would prove
+        # nothing.
+        F.batch_norm(
+            torch.randn(2, 4, 8, 8, device="cuda"),
+            torch.zeros(4, device="cuda"),
+            torch.ones(4, device="cuda"),
+            weight=torch.ones(4, device="cuda"),
+            bias=torch.zeros(4, device="cuda"),
+        )
+        torch.cuda.synchronize()
+        return True
+    except RuntimeError:
+        return False
+
+
+def install_native_batch_norm_if_needed() -> bool:
+    """Route `F.batch_norm` around MIOpen when MIOpen cannot run it (see above).
+
+    torch's own HIP kernel takes over — same operation, no MIOpen involved —
+    while every other operator keeps its MIOpen path. The probe costs one tiny
+    kernel at load time and nothing thereafter.
+
+    Returns:
+        True if the reroute was installed, False if MIOpen batch norm works.
+    """
+    if _miopen_batch_norm_works():
+        return False
+    original = F.batch_norm
+
+    def _batch_norm_without_miopen(*args: Any, **kwargs: Any) -> torch.Tensor:
+        with torch.backends.cudnn.flags(enabled=False):
+            return original(*args, **kwargs)
+
+    F.batch_norm = _batch_norm_without_miopen
+    print(
+        "[shims] MIOpen cannot run batch_norm (hiprtc build failure); "
+        "using torch's native kernel for batch_norm only",
+        file=sys.stderr,
+    )
+    return True
+
+
 def install(head_chunk: int = DEFAULT_HEAD_CHUNK, fp32_attention: bool | None = None) -> bool:
     """**Call this before importing the upstream package.**
 
@@ -735,6 +790,7 @@ def install(head_chunk: int = DEFAULT_HEAD_CHUNK, fp32_attention: bool | None = 
     """
     use_fp32 = (not fast_attention_available()) if fp32_attention is None else fp32_attention
     install_numba_fallback()
+    install_native_batch_norm_if_needed()
     _install_spconv()
     sys.modules["flash_attn"] = _make_flash_attn(head_chunk, use_fp32)
     _install_kaolin()

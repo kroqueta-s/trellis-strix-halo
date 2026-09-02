@@ -222,6 +222,34 @@ def test_flash_attn_qkvpacked_batched() -> None:
     assert err < 1e-5, f"qkvpacked disagrees: max error {err}"
 
 
+def test_batch_norm_matches_cpu_reference() -> None:
+    """`batch_norm` agrees with the CPU reference, whichever kernel serves it.
+
+    On the ROCm 10.0 Windows wheels MIOpen cannot run batch norm at all (its
+    hiprtc build fails), and `install_native_batch_norm_if_needed` reroutes the
+    call to torch's native kernel. This pins the numbers either way.
+    """
+    shims.install_native_batch_norm_if_needed()
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(4, 6, 17, 13, generator=g)
+    weight = torch.randn(6, generator=g)
+    bias = torch.randn(6, generator=g)
+    mean = torch.randn(6, generator=g)
+    var = torch.rand(6, generator=g) + 0.5
+    want = F.batch_norm(x, mean, var, weight, bias, training=False, eps=1e-5)
+    got = F.batch_norm(
+        x.to(DEVICE),
+        mean.to(DEVICE),
+        var.to(DEVICE),
+        weight.to(DEVICE),
+        bias.to(DEVICE),
+        training=False,
+        eps=1e-5,
+    ).cpu()
+    err = (got - want).abs().max().item()
+    assert err < 1e-4, f"batch_norm disagrees with the CPU reference: max error {err}"
+
+
 def test_kaolin_check_tensor() -> None:
     """The `check_tensor` FlexiCubes uses really does check the shape."""
     shims._install_kaolin()

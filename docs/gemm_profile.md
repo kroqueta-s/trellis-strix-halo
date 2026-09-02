@@ -49,6 +49,24 @@ The gain is almost entirely the skinny sparse-conv GEMM: 14.5 s at 1.0 TFLOPS
 under rocBLAS, 1.0 s at 14.3 TFLOPS under hipBLASLt. `metrics.blas_backend`
 records which backend a run used.
 
+## After the ROCm 10.0 update (torch 2.13.0+rocm10.0.0)
+
+Second-run stage walls, same sample and settings, 2026-09-02. Reference GEMM
+alongside: 30.3 / 30.9 TFLOPS at 2048³ / 4096³.
+
+| Stage | 7.2.1 + hipBLASLt | 10.0 |
+|---|--:|--:|
+| structure | 22.9 s | **14.3 s** |
+| slat | 39.1 s | **32.8 s** |
+| decode | 3.0 s | 3.0 s |
+| whole generation | 66.1 s | **~56 s (1.42× over the 7.2.1 baseline)** |
+
+The attention-bound structure stage dropped by a third (newer AOTriton flash
+kernels), and the skinny-GEMM fix is part of the default path. One open item:
+the conditioning stage grew from ~1 s to ~5 s — unexplained, small, noted.
+The install traps and the full measurement set are in gfx1151-gemm's
+`docs/rocm10.md`.
+
 TRELLIS shares its architecture (and therefore these shapes, modulo the voxel
 count) with Hi3DGen; Hunyuan3D looks completely different. The three-pipeline
 comparison, the shape-overlap analysis, and everything about this GPU that

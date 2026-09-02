@@ -27,7 +27,8 @@ is the reference specimen for the measurements below.*
 - Git
 - An AMD GPU supported by ROCm on Windows (verified on **Strix Halo / gfx1151**,
   Radeon 8060S)
-- AMD Adrenalin driver with **ROCm 7.2.1** support
+- A current AMD Adrenalin driver (verified with the 2026-08 driver; the
+  **ROCm 10.0 runtime itself ships inside the wheels** that install.ps1 pins)
 - **Python 3.12**
 - ~10 GB of disk (venv + upstream clone + 3.1 GB of weights)
 - ~16 GB of free VRAM at peak
@@ -125,20 +126,24 @@ alive is reported in `metrics.gfx_keepalive`.
 ## Measurements (gfx1151, Radeon 8060S, 32 GB dedicated VRAM)
 
 One image (`assets/sample.png`), upstream defaults
-`ss_steps = slat_steps = 25`, clock keepalive on, 2026-09-02:
+`ss_steps = slat_steps = 25`, clock keepalive on, torch 2.13.0+rocm10.0.0
+(the pins in `install.ps1`), 2026-09-02:
 
 | Stage | Time |
 |---|--:|
-| Load weights | 19 s |
-| Conditioning | 1 s |
-| Sparse structure | 23 s |
-| Structured latent | 52 s |
+| Load weights | 15 s |
+| Conditioning | 5 s |
+| Sparse structure | 14 s |
+| Structured latent | 33 s |
 | Decode to mesh | 3 s |
-| **Generate total** | **80 s** |
+| **Generate total** | **~56 s** |
 | Post-processing (150 views, 1024²) | 60 s |
 
-Peak VRAM 11.9 GB. Output 519,936 faces after post-processing, watertight, no
-boundary edges and no non-manifold edges after downstream repair.
+Peak VRAM 11.9 GB. Output 525,912 faces after post-processing, watertight, no
+boundary edges and no non-manifold edges after downstream repair. On the
+previous wheel stack (torch 2.9.1+rocm7.2.1) the same generation took 80 s;
+the history and the per-operator breakdown are in
+[`docs/gemm_profile.md`](docs/gemm_profile.md).
 
 Rasterizer throughput on a 697k-face mesh: 61 ms per view at 128², 244 ms at
 1024². Upstream's default of 1000 views would take 244 s, which is why the
