@@ -19,3 +19,8 @@ jobs:
       # The step counter has no dependencies at all, and a wrong count is
       # worse than no count, so it is checked on every push.
       - run: python tests/test_steps.py
+      # **What this runner reports, checked against the contract.** The model
+      # is replaced by a stand-in, so this needs no GPU, no weights and nothing
+      # installed - which is the point: a result key that quietly changes name
+      # is not an error anywhere downstream, it just loses the settings.
+      - run: python tests/test_result_shape.py

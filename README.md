@@ -105,6 +105,8 @@ Run the checks yourself:
 ```powershell
 .venv\Scripts\python.exe tests\test_shims.py
 .venv\Scripts\python.exe tests\test_raster.py
+# What this runner reports, checked against the contract. No GPU, no weights.
+.venv\Scripts\python.exe tests\test_result_shape.py
 ```
 
 Submanifold convolution is exactly a dense convolution restricted to occupied
@@ -170,6 +172,12 @@ three runners in this family.
   10 s — as long as those keep coming, it is working.
 
 ## Limits
+
+- **The mesh comes back Z-up at normalized scale**, and the result says so.
+  **Which way is forward has never been measured**, so it is reported as `null`
+  rather than guessed. A mesh imported on the wrong axis renders perfectly
+  correctly and prints mirrored, so an assumed axis is not a harmless one.
+  Real-world size is downstream work.
 
 - **No texture.** Texture baking needs `nvdiffrast` for real; only the
   rasterizer used by hole filling is replaced here.
