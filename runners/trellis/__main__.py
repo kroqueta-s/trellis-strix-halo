@@ -83,6 +83,9 @@ def m_capabilities(params: dict[str, Any], progress: Any) -> dict[str, Any]:
     return {
         "name": NAME,
         "version": VERSION,
+        # The version of `docs/runner_contract.md` this was written against.
+        # **A caller uses it to explain an absence**, never to refuse a runner.
+        "contract": 3,
         "capabilities": {
             "image_to_mesh": True,
             "text_to_mesh": False,
@@ -165,13 +168,17 @@ def m_image_to_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
 
     progress("export", "writing the mesh")
     mesh_path = out_dir / "raw.ply"
-    result.mesh.export(str(mesh_path))
+    # **Written beside its final name, then renamed** (contract §9). A cancel
+    # ends this process outright, and a run killed halfway through writing a
+    # million faces otherwise leaves a truncated file that looks finished.
+    staging = out_dir / "raw.ply.part"
+    result.mesh.export(str(staging), file_type="ply")
+    os.replace(staging, mesh_path)
 
     return {
         "mesh_path": str(mesh_path),
         "n_vertices": int(len(result.mesh.vertices)),
         "n_faces": int(len(result.mesh.faces)),
-        "extra": {"up_axis": "z"},
         "metrics": {
             "load_sec": round(result.load_sec, 2),
             # **Never use this as a pass/fail signal.**
@@ -193,7 +200,15 @@ def m_image_to_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
             # **What post-processing removed.** Recorded so nothing vanishes silently.
             "clean": result.clean,
         },
-        "params": {
+        # **Up was checked; forward was not** (contract §5). Upstream normalizes
+        # into a Z-up box, and that much is verified. Which horizontal direction
+        # counts as forward has never been measured here, so it is reported as
+        # `null` rather than guessed: a mesh imported on the wrong axis renders
+        # perfectly correctly, so nobody finds that mistake by looking - the
+        # first sign is a mirrored joint on a printed part.
+        "up_axis": "z",
+        "forward_axis": None,
+        "params_used": {
             "ss_steps": result.ss_steps,
             "slat_steps": result.slat_steps,
             "ss_guidance": result.ss_guidance,
