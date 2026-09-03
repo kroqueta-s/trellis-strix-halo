@@ -226,6 +226,87 @@ METHODS = {
 }
 
 
+def watch_parent(interval_sec: float = 2.0) -> None:
+    """End this process if the caller that started it goes away.
+
+    **This is the orphan case nothing else covers.** hearth stops its runners
+    when it shuts down, and a caller that kills hearth kills the whole tree -
+    but a hearth that *crashes* does neither. On Windows the child simply
+    carries on, holding the entire card, and **nothing anywhere errors**:
+    everything afterwards is several times slower for a reason nobody can see.
+
+    Reporting progress or reading stdin is not enough on its own. Both fail once
+    the caller's pipes close, which covers most of a run - but not the middle of
+    a long kernel, which is exactly when there is most to lose.
+
+    Two things about how this is done, both measured rather than assumed:
+
+    - **The process to watch is the one `HEARTH_PARENT_PID` names**, not this
+      process's own parent. A venv's `python.exe` re-executes the base
+      interpreter, so the runner's parent is a launcher that outlives hearth by
+      design; watching it would never fire. `os.getppid()` is the fallback for
+      being run by hand.
+    - **`os.getppid()` cannot detect a dead parent on Windows.** A process whose
+      parent dies is not reparented there, so the field keeps naming the dead
+      one. Holding a handle from the start and waiting on it does work: the
+      handle stays valid after the process exits, and a reused id cannot fool
+      it.
+
+    `os._exit` rather than a clean exit on purpose: this fires on a thread while
+    a generation may be mid-kernel, and unwinding a model from another thread is
+    not something to attempt. The weights are in VRAM, not on disk, so there is
+    nothing to lose by leaving abruptly.
+
+    Args:
+        interval_sec: How often to look, where waiting on a handle is not
+            available. Two seconds is far below the cost of noticing an orphan
+            any other way.
+    """
+    named = os.environ.get("HEARTH_PARENT_PID", "").strip()
+    watched = int(named) if named.isdigit() else os.getppid()
+
+    def gone() -> None:
+        # **Saying so must never stop it leaving.** stderr is a pipe to the
+        # process that just died, so writing to it raises - and an exception
+        # here would kill this thread and leave the runner holding the card,
+        # which is the entire failure being prevented.
+        try:
+            print(
+                f"[{NAME}] the process that started this runner is gone; "
+                "exiting so the card is freed",
+                file=sys.stderr,
+                flush=True,
+            )
+        except OSError:
+            pass
+        os._exit(0)
+
+    def watch() -> None:
+        if sys.platform == "win32":
+            import ctypes  # noqa: PLC0415 - only needed here, and only on Windows
+            from ctypes import wintypes  # noqa: PLC0415 - absent on other platforms
+
+            synchronize = 0x00100000
+            infinite = 0xFFFFFFFF
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+            handle = kernel32.OpenProcess(synchronize, False, watched)
+            if handle:
+                # Blocks until that process exits, however long that takes.
+                kernel32.WaitForSingleObject(handle, infinite)
+                gone()
+                return
+            # No handle: fall through to polling, which is worse but not nothing.
+        while True:
+            time.sleep(interval_sec)
+            if os.getppid() != watched:
+                gone()
+
+    threading.Thread(target=watch, name=f"{NAME}-parent-watch", daemon=True).start()
+
+
 def main() -> int:
     """Handle requests one at a time, in order.
 
@@ -233,6 +314,9 @@ def main() -> int:
         The exit code. 0 on a clean exit.
     """
     out = install_stdout_guard()
+    # **Before anything is loaded.** A runner that has already taken the card is
+    # exactly the one worth ending.
+    watch_parent()
     print(f"[{NAME}] runner started.", file=sys.stderr)
 
     for raw in sys.stdin:
