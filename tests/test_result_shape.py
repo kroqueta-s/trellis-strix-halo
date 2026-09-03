@@ -198,6 +198,31 @@ def test_the_axes_are_reported_and_never_guessed() -> None:
         assert "unmeasured" in notes, "unknown axes have to be said out loud somewhere"
 
 
+def test_every_setting_it_accepts_is_one_it_declares() -> None:
+    """**Accepted and undeclared is the same fault as declared and ignored.**
+
+    A setting the runner reads but leaves out of `capabilities` cannot be found
+    by a caller: no form draws it, no flow validates it, and the only way to
+    learn it exists is to read the source. `rembg_model` was in that state -
+    read on every generation, mentioned nowhere - which is how a table and the
+    code behind it drift apart without either looking wrong.
+    """
+    caps = RUNNER.m_capabilities({}, _progress)
+    accepted = set(getattr(RUNNER, "_ALLOWED", frozenset()))
+    if not accepted:
+        return
+    undeclared = sorted(accepted - set(caps["params"]))
+    assert not undeclared, f"accepted but not declared: {undeclared}"
+
+    per_method = caps.get("method_params", {})
+    for method, declared in per_method.items():
+        allowed = getattr(RUNNER, f"_ALLOWED_{method.upper()}", None)
+        if allowed is None:
+            continue
+        missing = sorted(set(allowed) - set(declared))
+        assert not missing, f"{method} accepts but does not declare: {missing}"
+
+
 def main() -> int:
     """Run every test."""
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
