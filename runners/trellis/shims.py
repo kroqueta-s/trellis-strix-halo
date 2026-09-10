@@ -626,6 +626,138 @@ def _install_dense_sdpa(head_chunk: int) -> None:
 
 
 # --------------------------------------------------------------------------------------
+# Replacement for o_voxel's hashmap (**TRELLIS.2 only**)
+# --------------------------------------------------------------------------------------
+#
+# `o_voxel.convert.flexible_dual_grid_to_mesh` - the function that turns the
+# decoder's dual grid into a mesh - is pure torch except for two calls into that
+# package's CUDA extension: a hashmap from a voxel coordinate to the row it came
+# from. Nothing else on the image-to-mesh path touches `_C`, so replacing those
+# two calls is enough to run the extraction without building anything.
+#
+# **This section has no counterpart in the Hi3DGen runner**, whose upstream is
+# TRELLIS.1 and never imports `o_voxel`. The rest of this file stays identical.
+#
+# **What a miss is**: `hashmap_lookup_3d_cuda` returns the largest value of the
+# value type both for an absent key and for a coordinate outside the grid
+# (`o-voxel/src/hash/hash.cu`), and the caller tests against `0xffffffff`.
+
+
+def _linearize_3d(coords: torch.Tensor, w: int, h: int, d: int) -> torch.Tensor:
+    """Flatten `[N, 4]` (batch, x, y, z) exactly as the kernels do.
+
+    `b*W*H*D + x*H*D + y*D + z`, in int64 so the product cannot wrap: the
+    largest grid TRELLIS.2 offers (1536^3) is 3.6e9, already past a signed
+    32-bit range.
+    """
+    c = coords.long()
+    return ((c[:, 0] * w + c[:, 1]) * h + c[:, 2]) * d + c[:, 3]
+
+
+def _table_as_int64(table: torch.Tensor) -> torch.Tensor:
+    """Read a hashmap array as int64, refusing the case that would wrap.
+
+    The caller picks uint32 or uint64 by grid volume
+    (`o_voxel/convert/flexible_dual_grid.py`), and **uint64 is only reached past
+    2^32 voxels** - beyond every resolution TRELLIS.2 offers. Rather than carry
+    an unsigned path that nothing exercises, a key that would not survive the
+    conversion raises.
+    """
+    if table.dtype == torch.uint64:
+        sentinel = torch.iinfo(torch.uint64).max
+        as_int = table.to(torch.int64)
+        if bool(((as_int < 0) & (table != sentinel)).any()):
+            raise NotImplementedError("o_voxel hashmap keys past 2^63 are not supported")
+        return torch.where(table == sentinel, torch.iinfo(torch.int64).max, as_int)
+    return table.to(torch.int64)
+
+
+def _hashmap_insert_3d_idx_as_val(
+    hashmap_keys: torch.Tensor,
+    hashmap_values: torch.Tensor,
+    coords: torch.Tensor,
+    w: int,
+    h: int,
+    d: int,
+) -> None:
+    """Store `coordinate -> row index` **in the caller's own two tensors**.
+
+    Upstream fills them by open addressing on the GPU. Here they hold the keys
+    **sorted at the front**, with the empty sentinel - the largest value of the
+    key type, which is what upstream also leaves in an empty slot - filling the
+    tail. The tail keeps the array sorted, so a lookup is one `searchsorted`
+    over the whole array with no count to carry. It is the idiom the
+    submanifold convolution already uses for its neighbour index.
+
+    **Duplicate coordinates keep the first row.** Upstream's kernel races for
+    them; the pipeline produces none, and being deterministic is worth more
+    here than reproducing a race.
+    """
+    keys = _linearize_3d(coords, w, h, d)
+    order = torch.argsort(keys, stable=True)
+    ordered = keys[order]
+    first = torch.ones_like(ordered, dtype=torch.bool)
+    first[1:] = ordered[1:] != ordered[:-1]
+    unique_keys = ordered[first]
+    unique_rows = order[first]
+
+    count = int(unique_keys.numel())
+    if count > hashmap_keys.numel():
+        raise ValueError(f"hashmap too small: {count} keys into {hashmap_keys.numel()} slots")
+
+    hashmap_keys.fill_(torch.iinfo(hashmap_keys.dtype).max)
+    hashmap_keys[:count] = unique_keys.to(hashmap_keys.dtype)
+    hashmap_values[:count] = unique_rows.to(hashmap_values.dtype)
+
+
+def _hashmap_lookup_3d(
+    hashmap_keys: torch.Tensor,
+    hashmap_values: torch.Tensor,
+    coords: torch.Tensor,
+    w: int,
+    h: int,
+    d: int,
+) -> torch.Tensor:
+    """Look coordinates up, returning the stored row or the miss value."""
+    c = coords.long()
+    inside = (
+        (c[:, 1] >= 0)
+        & (c[:, 1] < w)
+        & (c[:, 2] >= 0)
+        & (c[:, 2] < h)
+        & (c[:, 3] >= 0)
+        & (c[:, 3] < d)
+    )
+    query = _linearize_3d(coords, w, h, d)
+    table = _table_as_int64(hashmap_keys)
+    # A coordinate outside the grid can linearize to a negative number, which
+    # `searchsorted` would place before every key; `inside` rejects it anyway.
+    position = torch.searchsorted(table, query.clamp(min=0)).clamp(max=table.numel() - 1)
+    hit = inside & (table[position] == query)
+
+    out = torch.full_like(query, torch.iinfo(hashmap_values.dtype).max)
+    out[hit] = _table_as_int64(hashmap_values)[position[hit]]
+    return out.to(hashmap_values.dtype)
+
+
+def _make_o_voxel_c() -> types.ModuleType:
+    """Build the `o_voxel._C` stand-in holding **only the two functions used**."""
+    module = _new_module("o_voxel._C")
+    module.hashmap_insert_3d_idx_as_val_cuda = _hashmap_insert_3d_idx_as_val  # type: ignore[attr-defined]
+    module.hashmap_lookup_3d_cuda = _hashmap_lookup_3d  # type: ignore[attr-defined]
+    return module
+
+
+def install_o_voxel_hashmap() -> None:
+    """Take the place of `o_voxel._C` **before `o_voxel` is imported**.
+
+    The rest of that package is pure python and is imported from the upstream
+    checkout unchanged; only the compiled half is replaced.
+    """
+    sys.modules["o_voxel._C"] = _make_o_voxel_c()
+
+
+# --------------------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------------------
 
