@@ -757,6 +757,36 @@ def install_o_voxel_hashmap() -> None:
     sys.modules["o_voxel._C"] = _make_o_voxel_c()
 
 
+def install_trellis2() -> None:
+    """Everything TRELLIS.2 needs on top of `install()`. **Call it before importing.**
+
+    Three names are imported by the module that carries `Mesh`, and only one of
+    them does any work on the image-to-mesh path:
+
+    - `o_voxel._C`: **the mesh extraction runs through it**, so it is replaced
+      with a working implementation above.
+    - `cumesh`: a GPU mesh library, reached only through `Mesh.fill_holes`,
+      `simplify` and `remove_faces`. **This runner calls none of them** - it
+      drives the pipeline stage by stage and does its own postprocessing - so a
+      stand-in that raises when called says so rather than guessing.
+    - `flex_gemm.ops.grid_sample`: `MeshWithVoxel.query_attrs` samples texture
+      attributes with it. **Texture is not implemented here**, so the same
+      applies.
+
+    A stand-in that raises is the point: **it can never return a wrong mesh
+    quietly.** If a future change reaches one of these, it stops with the name
+    that was called.
+    """
+    install_o_voxel_hashmap()
+    _install_absent("cumesh", "a CUDA mesh library with no Windows + ROCm build")
+    for name in ("flex_gemm", "flex_gemm.ops", "flex_gemm.ops.grid_sample"):
+        _install_absent(name, "a CUDA extension with no Windows + ROCm build")
+    # `o_voxel`'s package __init__ imports every submodule, and two of them
+    # (`postprocess`, `rasterize`) import nvdiffrast at the top for work this
+    # runner never asks for. **Importing the package at all needs the name.**
+    install_absent_nvdiffrast()
+
+
 # --------------------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------------------
