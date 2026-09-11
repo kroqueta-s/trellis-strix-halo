@@ -145,25 +145,33 @@ around it — so the colour follows the *position*, not the surface. That is wha
 makes it survive decimation, hole closing and the manifold conversion, all of
 which replace the vertices outright; a UV atlas would not survive any of them.
 
-On the mecha at 512, against the same run without it:
+On the mecha, against the same run without it:
 
-| Stage | Seconds |
-|---|--:|
-| Texture latent (12 steps) | 10.4 |
-| Texture decode | 4.8 |
-| **Added to generation** | **15.1 of 64.4 (+31 %)** |
-| Colouring 738,847 vertices | **0.12** |
+| Stage | 512 | 1024 |
+|---|--:|--:|
+| Texture latent (12 steps) | 10.4 s | 64.3 s |
+| Texture decode | 4.8 s | 14.7 s |
+| **Added to generation** | **+31 %** (15.1 of 64.4) | **+50 %** (78.6 of 236.1) |
+| Colouring the vertices | 0.12 s (738,847) | **0.15 s** (755,968) |
+| Peak VRAM, with / without | 5.22 / 5.22 GB | 13.53 / 13.52 GB |
 
-Loading costs more too — **64.7 s against 42–45 s**, because the pipeline holds
-eight models rather than five — and it needs 6.1 GB more on disk
-(`install-trellis2.ps1 -WithTexture`). **Peak VRAM did not move**: 5.22 GB, with
-no spill.
+**Carrying the colours onto the mesh is free; sampling them is not.** The
+texture flow runs the same full attention as the shape flow, so it grows with
+the square of the token count — but at guidance 1.0 it makes no negative pass,
+which is why it costs about half what the shape stage does (113.3 s against
+64.3 s at 1024).
 
-**511 vertices of 738,847 (0.07 %) came back black** — the ones no active voxel
-surrounds, which cannot be interpolated from anything.
-`metrics.vertex_colors.unreached_vertices` counts them every run, because a
-model that is black because the texture stage failed and one that is black
-because it is black look identical otherwise.
+**Peak VRAM does not move**, because `low_vram` puts each model on the card only
+while it is needed. What it costs instead is loading — **63–65 s against
+42–45 s**, for eight models rather than five — and 6.1 GB more on disk
+(`install-trellis2.ps1 -WithTexture`). The geometry is unchanged: 9,273,134
+faces before decimation either way, and the same topology afterwards.
+
+**1,161 vertices of 755,968 (0.15 %) came back black** at 1024, 511 of 738,847
+(0.07 %) at 512 — the ones no active voxel surrounds, which cannot be
+interpolated from anything. `metrics.vertex_colors.unreached_vertices` counts
+them every run, because a model that is black because the texture stage failed
+and one that is black because it is black look identical otherwise.
 
 Only the base colour is kept. The decoder also produces metallic, roughness and
 alpha (`pipeline.pbr_attr_layout`), and a PLY has nowhere to put them.
