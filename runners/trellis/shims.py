@@ -233,6 +233,56 @@ def _neighbor_index_map(coords: torch.Tensor, kernel_size: int) -> torch.Tensor:
     return out
 
 
+def _submanifold_conv(
+    feats: torch.Tensor,
+    rulebook: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """The convolution itself, shared by the two backends that ask for it.
+
+    `weight` is KRSC (`[out, kD, kH, kW, in]`), `rulebook` is `[K, N]` of input
+    indices with `-1` for an inactive neighbour, and the result is `[N, out]`.
+
+    **Output voxels are processed in chunks.** Doing them all at once makes the
+    gathered features `[N, in]` alone exceed 700 MB at resolution 256 with 192
+    input channels, and there are only 32 GB of dedicated VRAM.
+
+    **The accumulator is fp32 even when the features are fp16**: a 3^3 kernel
+    over 1024 channels sums 27,648 products per output, which leaves fp16 no
+    headroom.
+    """
+    out_channels, in_channels = weight.shape[0], weight.shape[-1]
+    n = feats.shape[0]
+    # [out, K, in] -> [K, in, out] (built once and reused)
+    w_all = (
+        weight.reshape(out_channels, -1, in_channels).permute(1, 2, 0).contiguous().to(feats.dtype)
+    )
+    kernels = w_all.shape[0]
+    center = kernels // 2
+
+    out = torch.empty(n, out_channels, device=feats.device, dtype=feats.dtype)
+    bias_f = None if bias is None else bias.float()
+    for start in range(0, n, VOXEL_CHUNK):
+        end = min(start + VOXEL_CHUNK, n)
+        acc = torch.zeros(end - start, out_channels, device=feats.device)
+        for k in range(kernels):
+            if kernels == 1 or k == center:
+                # The centre is always the voxel itself: submanifold means
+                # output coordinates equal input coordinates.
+                acc += (feats[start:end] @ w_all[k]).float()
+                continue
+            idx = rulebook[k, start:end].long()
+            valid = idx >= 0
+            gathered = feats.index_select(0, idx.clamp_(min=0))
+            gathered[~valid] = 0
+            acc += (gathered @ w_all[k]).float()
+        if bias_f is not None:
+            acc += bias_f
+        out[start:end] = acc.to(feats.dtype)
+    return out
+
+
 class _SubMConv3dImpl(nn.Module):
     """Submanifold sparse 3D convolution (stride 1, output coordinates equal input coordinates).
 
@@ -291,35 +341,7 @@ class _SubMConv3dImpl(nn.Module):
         if feats.dim() != 2:
             feats = feats.reshape(feats.shape[0], -1)
         rulebook = self._rulebook(x)
-        n = feats.shape[0]
-        # [out, K, in] -> [K, in, out] (built once and reused)
-        weight = self.weight.reshape(self.out_channels, -1, self.in_channels)
-        w_all = weight.permute(1, 2, 0).contiguous().to(feats.dtype)
-        kernels = w_all.shape[0]
-        center = kernels // 2
-
-        out = torch.empty(n, self.out_channels, device=feats.device, dtype=feats.dtype)
-        bias = None if self.bias is None else self.bias.float()
-        # **Output voxels are processed in chunks.** Doing them all at once makes
-        # the gathered features `[N, in]` alone exceed 700 MB at resolution 256
-        # with 192 input channels.
-        for start in range(0, n, VOXEL_CHUNK):
-            end = min(start + VOXEL_CHUNK, n)
-            acc = torch.zeros(end - start, self.out_channels, device=feats.device)
-            for k in range(kernels):
-                if kernels == 1 or k == center:
-                    # The centre is always the voxel itself: submanifold means
-                    # output coordinates equal input coordinates.
-                    acc += (feats[start:end] @ w_all[k]).float()
-                    continue
-                idx = rulebook[k, start:end].long()
-                valid = idx >= 0
-                gathered = feats.index_select(0, idx.clamp_(min=0))
-                gathered[~valid] = 0
-                acc += (gathered @ w_all[k]).float()
-            if bias is not None:
-                acc += bias
-            out[start:end] = acc.to(feats.dtype)
+        out = _submanifold_conv(feats, rulebook, self.weight, self.bias)
 
         return SparseConvTensor(
             out,
@@ -757,6 +779,71 @@ def install_o_voxel_hashmap() -> None:
     sys.modules["o_voxel._C"] = _make_o_voxel_c()
 
 
+def _flex_gemm_submanifold_conv3d(
+    feats: torch.Tensor,
+    coords: torch.Tensor,
+    _spatial_size: Any,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    neighbor_cache: torch.Tensor | None,
+    dilation: Any = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`flex_gemm.ops.spconv.sparse_submanifold_conv3d`, on the same rulebook.
+
+    Returns the features **and the rulebook**, which the caller caches on the
+    sparse tensor and hands back for the next convolution at the same
+    resolution - the same reuse the spconv path gets from `indice_key`.
+    """
+    if dilation not in (1, (1, 1, 1), [1, 1, 1]):
+        raise NotImplementedError(f"dilation {dilation} is unsupported (this path never uses it)")
+    kernel = int(weight.shape[1])
+    if neighbor_cache is None:
+        if kernel == 1:
+            neighbor_cache = torch.arange(
+                coords.shape[0], device=coords.device, dtype=torch.int32
+            ).unsqueeze(0)
+        else:
+            neighbor_cache = _neighbor_index_map(coords, kernel)
+    return _submanifold_conv(feats, neighbor_cache, weight, bias), neighbor_cache
+
+
+def _install_flex_gemm() -> None:
+    """Stand in for `flex_gemm`, **with a working sparse convolution**.
+
+    **This is the backend the published checkpoints were saved with.** Its
+    convolution keeps the weight on the module itself (`conv.weight`), while the
+    spconv backend nests it one level down (`conv.conv.weight`), so loading a
+    TRELLIS.2 checkpoint through the spconv path leaves **every convolution
+    weight uninitialized** - and the decoder then predicts no subdivision at
+    all, which surfaces far away as an empty tensor. Measured 2026-09-11:
+    `blocks.0.0.conv.conv.weight` held 32 NaNs and 2 infinities, because it was
+    never written.
+
+    The arithmetic is the same submanifold convolution as the spconv shim, and
+    the weight layout is the same KRSC, so `tests/test_shims.py` covers both.
+    `grid_sample` stays absent: it belongs to texture.
+    """
+    module = _new_module("flex_gemm", is_package=True)
+    ops = _new_module("flex_gemm.ops", is_package=True)
+    spconv_ops = _new_module("flex_gemm.ops.spconv", is_package=True)
+
+    spconv_ops.sparse_submanifold_conv3d = _flex_gemm_submanifold_conv3d  # type: ignore[attr-defined]
+    # The algorithm and the hashmap ratio choose between CUDA kernels that do
+    # not exist here; there is one implementation, so both are accepted and
+    # ignored rather than raising in the middle of a forward pass.
+    spconv_ops.set_algorithm = lambda *_args, **_kwargs: None  # type: ignore[attr-defined]
+    spconv_ops.set_hashmap_ratio = lambda *_args, **_kwargs: None  # type: ignore[attr-defined]
+
+    ops.spconv = spconv_ops  # type: ignore[attr-defined]
+    module.ops = ops  # type: ignore[attr-defined]
+    sys.modules["flex_gemm"] = module
+    sys.modules["flex_gemm.ops"] = ops
+    sys.modules["flex_gemm.ops.spconv"] = spconv_ops
+
+    _install_absent("flex_gemm.ops.grid_sample", "texture sampling only (not produced here)")
+    ops.grid_sample = sys.modules["flex_gemm.ops.grid_sample"]  # type: ignore[attr-defined]
+
+
 def install_trellis2() -> None:
     """Everything TRELLIS.2 needs on top of `install()`. **Call it before importing.**
 
@@ -769,9 +856,9 @@ def install_trellis2() -> None:
       `simplify` and `remove_faces`. **This runner calls none of them** - it
       drives the pipeline stage by stage and does its own postprocessing - so a
       stand-in that raises when called says so rather than guessing.
-    - `flex_gemm.ops.grid_sample`: `MeshWithVoxel.query_attrs` samples texture
-      attributes with it. **Texture is not implemented here**, so the same
-      applies.
+    - `flex_gemm`: **the sparse convolution the checkpoints were saved with**,
+      so its half is implemented rather than stubbed (`_install_flex_gemm`).
+      Only `ops.grid_sample`, which samples texture attributes, stays absent.
 
     A stand-in that raises is the point: **it can never return a wrong mesh
     quietly.** If a future change reaches one of these, it stops with the name
@@ -779,8 +866,7 @@ def install_trellis2() -> None:
     """
     install_o_voxel_hashmap()
     _install_absent("cumesh", "a CUDA mesh library with no Windows + ROCm build")
-    for name in ("flex_gemm", "flex_gemm.ops", "flex_gemm.ops.grid_sample"):
-        _install_absent(name, "a CUDA extension with no Windows + ROCm build")
+    _install_flex_gemm()
     # `o_voxel`'s package __init__ imports every submodule, and two of them
     # (`postprocess`, `rasterize`) import nvdiffrast at the top for work this
     # runner never asks for. **Importing the package at all needs the name.**

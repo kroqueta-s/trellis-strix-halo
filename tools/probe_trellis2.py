@@ -41,7 +41,7 @@ if _setting("TRELLIS2_PREFER_HIPBLASLT", "on") == "on":
     os.environ.setdefault("ROCBLAS_USE_HIPBLASLT", "1")
 os.environ.setdefault("ATTN_BACKEND", "sdpa")
 os.environ.setdefault("SPARSE_ATTN_BACKEND", "flash_attn")
-os.environ.setdefault("SPARSE_CONV_BACKEND", "spconv")
+os.environ.setdefault("SPARSE_CONV_BACKEND", "flex_gemm")
 os.environ.setdefault("SPCONV_ALGO", "native")
 
 import torch  # noqa: E402
@@ -141,6 +141,27 @@ def main() -> int:
         pipeline = Trellis2ImageTo3DPipeline.from_pretrained(str(WEIGHTS), config_file=CONFIG_FILE)
         pipeline.cuda()
         timings["load"] = time.perf_counter() - t0
+        # **The background remover comes back in the checkpoint's dtype.**
+        # transformers 5 keeps fp16 weights in fp16, while upstream's BiRefNet
+        # wrapper hands it a float32 tensor, so the first convolution refuses
+        # ("Input type (float) and bias type (c10::Half)"). Casting the model
+        # is the launch-side fix; the vendor code is not touched.
+        rembg = getattr(pipeline, "rembg_model", None)
+        inner = getattr(rembg, "model", None)
+        if inner is not None and next(inner.parameters()).dtype != torch.float32:
+            inner.float()
+        # **The conditioner's layer stack moved one level down.** Upstream walks
+        # `DINOv3ViTModel.layer`; transformers 5.16 keeps the 24 blocks at
+        # `.model.layer` and exposes nothing by the old name. The blocks
+        # themselves are unchanged - same call, same `position_embeddings`
+        # keyword - so an alias is the whole fix. It shares the module list
+        # rather than copying it, so nothing moves in memory.
+        cond_model = getattr(getattr(pipeline, "image_cond_model", None), "model", None)
+        if cond_model is not None and not hasattr(cond_model, "layer"):
+            nested = getattr(getattr(cond_model, "model", None), "layer", None)
+            if nested is None:
+                raise RuntimeError("DINOv3: no layer stack at .layer or .model.layer")
+            cond_model.layer = nested
         print(f"loaded: {sorted(pipeline.models)} | low_vram={pipeline.low_vram}")
         if args.load_only:
             print(f"G-3 only: import {timings['import']:.1f}s, load {timings['load']:.1f}s")
@@ -161,7 +182,10 @@ def main() -> int:
             torch.manual_seed(args.seed)
             watch.stage = "structure"
             t0 = time.perf_counter()
-            coords = pipeline.sample_sparse_structure(cond, 32, 1, {})
+            # **The sparse structure is sampled coarser than the output.**
+            # Upstream's `run()` uses 32 for its 512 pipeline and 64 for 1024.
+            ss_resolution = 32 if args.resolution <= 512 else 64
+            coords = pipeline.sample_sparse_structure(cond, ss_resolution, 1, {})
             timings["structure"] = time.perf_counter() - t0
             n_voxels = int(coords.shape[0])
             print(f"  active voxels: {n_voxels:,}")
