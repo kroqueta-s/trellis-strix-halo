@@ -1,0 +1,51 @@
+# Pure-python dependencies for the TRELLIS.2 runner. **No CUDA-only package
+# appears here.** spconv, flash-attn, o-voxel, CuMesh, FlexGEMM, nvdiffrast and
+# nvdiffrec are replaced at launch time by the shims in runners/trellis/
+# (see shims.py), or are off the image-to-mesh path entirely.
+#
+# The versions are the ones the TRELLIS.1 runner was verified with on
+# 2026-09-01; this file exists because the two runners have separate virtual
+# environments (one model per environment), not because the versions differ.
+#
+# **rembg and onnxruntime are deliberately absent.** TRELLIS.2 removes the
+# background with BiRefNet, which is plain torch, so nothing here pulls in
+# numba - the library Smart App Control blocks intermittently on this machine.
+tqdm==4.70.0
+easydict==1.13
+scipy==1.18.1
+trimesh==5.1.0
+transformers==5.16.1
+safetensors==0.8.0
+huggingface_hub==1.29.0
+imageio==2.37.4
+opencv-python-headless==5.0.0.93
+einops==0.8.2
+plyfile==1.1.5
+python-dotenv==1.2.3
+utils3d @ git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
+
+# o-voxel's python half is imported from the upstream checkout rather than
+# installed (its compiled half cannot be built here), and its package __init__
+# pulls in the .vxz reader, which imports this. Nothing on the image-to-mesh
+# path reads a .vxz file; the import is what needs satisfying.
+zstandard==0.25.0
+
+# BiRefNet removes the background, and transformers loads it through
+# trust_remote_code: the modeling file it fetches imports these two, and
+# transformers refuses to run it until they are present.
+kornia==0.8.3
+timm==1.0.29
+
+# Decimation, run before the rest of the post-processing. Measured 2026-09-11:
+# 3.33 M faces to 700 k in **3.3 s**, and it does not damage the topology - the
+# non-manifold edges fall from 15,860 to 10,097 and the boundary edges from
+# 118,777 to 26,959, for a mean error of 0.17% of the longest side.
+fast-simplification==0.2.0
+
+# **Deliberately absent: pymeshfix (AGPL-3.0) and igraph (GPL).** The TRELLIS.1
+# runner needs them for upstream's visibility-and-min-cut postprocessing; this
+# one does not run that pass at all (it destroys these meshes - see
+# docs/trellis2.md), and closes its holes with `runners/trellis/close_holes.py`,
+# which is this repository's own code. **This repository is MIT**, and nothing
+# it requires at runtime should be more restrictive than that.
+# pyvista goes with them: it is only here to carry pymeshfix's workflow.

@@ -19,8 +19,12 @@ onnxruntime==1.29.0
 python-dotenv==1.2.3
 utils3d @ git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
 
-# Used by the upstream postprocessing that this runner calls (fill_holes).
-pyvista==0.48.4
-pymeshfix==0.18.1
-igraph==1.0.0
+# **pymeshfix (AGPL-3.0) and igraph (GPL) used to be here** - the hole filling
+# and the min-cut in fill_holes.py. **This repository is MIT**, and nothing it
+# needs at runtime should be more restrictive, so both were replaced:
+# the cut by scipy's maximum flow (tests/test_min_cut.py holds the two to the
+# same cost), the hole filling by runners/trellis/close_holes.py. Measured on
+# the same specimen afterwards: 518,576 faces against 525,992, one component,
+# **0 boundary edges, 0 non-manifold edges, watertight**, and the enclosed
+# volume within 0.26%.
 xatlas==0.0.11

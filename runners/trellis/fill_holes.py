@@ -27,7 +27,14 @@ nor any threshold was changed**, so the output matches upstream
 (`tests/test_fill_holes.py` confirms the agreement on a small mesh).
 
 **Upstream's helpers are called as-is** (`utils3d.torch.*`,
-`sphere_hammersley_sequence`, `pymeshfix`). Only the sequencing lives here.
+`sphere_hammersley_sequence`). Only the sequencing lives here.
+
+**Two of upstream's libraries are not used**: `igraph` (GPL) for the min-cut
+and `pymeshfix` (AGPL-3.0) for the hole filling. This repository is MIT, so
+the cut is solved with scipy's maximum flow and the holes are closed by
+`close_holes.py`. Measured on the same specimen: 518,576 faces against
+525,992, one component, 0 boundary edges, 0 non-manifold edges, watertight,
+and the enclosed volume within 0.26%.
 """
 
 from __future__ import annotations
@@ -130,7 +137,7 @@ def fill_holes(
         faces: `[F, 3]` on cuda.
         max_hole_size: Maximum area of the boundary loop a cut may open. A cut
             exceeding it is rejected.
-        max_hole_nbe: Maximum number of edges in a boundary loop `pymeshfix`
+        max_hole_nbe: Maximum number of edges in a boundary loop the closing
             will fill.
         resolution: Rasterization resolution.
         num_views: Number of viewpoints.
@@ -139,9 +146,7 @@ def fill_holes(
     Returns:
         `(verts, faces)`.
     """
-    import igraph
     import utils3d
-    from pymeshfix import _meshfix
 
     def say(stage: str, message: str) -> None:
         if progress is not None:
@@ -171,27 +176,26 @@ def fill_holes(
     dual_weights = torch.norm(verts[dual_edge2edge[:, 0]] - verts[dual_edge2edge[:, 1]], dim=1)
 
     n_faces = int(faces.shape[0])
-    g = igraph.Graph()
-    g.add_vertices(n_faces + 2)  # the last two are source and target
     source, target = n_faces, n_faces + 1
-    g.add_edges(dual_edges.cpu().numpy())
-    weights = dual_weights.cpu().numpy().tolist()
 
-    # **This is the only difference from upstream.** The indices move to the CPU
-    # in one go before the edges are built. Upstream walks a CUDA tensor element
-    # by element in Python, spending 35 seconds on 360,000 GPU reads.
-    # **The edges added are the same.**
-    inner_list = inner_face_indices.cpu().numpy().tolist()
-    outer_list = outer_face_indices.cpu().numpy().tolist()
-    g.add_edges([(f, source) for f in inner_list])
-    g.add_edges([(f, target) for f in outer_list])
-    weights.extend([1.0] * (len(inner_list) + len(outer_list)))
-
+    # **The indices move to the CPU in one go**, where upstream walks a CUDA
+    # tensor element by element in Python and spends 35 seconds on 360,000 GPU
+    # reads. The edges are the same ones.
+    inner_list = inner_face_indices.cpu().numpy()
+    outer_list = outer_face_indices.cpu().numpy()
     say("mincut", f"solving the min-cut (inner {len(inner_list):,} / outer {len(outer_list):,})")
-    capacities = (np.asarray(weights, dtype=np.float64) * 1000).tolist()
-    cut = g.mincut(source, target, capacities)
     remove_face_indices = torch.tensor(
-        [v for v in cut.partition[0] if v < n_faces], dtype=torch.long, device=faces.device
+        _min_cut(
+            n_faces,
+            dual_edges.cpu().numpy(),
+            dual_weights.cpu().numpy(),
+            inner_list,
+            outer_list,
+            source,
+            target,
+        ),
+        dtype=torch.long,
+        device=faces.device,
     )
     if remove_face_indices.shape[0] == 0:
         say("mincut", "no faces to cut")
@@ -213,14 +217,38 @@ def fill_holes(
             faces, verts = utils3d.torch.remove_unreferenced_vertices(faces, verts)
             say("mincut", f"cut {int(remove_face_indices.shape[0]):,} faces")
 
-    say("meshfix", f"filling small holes (up to {max_hole_nbe} edges)")
-    fixer = _meshfix.PyTMesh()
-    fixer.load_array(verts.cpu().numpy(), faces.cpu().numpy())
-    fixer.fill_small_boundaries(nbe=max_hole_nbe, refine=True)
-    new_verts, new_faces = fixer.return_arrays()
+    say("close", f"closing boundary loops of up to {max_hole_nbe} edges")
+    import trimesh
+
+    from .close_holes import close_holes
+
+    from .split_manifold import count_non_manifold, split_non_manifold
+
+    closed, stats = close_holes(
+        trimesh.Trimesh(
+            vertices=verts.detach().cpu().numpy(),
+            faces=faces.detach().cpu().numpy(),
+            process=False,
+        ),
+        max_extent=0.0,
+        max_edges=int(max_hole_nbe),
+    )
+    say("close", f"closed {stats.loops:,} loops, left {stats.loops_left_open:,} open")
+
+    # **A fan through a pinch vertex leaves a non-manifold edge behind.** There
+    # are only a handful - three on the reference specimen - and leaving them
+    # costs the mesh its watertightness, which is the one property the caller
+    # is entitled to. Separating them and closing what opens takes under a
+    # second at this size.
+    _boundary, non_manifold = count_non_manifold(closed)
+    if non_manifold:
+        say("close", f"separating {non_manifold:,} non-manifold edges the patches left")
+        closed, _split = split_non_manifold(closed)
+        closed, again = close_holes(closed, max_extent=0.0)
+        say("close", f"closed {again.loops:,} more loops")
     return (
-        torch.tensor(new_verts, device=verts.device, dtype=torch.float32),
-        torch.tensor(new_faces, device=faces.device, dtype=torch.int32),
+        torch.tensor(np.asarray(closed.vertices), device=verts.device, dtype=torch.float32),
+        torch.tensor(np.asarray(closed.faces), device=faces.device, dtype=torch.int32),
     )
 
 
@@ -277,3 +305,77 @@ def ensure_upstream_on_path(repo: str) -> None:
     """Make the upstream clone importable, so its helpers can be used."""
     if repo not in sys.path:
         sys.path.insert(0, repo)
+
+def _min_cut(
+    n_faces: int,
+    dual_edges: np.ndarray,
+    dual_weights: np.ndarray,
+    inner: np.ndarray,
+    outer: np.ndarray,
+    source: int,
+    target: int,
+) -> list[int]:
+    """Which faces fall on the source side of the minimum cut.
+
+    **This was `igraph.Graph.mincut`, and igraph is GPL** while this repository
+    is MIT, so it is done with scipy's maximum flow instead (BSD, and already a
+    dependency). The two are the same computation: a maximum flow saturates the
+    minimum cut, and the source side of that cut is exactly the set of nodes
+    still reachable from the source through edges with capacity to spare.
+
+    Capacities are integers because `maximum_flow` requires them, which is why
+    upstream's weights were already being multiplied by a thousand.
+
+    Args:
+        n_faces: How many faces; the source and target sit past them.
+        dual_edges: `[E, 2]` face pairs sharing an edge.
+        dual_weights: `[E]` weight per pair.
+        inner: Faces joined to the source (invisible ones).
+        outer: Faces joined to the target (visible ones).
+        source: Index of the source node.
+        target: Index of the target node.
+
+    Returns:
+        The face indices to remove.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import breadth_first_order, maximum_flow
+
+    nodes = n_faces + 2
+    capacity = np.rint(np.asarray(dual_weights, dtype=np.float64) * 1000.0)
+    # The undirected graph: face to face across a shared edge, every invisible
+    # face to the source, every visible one to the target.
+    ends_a = np.concatenate([dual_edges[:, 0], inner, outer])
+    ends_b = np.concatenate(
+        [dual_edges[:, 1], np.full(len(inner), source), np.full(len(outer), target)]
+    )
+    weights = np.concatenate(
+        [capacity, np.full(len(inner), 1000.0), np.full(len(outer), 1000.0)]
+    )
+    # **Each undirected edge becomes a pair of directed ones**, which is how an
+    # undirected cut is put to a directed maximum flow.
+    rows = np.concatenate([ends_a, ends_b])
+    cols = np.concatenate([ends_b, ends_a])
+    data = np.concatenate([weights, weights])
+    graph = coo_matrix(
+        (np.clip(data, 1, np.iinfo(np.int32).max).astype(np.int32), (rows, cols)),
+        shape=(nodes, nodes),
+    ).tocsr()
+    graph.sum_duplicates()
+
+    result = maximum_flow(graph, source, target)
+    residual = (graph - result.flow).tocsr()
+    residual.data = (residual.data > 0).astype(np.int32)
+    residual.eliminate_zeros()
+
+    # **A minimum cut is not unique, and which one is chosen changes the mesh.**
+    # Reachability from the source gives the smallest source side; igraph
+    # returns the largest, so the same is taken here: everything that cannot
+    # still reach the target. The two agree on every random graph tested
+    # (`tests/test_min_cut.py`).
+    to_target, _ = breadth_first_order(
+        residual.T.tocsr(), target, directed=True, return_predecessors=True
+    )
+    reaches_target = np.zeros(nodes, dtype=bool)
+    reaches_target[to_target] = True
+    return [int(v) for v in np.flatnonzero(~reaches_target) if v < n_faces]

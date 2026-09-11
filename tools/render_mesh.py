@@ -41,9 +41,20 @@ def _rotation(yaw: float, pitch: float) -> np.ndarray:
 
 
 def _render_one(
-    verts: np.ndarray, normals: np.ndarray, size: int, yaw: float, pitch: float, splat: int
+    verts: np.ndarray,
+    normals: np.ndarray,
+    size: int,
+    yaw: float,
+    pitch: float,
+    splat: int,
+    two_sided: bool = False,
+    colors: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Draw one view: orthographic projection, z-buffer, flat Lambert shading."""
+    """Draw one view: orthographic projection, z-buffer, flat Lambert shading.
+
+    With `colors` (per-vertex RGB in 0..1) the shade multiplies the vertex's own
+    colour and the view comes back as RGB; without it, greyscale as before.
+    """
     rot = _rotation(yaw, pitch)
     p = verts @ rot.T
     n = normals @ rot.T
@@ -56,10 +67,18 @@ def _render_one(
 
     light = np.array([0.4, 0.6, 1.0])
     light /= np.linalg.norm(light)
-    shade = np.clip(n @ light, 0.0, 1.0) * 0.75 + 0.25
+    # **Two-sided lighting shows the shape when the winding does not agree.**
+    # TRELLIS.2's meshes come out with about half their faces wound the other
+    # way (49.2% measured at 512), which renders as salt-and-pepper speckle and
+    # hides exactly the detail a visual check is for. Taking the magnitude
+    # lights both sides, so what is on screen is the geometry rather than the
+    # orientation.
+    facing = np.abs(n @ light) if two_sided else np.clip(n @ light, 0.0, 1.0)
+    shade = np.clip(facing, 0.0, 1.0) * 0.75 + 0.25
 
     zbuf = np.full((size, size), -np.inf, dtype=np.float64)
-    img = np.zeros((size, size), dtype=np.float64)
+    value = shade[:, None] * colors if colors is not None else shade[:, None]
+    img = np.zeros((size, size, value.shape[1]), dtype=np.float64)
     # Draw back to front so nearer points win (last write to a pixel is fine).
     order = np.argsort(depth)
     for dy in range(-splat, splat + 1):
@@ -69,7 +88,7 @@ def _render_one(
             zs = depth[order]
             keep = zs > zbuf[ys, xs]
             zbuf[ys[keep], xs[keep]] = zs[keep]
-            img[ys[keep], xs[keep]] = shade[order][keep]
+            img[ys[keep], xs[keep]] = value[order][keep]
     return img
 
 
@@ -81,6 +100,8 @@ def render(
     splat: int = 1,
     rotx: float = 0.0,
     largest_only: bool = False,
+    two_sided: bool = False,
+    color: bool = False,
 ) -> None:
     """Draw the mesh from several viewpoints into a single PNG strip.
 
@@ -90,6 +111,9 @@ def render(
         largest_only: If true, draw **only the largest connected component**.
             Use it to tell whether floating debris is real geometry or just
             splatting noise.
+        color: If true, use the mesh's vertex colours instead of grey. **It
+            raises when the mesh has none** rather than returning a grey image
+            that looks like a texture stage that produced nothing.
     """
     mesh = trimesh.load(mesh_path, process=False)
     if largest_only:
@@ -106,10 +130,20 @@ def render(
     verts = verts / max(radius, 1e-12)
     normals = _vertex_normals(verts, faces)
 
+    colors = None
+    if color:
+        raw = getattr(getattr(mesh, "visual", None), "vertex_colors", None)
+        if raw is None or len(raw) != len(verts):
+            raise ValueError(f"{mesh_path} carries no vertex colours")
+        colors = np.asarray(raw, dtype=np.float64)[:, :3] / 255.0
+
     angles = [(i * 2.0 * np.pi / views, np.deg2rad(15.0)) for i in range(views)]
-    tiles = [_render_one(verts, normals, size, yaw, pitch, splat) for yaw, pitch in angles]
+    tiles = [
+        _render_one(verts, normals, size, yaw, pitch, splat, two_sided, colors)
+        for yaw, pitch in angles
+    ]
     strip = np.concatenate(tiles, axis=1)
-    Image.fromarray((strip * 255).astype(np.uint8)).save(out_path)
+    Image.fromarray((strip.squeeze() * 255).astype(np.uint8)).save(out_path)
 
 
 def main() -> int:
@@ -121,7 +155,17 @@ def main() -> int:
     parser.add_argument("--splat", type=int, default=1)
     parser.add_argument("--rotx", type=float, default=0.0)
     parser.add_argument(
+        "--two-sided",
+        action="store_true",
+        help="light both faces of a triangle (for meshes whose winding is inconsistent)",
+    )
+    parser.add_argument(
         "--largest-only", action="store_true", help="draw only the largest connected component"
+    )
+    parser.add_argument(
+        "--color",
+        action="store_true",
+        help="shade the mesh's own vertex colours (fails if it has none)",
     )
     args = parser.parse_args()
     render(
@@ -132,6 +176,8 @@ def main() -> int:
         args.splat,
         args.rotx,
         args.largest_only,
+        args.two_sided,
+        args.color,
     )
     print(f"wrote {args.out}")
     return 0
