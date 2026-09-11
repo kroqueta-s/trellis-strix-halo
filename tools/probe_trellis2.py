@@ -111,6 +111,10 @@ def main() -> int:
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--load-only", action="store_true", help="stop after G-3")
+    parser.add_argument(
+        "--cascade", type=int, default=0, help="target resolution for the cascade (1024 or 1536)"
+    )
+    parser.add_argument("--max-tokens", type=int, default=49152)
     args = parser.parse_args()
 
     if not UPSTREAM.is_dir():
@@ -192,14 +196,33 @@ def main() -> int:
 
             watch.stage = "shape_slat"
             t0 = time.perf_counter()
-            slat = pipeline.sample_shape_slat(
-                cond, pipeline.models[f"shape_slat_flow_model_{args.resolution}"], coords, {}
-            )
+            resolution = args.resolution
+            if args.cascade:
+                # **The cascade samples at 512 and refines upward**, and drops
+                # the target resolution in steps of 128 until the token count
+                # fits, so the resolution it actually used comes back with it.
+                cond_hr = pipeline.get_cond([image], 1024)
+                slat, resolution = pipeline.sample_shape_slat_cascade(
+                    cond,
+                    cond_hr,
+                    pipeline.models["shape_slat_flow_model_512"],
+                    pipeline.models["shape_slat_flow_model_1024"],
+                    512,
+                    args.cascade,
+                    coords,
+                    {},
+                    args.max_tokens,
+                )
+                print(f"  cascade resolution: {resolution}")
+            else:
+                slat = pipeline.sample_shape_slat(
+                    cond, pipeline.models[f"shape_slat_flow_model_{args.resolution}"], coords, {}
+                )
             timings["shape_slat"] = time.perf_counter() - t0
 
             watch.stage = "decode"
             t0 = time.perf_counter()
-            meshes, _subs = pipeline.decode_shape_slat(slat, args.resolution)
+            meshes, _subs = pipeline.decode_shape_slat(slat, resolution)
             timings["decode"] = time.perf_counter() - t0
 
     extracted = meshes[0]
@@ -209,7 +232,7 @@ def main() -> int:
         process=False,
     )
     args.out.mkdir(parents=True, exist_ok=True)
-    out_file = args.out / f"raw_{args.resolution}.ply"
+    out_file = args.out / f"raw_{args.cascade or args.resolution}.ply"
     mesh.export(out_file)
 
     print("\n--- stages ---")
