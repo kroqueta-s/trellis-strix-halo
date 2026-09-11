@@ -506,7 +506,7 @@ def _postprocess(
         mark = time.perf_counter()
         if progress is not None:
             progress("close_holes", "closing the boundary loops")
-        mesh, stats = holes.close_holes(mesh)
+        mesh, stats = holes.close_holes(mesh, max_extent=config.CLOSE_MAX_EXTENT)
         report.update(stats.as_dict())
         report["close_holes_sec"] = round(time.perf_counter() - mark, 2)
 

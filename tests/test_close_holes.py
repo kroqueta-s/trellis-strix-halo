@@ -29,7 +29,7 @@ def _boundary(mesh: trimesh.Trimesh) -> int:
 def test_a_closed_mesh_is_left_alone() -> None:
     """Nothing to close means nothing added."""
     box = trimesh.creation.box()
-    closed, stats = close_holes(box)
+    closed, stats = close_holes(box, max_extent=0)
     assert stats.as_dict()["faces_added"] == 0, stats.as_dict()
     assert len(closed.faces) == len(box.faces)
 
@@ -40,7 +40,7 @@ def test_one_punched_hole_closes() -> None:
     punched = trimesh.Trimesh(vertices=box.vertices.copy(), faces=box.faces[1:].copy(), process=False)
     assert _boundary(punched) == 3
 
-    closed, stats = close_holes(punched)
+    closed, stats = close_holes(punched, max_extent=0)
     assert _boundary(closed) == 0, stats.as_dict()
     assert closed.is_watertight, stats.as_dict()
     assert stats.loops == 1
@@ -60,7 +60,7 @@ def test_many_holes_close_and_keep_the_volume() -> None:
     keep = np.setdiff1d(np.arange(len(sphere.faces)), drop)
     punched = trimesh.Trimesh(vertices=sphere.vertices.copy(), faces=sphere.faces[keep], process=False)
 
-    closed, stats = close_holes(punched)
+    closed, stats = close_holes(punched, max_extent=0)
     assert _boundary(closed) == 0, stats.as_dict()
     # The patches are tiny, so the volume must land back on the sphere's.
     assert closed.volume > 0, closed.volume
@@ -82,10 +82,39 @@ def test_a_patch_is_wound_like_its_neighbour() -> None:
         punched = trimesh.Trimesh(
             vertices=box.vertices.copy(), faces=box.faces[keep], process=False
         )
-        closed, stats = close_holes(punched)
+        closed, stats = close_holes(punched, max_extent=0)
         assert _boundary(closed) == 0, stats.as_dict()
         # The apex sits on the hole, so the volume changes by less than a face.
         assert closed.volume > 0.9 * box.volume, (dropped, closed.volume, box.volume)
+
+
+def test_a_wide_loop_is_left_open() -> None:
+    """**A fan over a wide loop is a sail, not a repair**, so it is refused.
+
+    Measured at 512: closing every loop covers 13.4% of the surface area with
+    patch. The cap is what keeps that at 3.3%, and it has to be the loop's
+    extent rather than its vertex count - the worst offenders had only a few
+    hundred vertices and spanned a third of the model.
+    """
+    # Fine enough that one missing triangle really is a pinhole against the
+    # whole model - which is the case the cap has to keep closing.
+    sphere = trimesh.creation.icosphere(subdivisions=4)
+    centre = sphere.triangles_center
+    wide = centre[:, 2] > 0.9 * sphere.vertices[:, 2].max()
+    drop = np.flatnonzero(wide)
+    keep = np.setdiff1d(np.arange(len(sphere.faces)), np.append(drop, 3000))
+    punched = trimesh.Trimesh(vertices=sphere.vertices.copy(), faces=sphere.faces[keep], process=False)
+
+    closed, stats = close_holes(punched, max_extent=0.05)
+    assert stats.loops_left_open >= 1, stats.as_dict()
+    assert _boundary(closed) > 0, "the wide loop should still be open"
+    # The narrow one is closed all the same.
+    assert stats.loops >= 1, stats.as_dict()
+    assert stats.fan_area_fraction < 0.01, stats.as_dict()
+
+    everything, all_stats = close_holes(punched, max_extent=0)
+    assert _boundary(everything) == 0, all_stats.as_dict()
+    assert all_stats.fan_area_fraction > stats.fan_area_fraction, all_stats.as_dict()
 
 
 def main() -> int:

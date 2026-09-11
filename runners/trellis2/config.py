@@ -124,6 +124,14 @@ DROP_THIN_PARTS: float = _float("TRELLIS2_DROP_THIN_PARTS", 0.02)
 # edges produce, which this cannot close.
 CLOSE_HOLES: bool = _bool("TRELLIS2_CLOSE_HOLES", True)
 
+# The widest loop still treated as a hole, as a fraction of the longest side.
+# **A fan over a wide loop is a sail, not a repair.** Measured 2026-09-12 at
+# 512: closing every loop covers **13.4% of the surface area** with patch,
+# while capping here closes 15,135 of 15,352 loops for **3.3%**. The
+# distribution has its knee at this value (99th percentile extent 0.0658).
+# 0 closes everything. `metrics.post.fan_area_fraction` reports what it cost.
+CLOSE_MAX_EXTENT: float = _float("TRELLIS2_CLOSE_MAX_EXTENT", 0.05)
+
 # **Off, because it costs more than the generation.** `fix_winding` +
 # `fix_normals` take 270 s on the 3.45 M-face mesh at 512 (measured 2026-09-11)
 # and 66 s at 700k, against 49.6 s to generate it. The mesh comes out with
