@@ -42,7 +42,10 @@ timm==1.0.29
 # 118,777 to 26,959, for a mean error of 0.17% of the longest side.
 fast-simplification==0.2.0
 
-# Used by the postprocessing this runner shares with the TRELLIS.1 one.
-pyvista==0.48.4
-pymeshfix==0.18.1
-igraph==1.0.0
+# **Deliberately absent: pymeshfix (AGPL-3.0) and igraph (GPL).** The TRELLIS.1
+# runner needs them for upstream's visibility-and-min-cut postprocessing; this
+# one does not run that pass at all (it destroys these meshes - see
+# docs/trellis2.md), and closes its holes with `runners/trellis/close_holes.py`,
+# which is this repository's own code. **This repository is MIT**, and nothing
+# it requires at runtime should be more restrictive than that.
+# pyvista goes with them: it is only here to carry pymeshfix's workflow.

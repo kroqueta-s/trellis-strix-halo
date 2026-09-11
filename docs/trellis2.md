@@ -106,6 +106,13 @@ runs instead is decimation, debris removal and hole closing. On the mecha at
 | Close holes | 70.3 s | **10.0 s** |
 | **Total** | **125.5 s** | **63.3 s** |
 
+With `make_manifold` on as well, a 512 run of the mecha spends 3.1 s
+decimating, 34.9 s dropping debris, 9.3 s closing holes and **59.7 s becoming a
+manifold**, against 44.0 s to generate. **The post-processing is the expensive
+half again**, and the two stages worth attacking are the debris removal — it
+scales with the component count rather than the faces — and the manifold
+conversion.
+
 **Decimation runs first because everything after it is proportional to
 something it reduces.** It costs 3.3 s to take 3.33 M faces to 700 k, for a
 mean error of 0.17 % of the longest side (95th percentile 0.31 %) and a volume
@@ -175,14 +182,34 @@ Read-only preset is enough.
 - **No texture.** The stage exists upstream and is reachable in principle —
   UV unwrapping can be done with `xatlas` rather than CuMesh — but it is not
   implemented here.
-- **The mesh is not orientable.** The decoder's field is open by construction
-  (**32.8 % of its 2×2 grid loops carry an odd number of crossings** at 512, so
-  no inside/outside labelling of it exists). Closing the holes and separating
-  the touching sheets produces a mesh that is watertight and edge-manifold —
-  measured, 0 boundary edges and 0 non-manifold edges — but **26,843 edges still
-  disagree about which way round they go**, so `manifold3d` rejects it and
-  meshforge's `repair_manifold` cannot take it. `metrics.topology` reports this
-  every run rather than claiming otherwise.
+- **What the decoder produces is neither closed nor orientable.** Its flags say
+  which grid edges the surface crosses, and **about 5 % of the primal faces
+  carry an odd number of crossings** (4.99 % at 512, 5.02 % at 1024, measured as
+  the share of quad edges with an odd number of quads on them). A dual-grid
+  surface closes only where that count is even — and the consequence goes
+  further than holes. Where three sheets meet on one edge a path can return to
+  itself half a turn over, and **26,843 edges of roughly 2.2 M then cannot be
+  given a consistent orientation**. That is genuine rather than an artefact of
+  the analysis: an independent two-colouring returns the same count, a Möbius
+  strip reproduces the effect and a torus does not, and 99.99 % of the faces sit
+  in components carrying it. Recovering an inside/outside labelling to fix it at
+  the source was tried, and **left 6.8 % of its constraints violated** — worse
+  than the 5 % it set out to repair.
+
+  `make_manifold` deals with it by separating and cutting rather than arguing:
+  the touching sheets are split apart, the edges that cannot agree are cut too,
+  and every seam that opens is closed again. **The result is watertight,
+  edge-manifold and consistently wound, and `manifold3d` accepts it**
+  (`Error.NoError`, genus 1207), which is what meshforge's `repair_manifold`
+  needs. `TRELLIS2_MAKE_MANIFOLD=off` returns the model's own surface instead.
+
+  **It costs, and the cost is in `metrics`.** Closing those seams adds patch
+  worth **2.2–2.5× the input surface area**
+  (`post.manifold.close.fan_area_fraction`), nearly all of it internal — the
+  silhouette and the detail survive, checked by eye — while the enclosed volume
+  comes out at 0.0023 against 0.024 for the open surface, which says the inside
+  is a nest of shells rather than a solid. **Topologically clean is not the same
+  as printable**, and that part is not verified yet.
 - **Half the faces are wound the other way** (49.2 % at 512). Correcting that
   costs more than the generation on an undecimated mesh, so it is left to the
   caller, after decimation. `tools/render_mesh.py --two-sided` exists because a
@@ -190,3 +217,20 @@ Read-only preset is enough.
   and the detail being checked for is exactly what disappears.
 - **Millimetres, orientation and printability are downstream work.** The mesh
   comes back Z-up at normalized scale, as upstream leaves it.
+
+## Licences
+
+This repository is MIT, and **nothing this runner needs at runtime is more
+restrictive**: trimesh (MIT), numpy and scipy (BSD), fast-simplification (MIT),
+manifold3d (Apache), transformers (Apache).
+
+**Two of the TRELLIS.1 runner's dependencies are not in that list**, and they
+are deliberately absent here: `pymeshfix` is **AGPL-3.0** and `igraph` is
+**GPL**. Both are needed by upstream's visibility-and-min-cut post-processing,
+which this runner does not run.
+
+The weights have their own terms, which are not this repository's: TRELLIS.2
+itself is MIT, `facebook/dinov3-vitl16-pretrain-lvd1689m` is under the DINOv3
+licence and gated, and the background remover this runner points at is whatever
+the operator configured. **Read the licence of a model before using what it
+produces.**

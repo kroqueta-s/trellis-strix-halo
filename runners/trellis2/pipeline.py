@@ -30,6 +30,7 @@ import trimesh
 from PIL import Image
 
 from runners.trellis import close_holes as holes
+from runners.trellis import split_manifold
 from runners.trellis import postprocess, shims
 from runners.trellis.steps import StepCounter, count_tqdm
 
@@ -509,6 +510,14 @@ def _postprocess(
         mesh, stats = holes.close_holes(mesh, max_extent=config.CLOSE_MAX_EXTENT)
         report.update(stats.as_dict())
         report["close_holes_sec"] = round(time.perf_counter() - mark, 2)
+
+    if config.MAKE_MANIFOLD:
+        mark = time.perf_counter()
+        if progress is not None:
+            progress("manifold", "separating the sheets and closing the seams")
+        mesh, manifold_report = split_manifold.make_manifold(mesh)
+        report["manifold"] = manifold_report
+        report["manifold_sec"] = round(time.perf_counter() - mark, 2)
 
     report["faces_after"] = int(len(mesh.faces))
     return mesh, report

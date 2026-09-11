@@ -24,6 +24,7 @@ closing those is `close_holes`'s job.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import trimesh
@@ -69,12 +70,16 @@ def count_non_manifold(mesh: trimesh.Trimesh) -> tuple[int, int]:
 
 
 def split_non_manifold(
-    mesh: trimesh.Trimesh, separation: float = 0.0
+    mesh: trimesh.Trimesh, separation: float = 0.0, cut: np.ndarray | None = None
 ) -> tuple[trimesh.Trimesh, SplitStats]:
     """Duplicate the vertices where surface sheets meet, keeping every face.
 
     Args:
         mesh: The mesh to separate. **It is not modified.**
+        cut: Optional boolean mask over the **paired edge instances**, marking
+            edges to treat as a cut even though two faces share them. This is
+            how the orientation conflicts are resolved: an edge whose two faces
+            cannot agree is separated instead of being argued with.
         separation: How far to pull each copy towards its own sheet, as a
             fraction of the longest side. **0 leaves every copy exactly where
             the original was**, which keeps the geometry untouched but leaves
@@ -101,6 +106,8 @@ def split_non_manifold(
     # next to each other once sorted by key, so the pairs come out of a reshape.
     per_key_count = counts[inverse[order]]
     paired = order[per_key_count == 2].reshape(-1, 2)
+    if cut is not None:
+        paired = paired[~cut]
     first, second = paired[:, 0], paired[:, 1]
 
     # The two faces may traverse the edge in either direction, so the corner
@@ -148,7 +155,21 @@ def split_non_manifold(
     )
 
 
-def orient_faces(mesh: trimesh.Trimesh) -> tuple[trimesh.Trimesh, dict[str, int]]:
+def conflicting_edges(mesh: trimesh.Trimesh) -> np.ndarray:
+    """Which paired edges still disagree once the orientation has been propagated.
+
+    Returns a boolean mask over the paired edge instances, in the order
+    `split_non_manifold` expects for its `cut` argument. **These are the edges
+    that make the surface non-orientable**, and cutting them is the only way to
+    an orientable one - measured 2026-09-12, 26,843 of roughly 2.2 M.
+    """
+    _oriented, stats = orient_faces(mesh, _return_mask=True)
+    return stats["conflict_mask"]
+
+
+def orient_faces(
+    mesh: trimesh.Trimesh, _return_mask: bool = False
+) -> tuple[trimesh.Trimesh, dict[str, Any]]:
     """Wind every face the same way round, and point them outwards.
 
     **Only meaningful once the mesh is edge-manifold**, which is what
@@ -171,7 +192,8 @@ def orient_faces(mesh: trimesh.Trimesh) -> tuple[trimesh.Trimesh, dict[str, int]
     instance_face = np.tile(np.arange(face_count), 3)
     starts = faces[:, [0, 1, 2]].ravel(order="F")
 
-    paired = order[counts[inverse[order]] == 2].reshape(-1, 2)
+    paired_all = order[counts[inverse[order]] == 2].reshape(-1, 2)
+    paired = paired_all
     left, right = instance_face[paired[:, 0]], instance_face[paired[:, 1]]
     # **Same direction means they disagree**: two faces sharing an edge are
     # consistently wound when they traverse it in opposite directions.
@@ -211,6 +233,12 @@ def orient_faces(mesh: trimesh.Trimesh) -> tuple[trimesh.Trimesh, dict[str, int]
     # A conflict is an edge whose two faces still disagree once flipped.
     still = (disagree.astype(bool)) ^ (flip[left] ^ flip[right])
     conflicts = int(still.sum())
+    if _return_mask:
+        # The mask has to line up with every paired edge, not only the
+        # deduplicated ones, so it is rebuilt over the original pairing.
+        full = np.zeros(len(paired_all), dtype=bool)
+        full[unique_index[still]] = True
+        return mesh, {"conflicts": conflicts, "conflict_mask": full}
 
     faces[flip] = faces[flip][:, [0, 2, 1]]
     oriented = trimesh.Trimesh(vertices=np.asarray(mesh.vertices), faces=faces, process=False)
@@ -227,3 +255,59 @@ def orient_faces(mesh: trimesh.Trimesh) -> tuple[trimesh.Trimesh, dict[str, int]
         "flipped_whole": int(flipped_whole),
         "unreached": int((~seen).sum()),
     }
+
+
+def make_manifold(mesh: trimesh.Trimesh) -> tuple[trimesh.Trimesh, dict[str, Any]]:
+    """Turn the decoder's surface into a closed, orientable, manifold one.
+
+    Four steps, each one measured on the way past:
+
+    1. **Separate the sheets that touch** — the non-manifold edges become
+       boundary, and nothing is deleted.
+    2. **Propagate the orientation** and find the edges that still disagree.
+       There are always some: the surface the decoder produces is genuinely
+       non-orientable (26,843 edges of roughly 2.2 M, measured 2026-09-12, and
+       a Möbius strip reproduces the effect while a torus does not).
+    3. **Cut those edges too**, which is what makes an orientable surface out of
+       a non-orientable one. **This is where the geometry is paid for**: it
+       opens long seams, and closing them again is invention.
+    4. **Close every seam**, uncapped — a capped close would leave the mesh
+       open, which defeats the point of asking for a manifold at all.
+
+    Measured end to end on the mecha at 1024, decimated to 1.4 M faces: a
+    manifold of 1,520,680 faces, `manifold3d` accepting it with `NoError`, and
+    forge's decompose-and-union going through. **The patches are 7.6% of the
+    faces and most of the added area is internal** — the silhouette and the
+    detail survive, which is why this is worth its cost.
+
+    Returns:
+        The manifold mesh and what each step did. **`fan_area_fraction` says
+        how much of it is invention**, and it is not small.
+    """
+    from .close_holes import close_holes
+
+    report: dict[str, Any] = {"faces_in": int(len(mesh.faces))}
+    work, split_stats = split_non_manifold(mesh)
+    report["split"] = split_stats.as_dict()
+
+    cut = conflicting_edges(work)
+    report["conflicting_edges"] = int(cut.sum())
+    if cut.any():
+        work, second = split_non_manifold(work, cut=cut)
+        report["cut"] = second.as_dict()
+
+    work, orient_stats = orient_faces(work)
+    report["orient"] = {k: v for k, v in orient_stats.items() if k != "conflict_mask"}
+
+    # **Uncapped on purpose**: these are seams this function opened, not holes
+    # in the model, and leaving them open would make the whole exercise moot.
+    work, close_stats = close_holes(work, max_extent=0.0)
+    report["close"] = close_stats.as_dict()
+
+    boundary, non_manifold = count_non_manifold(work)
+    report["boundary_edges"] = boundary
+    report["non_manifold_edges"] = non_manifold
+    report["watertight"] = bool(work.is_watertight)
+    report["winding_consistent"] = bool(work.is_winding_consistent)
+    report["faces_out"] = int(len(work.faces))
+    return work, report

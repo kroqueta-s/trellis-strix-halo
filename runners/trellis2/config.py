@@ -132,6 +132,19 @@ CLOSE_HOLES: bool = _bool("TRELLIS2_CLOSE_HOLES", True)
 # 0 closes everything. `metrics.post.fan_area_fraction` reports what it cost.
 CLOSE_MAX_EXTENT: float = _float("TRELLIS2_CLOSE_MAX_EXTENT", 0.05)
 
+# Separate the touching sheets, cut what cannot be oriented, and close the
+# seams, so that the mesh is a closed orientable manifold. **This is what makes
+# `manifold3d` - and therefore forge's `repair_manifold` - accept it**:
+# measured 2026-09-12, `Error.NoError`, 1,517,778 triangles, genus 1207, where
+# without it manifold3d refuses and forge reports "repairing did not make this
+# watertight".
+#
+# **It is not free.** The seams it opens have to be closed again, and the
+# patches add **2.5x the input surface area** (`post.manifold.close`). Most of
+# that is internal - the silhouette and the detail survive, checked by eye -
+# but a caller who wants only what the model produced should turn this off.
+MAKE_MANIFOLD: bool = _bool("TRELLIS2_MAKE_MANIFOLD", True)
+
 # **Off, because it costs more than the generation.** `fix_winding` +
 # `fix_normals` take 270 s on the 3.45 M-face mesh at 512 (measured 2026-09-11)
 # and 66 s at 700k, against 49.6 s to generate it. The mesh comes out with

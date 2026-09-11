@@ -111,6 +111,19 @@ def test_an_inside_out_box_is_turned_out() -> None:
     assert oriented.volume > 0, oriented.volume
 
 
+def test_make_manifold_produces_a_manifold() -> None:
+    """Two boxes joined at a vertex come back closed, oriented and manifold."""
+    from runners.trellis.split_manifold import make_manifold
+
+    mesh = _two_boxes_touching_at_a_vertex()
+    made, report = make_manifold(mesh)
+    assert report["boundary_edges"] == 0, report
+    assert report["non_manifold_edges"] == 0, report
+    assert report["watertight"], report
+    assert report["winding_consistent"], report
+    assert made.volume > 0, made.volume
+
+
 def main() -> int:
     """Run every test."""
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
