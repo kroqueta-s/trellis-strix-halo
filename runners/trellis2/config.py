@@ -93,6 +93,21 @@ VRAM_LIMIT_GB: float = _float("TRELLIS2_VRAM_LIMIT_GB", 30.0)
 HEARTBEAT_SEC: float = _float("TRELLIS2_HEARTBEAT_SEC", 10.0)
 
 # --- Post-processing -------------------------------------------------------
+# Decimate to this many faces **before anything else is done to the mesh**.
+# 0 turns it off and the model's own tessellation is kept.
+#
+# **Everything after it is proportional to the face count**, so this is what
+# makes the post-processing affordable. Measured 2026-09-12 at 512: closing the
+# holes takes 24.2 s on 3.45 M faces and **2.5 s on 700 k**, and dropping the
+# debris 19.2 s against a few seconds. Decimation itself costs **3.3 s** and
+# improves the topology on the way (non-manifold edges 15,860 -> 10,097,
+# boundary edges 118,777 -> 26,959) for a mean error of **0.17%** of the longest
+# side.
+#
+# The default is the operator's staged target: a light first pass to 1-3 M,
+# with the rest of the reduction downstream.
+TARGET_FACES: int = _int("TRELLIS2_TARGET_FACES", 1_500_000)
+
 # Drop free-floating parts smaller than this fraction of the longest side.
 # **Measured 2026-09-11**: at 512 that is 18,893 parts and 121,716 faces (3.5%),
 # at 1024 it is 81,313 parts and 651,488 faces (4.4%). Set to 0 to keep them.

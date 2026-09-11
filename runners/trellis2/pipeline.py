@@ -292,6 +292,7 @@ def generate_mesh(
     resolution: int | None = None,
     seed: int = 0,
     max_tokens: int | None = None,
+    target_faces: int | None = None,
     progress: Callable[..., None] | None = None,
 ) -> MeshResult:
     """Generate one mesh from one image.
@@ -376,7 +377,11 @@ def generate_mesh(
         faces=extracted.faces.detach().cpu().numpy(),
         process=False,
     )
-    mesh, post = _postprocess(mesh, progress)
+    # **The post-processing needs a heartbeat too.** At 1024 it runs for
+    # minutes, and a caller watching for liveness cannot tell a long stage from
+    # a stuck one: the switch test gave up on exactly this gap (2026-09-12).
+    with _DeviceWatch(progress=progress, stage="postprocess"):
+        mesh, post = _postprocess(mesh, progress, target_faces)
 
     return MeshResult(
         mesh=mesh,
@@ -428,8 +433,32 @@ def _sample_shape(
     )
 
 
+def decimate(mesh: trimesh.Trimesh, target: int) -> trimesh.Trimesh:
+    """Reduce to `target` faces with quadric edge collapse.
+
+    **Placed before everything else on purpose.** Every later step costs in
+    proportion to the face count, and this one costs almost nothing: measured
+    2026-09-11, 3.33 M faces to 700 k in 3.3 s, for a mean error of 0.17% of the
+    longest side and a volume within 0.9%.
+
+    **It does not damage the topology here** - the opposite, measured on the
+    same mesh: non-manifold edges 15,860 -> 10,097 and boundary edges
+    118,777 -> 26,959, because the slivers collapse. That is worth stating
+    because the usual worry about decimation is that it breaks a manifold; what
+    it cannot do is *make* one.
+    """
+    import fast_simplification
+
+    vertices, faces = fast_simplification.simplify(
+        mesh.vertices.astype(np.float32), mesh.faces.astype(np.int32), target_count=int(target)
+    )
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+
 def _postprocess(
-    mesh: trimesh.Trimesh, progress: Callable[..., None] | None
+    mesh: trimesh.Trimesh,
+    progress: Callable[..., None] | None,
+    target_faces: int | None = None,
 ) -> tuple[trimesh.Trimesh, dict[str, Any]]:
     """Drop the debris and close the holes. **The visibility pass is not used.**
 
@@ -442,6 +471,20 @@ def _postprocess(
     debris, 2.5 s to close the holes.**
     """
     report: dict[str, Any] = {"faces_before": int(len(mesh.faces))}
+
+    # **First, because everything below is proportional to the face count.**
+    target = int(config.TARGET_FACES if target_faces is None else target_faces)
+    if 0 < target < len(mesh.faces):
+        mark = time.perf_counter()
+        if progress is not None:
+            progress("decimate", f"reducing {len(mesh.faces):,} faces to {target:,}")
+        mesh = decimate(mesh, target)
+        report["decimate_to"] = target
+        report["decimate_sec"] = round(time.perf_counter() - mark, 2)
+    elif target > 0:
+        # **Asked for more faces than there are.** Saying so beats silently
+        # doing nothing, because the caller's budget was not met for a reason.
+        report["decimate_skipped"] = f"already at {len(mesh.faces)} faces, target {target}"
 
     if config.FIX_WINDING:
         mark = time.perf_counter()

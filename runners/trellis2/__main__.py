@@ -93,6 +93,10 @@ def m_capabilities(params: dict[str, Any], progress: Any) -> dict[str, Any]:
                 "max": 1536,
             },
             "max_tokens": {"type": "int", "default": config.MAX_TOKENS, "min": 4096},
+            # **Decimation happens before the rest of the post-processing**, so
+            # this sets what the cleaning costs as much as what comes out.
+            # 0 keeps the model's own tessellation.
+            "target_faces": {"type": "int", "default": config.TARGET_FACES, "min": 0},
             "seed": {"type": "int", "default": 0, "min": 0},
         },
         "notes": (
@@ -128,15 +132,20 @@ def m_unload(params: dict[str, Any], progress: Any) -> dict[str, Any]:
     return {"unloaded": freed, "vram_used_gb": round(used_gb, 2)}
 
 
-_ALLOWED = frozenset({"resolution", "max_tokens", "seed"})
+_ALLOWED = frozenset({"resolution", "max_tokens", "seed", "target_faces"})
 
 
 def m_image_to_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
     """One image to a raw mesh.
 
     **Scaling to real-world size is not done here.** Millimetres are downstream
-    work (meshforge's forge), and so is decimation: this returns what the model
-    produced, cleaned of debris and with its holes closed.
+    work (meshforge's forge).
+
+    **Decimation is**, though, and it runs first: everything else in the
+    post-processing costs in proportion to the face count, so cleaning fifteen
+    million faces and then reducing them would be work done twice. `target_faces`
+    controls it and 0 turns it off, in which case the model's own tessellation
+    comes back untouched.
     """
     from PIL import Image
 
@@ -159,6 +168,7 @@ def m_image_to_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
         resolution=int(requested) if requested else None,
         seed=int(params.get("seed", 0)),
         max_tokens=int(params["max_tokens"]) if params.get("max_tokens") else None,
+        target_faces=int(params["target_faces"]) if "target_faces" in params else None,
         progress=progress,
     )
 
@@ -207,6 +217,9 @@ def m_image_to_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
         "params_used": {
             "resolution": result.resolution,
             "seed": result.seed,
+            # **What it ran with**, which is the setting unless the caller said
+            # otherwise - and 0 when nothing was decimated.
+            "target_faces": result.post.get("decimate_to", 0),
         },
     }
 
