@@ -115,6 +115,9 @@ def main() -> int:
         "--cascade", type=int, default=0, help="target resolution for the cascade (1024 or 1536)"
     )
     parser.add_argument("--max-tokens", type=int, default=49152)
+    parser.add_argument(
+        "--no-close", action="store_true", help="leave the sparse region's edge open, as upstream does"
+    )
     args = parser.parse_args()
 
     if not UPSTREAM.is_dir():
@@ -125,7 +128,7 @@ def main() -> int:
     sys.path.insert(0, str(UPSTREAM / "o-voxel"))
 
     fast = shims.install(head_chunk=HEAD_CHUNK)
-    shims.install_trellis2()
+    shims.install_trellis2(close_mesh=not args.no_close)
     print(f"fast attention: {fast} | blas: {torch.backends.cuda.preferred_blas_library()}")
 
     if VRAM_LIMIT_GB:

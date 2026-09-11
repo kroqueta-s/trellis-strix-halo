@@ -41,6 +41,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Whether the dual-grid extraction closes the sparse region's edge (TRELLIS.2).
+# **Upstream leaves it open**; see `flexible_dual_grid_to_mesh` for the measurement
+# that made this the default.
+_CLOSE_MESH = True
+
 # Attention heads computed at once. Measured best on Hunyuan3D at 4 on gfx1151.
 DEFAULT_HEAD_CHUNK = 4
 
@@ -762,6 +767,144 @@ def _hashmap_lookup_3d(
     return out.to(hashmap_values.dtype)
 
 
+# Offsets of the four voxels that share an edge, per axis. **The order is
+# upstream's** (`o_voxel/convert/flexible_dual_grid.py`): it decides which way
+# round a quad is wound, so it is copied exactly rather than re-derived.
+_EDGE_NEIGHBOURS = (
+    ((0, 0, 0), (0, 0, 1), (0, 1, 1), (0, 1, 0)),
+    ((0, 0, 0), (1, 0, 0), (1, 0, 1), (0, 0, 1)),
+    ((0, 0, 0), (0, 1, 0), (1, 1, 0), (1, 0, 0)),
+)
+
+
+def _voxel_index(active: torch.Tensor, query: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+    """Index of each queried voxel in `active`, or -1. The same sorted lookup as everywhere here."""
+    scale = torch.tensor(
+        [int(grid[1]) * int(grid[2]), int(grid[2]), 1], device=active.device, dtype=torch.long
+    )
+    keys = (active.long() * scale).sum(dim=1)
+    order = torch.argsort(keys)
+    sorted_keys = keys[order]
+    wanted = (query.long() * scale).sum(dim=1)
+    position = torch.searchsorted(sorted_keys, wanted).clamp(max=sorted_keys.numel() - 1)
+    found = sorted_keys[position] == wanted
+    inside = ((query >= 0) & (query < grid.to(query.device))).all(dim=1)
+    return torch.where(found & inside, order[position], torch.full_like(wanted, -1))
+
+
+def flexible_dual_grid_to_mesh(
+    coords: torch.Tensor,
+    dual_vertices: torch.Tensor,
+    intersected_flag: torch.Tensor,
+    split_weight: torch.Tensor | None = None,
+    aabb: Any = None,
+    voxel_size: Any = None,
+    grid_size: Any = None,
+    train: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract the mesh from the dual grid, **and close it at the edge of the sparse region**.
+
+    Upstream drops every quad whose four voxels are not all active
+    (`connected_voxel_valid`), which is where TRELLIS.2's meshes are open: not
+    because the geometry is broken, but because the sparse structure stops
+    there. Measured on this machine at resolution 512: **118,777 boundary
+    edges**, and nothing downstream could close them - `trimesh.repair` reached
+    20,677, `manifold3d` refused the mesh outright, MeshFix ran single-threaded
+    for 23 minutes without finishing.
+
+    So the hole is closed where it is made. A missing neighbour contributes a
+    vertex at **the centre of its own voxel**, which is where a dual vertex
+    would sit with no surface to pull it, and the quad is emitted as usual.
+    **The dual vertices the model produced are used unchanged**, so the sharp
+    features that TRELLIS.2 exists for are not touched - this is not a
+    re-meshing and nothing is smoothed.
+
+    Set `TRELLIS2_CLOSE_MESH=off` to get upstream's behaviour back.
+    """
+    if train:
+        raise NotImplementedError("training-mode extraction is not used by this runner")
+
+    device = coords.device
+    n = dual_vertices.shape[0]
+    if isinstance(aabb, (list, tuple, np.ndarray)):
+        aabb = torch.tensor(np.asarray(aabb), dtype=torch.float32, device=device)
+    if grid_size is None:
+        raise ValueError("grid_size is required")
+    if isinstance(grid_size, int):
+        grid_size = [grid_size] * 3
+    grid = torch.tensor(np.asarray(grid_size), dtype=torch.long, device=device).reshape(3)
+    if voxel_size is None:
+        voxel_size = (aabb[1] - aabb[0]) / grid.to(torch.float32)
+
+    vertices = (coords.float() + dual_vertices) * voxel_size + aabb[0].reshape(1, 3)
+
+    offsets = torch.tensor(_EDGE_NEIGHBOURS, dtype=torch.long, device=device).unsqueeze(0)
+    neighbours = coords.long().reshape(n, 1, 1, 3) + offsets  # [N, 3, 4, 3]
+    connected = neighbours[intersected_flag]  # [M, 4, 3]
+    m = connected.shape[0]
+    if m == 0:
+        return vertices, torch.zeros((0, 3), dtype=torch.long, device=device)
+
+    index = _voxel_index(coords, connected.reshape(-1, 3), grid).reshape(m, 4)
+    missing = index < 0
+
+    if _CLOSE_MESH and bool(missing.any()):
+        # One synthetic vertex per missing voxel, at the centre of that voxel.
+        absent = connected.reshape(-1, 3)[missing.reshape(-1)]
+        unique, inverse = torch.unique(absent, dim=0, return_inverse=True)
+        extra = (unique.float() + 0.5) * voxel_size + aabb[0].reshape(1, 3)
+        vertices = torch.cat([vertices, extra], dim=0)
+        index = index.clone()
+        index[missing] = inverse + n
+    else:
+        keep = ~missing.any(dim=1)
+        index = index[keep]
+    if index.shape[0] == 0:
+        return vertices, torch.zeros((0, 3), dtype=torch.long, device=device)
+
+    quad = vertices[index]  # [L, 4, 3]
+    if split_weight is None:
+        # Upstream's rule: split the quad the way that keeps the two triangles
+        # most nearly coplanar.
+        first = torch.cross(quad[:, 1] - quad[:, 0], quad[:, 2] - quad[:, 0], dim=1)
+        second = torch.cross(quad[:, 2] - quad[:, 1], quad[:, 3] - quad[:, 1], dim=1)
+        align_a = (first * second).sum(dim=1).abs()
+        first = torch.cross(quad[:, 2] - quad[:, 1], quad[:, 3] - quad[:, 1], dim=1)
+        second = torch.cross(quad[:, 3] - quad[:, 2], quad[:, 0] - quad[:, 2], dim=1)
+        align_b = (first * second).sum(dim=1).abs()
+        pick = (align_a > align_b).unsqueeze(1)
+    else:
+        weight = split_weight.reshape(-1)
+        padded = torch.cat([weight, weight.new_zeros(vertices.shape[0] - weight.shape[0])])
+        corners = padded[index]
+        pick = (corners[:, 0] * corners[:, 2] > corners[:, 1] * corners[:, 3]).unsqueeze(1)
+
+    split_a = index[:, [0, 1, 2, 0, 2, 3]]
+    split_b = index[:, [0, 1, 3, 3, 1, 2]]
+    return vertices, torch.where(pick, split_a, split_b).reshape(-1, 3)
+
+
+def install_o_voxel_extraction(close: bool = True) -> bool:
+    """Replace `o_voxel.convert.flexible_dual_grid_to_mesh` **before the VAE imports it**.
+
+    `fdg_vae` does `from o_voxel.convert import ...` at module level, so the
+    replacement has to be in place before `trellis2.models` is imported.
+
+    Returns:
+        Whether the replacement was installed.
+    """
+    global _CLOSE_MESH
+    _CLOSE_MESH = close
+    try:
+        import o_voxel.convert as convert
+    except ImportError as exc:
+        print(f"[shims] o_voxel is not importable: {type(exc).__name__}: {exc}")
+        return False
+    convert.flexible_dual_grid_to_mesh = flexible_dual_grid_to_mesh
+    sys.modules["o_voxel.convert"].flexible_dual_grid_to_mesh = flexible_dual_grid_to_mesh
+    return True
+
+
 def _make_o_voxel_c() -> types.ModuleType:
     """Build the `o_voxel._C` stand-in holding **only the two functions used**."""
     module = _new_module("o_voxel._C")
@@ -844,7 +987,7 @@ def _install_flex_gemm() -> None:
     ops.grid_sample = sys.modules["flex_gemm.ops.grid_sample"]  # type: ignore[attr-defined]
 
 
-def install_trellis2() -> None:
+def install_trellis2(close_mesh: bool = True) -> None:
     """Everything TRELLIS.2 needs on top of `install()`. **Call it before importing.**
 
     Three names are imported by the module that carries `Mesh`, and only one of
@@ -879,6 +1022,10 @@ def install_trellis2() -> None:
     # (`postprocess`, `rasterize`) import nvdiffrast at the top for work this
     # runner never asks for. **Importing the package at all needs the name.**
     install_absent_nvdiffrast()
+    # **Last, because it imports the real `o_voxel`**, which needs every
+    # stand-in above to be in place first.
+    if not install_o_voxel_extraction(close=close_mesh):
+        raise ImportError("o_voxel is not importable (is the checkout on sys.path?)")
 
 
 # --------------------------------------------------------------------------------------
