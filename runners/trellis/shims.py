@@ -867,6 +867,14 @@ def install_trellis2() -> None:
     install_o_voxel_hashmap()
     _install_absent("cumesh", "a CUDA mesh library with no Windows + ROCm build")
     _install_flex_gemm()
+    # **The postprocessing this runner shares with TRELLIS.1 imports `rembg`
+    # at module level and never calls it there** - background removal belongs to
+    # the pipeline, and TRELLIS.2 does it with BiRefNet instead. Without a
+    # stand-in the invisible-face removal fails and the mesh comes back
+    # unchanged, which is easy to miss because it is caught and reported as a
+    # warning (seen 2026-09-11: 118,871 boundary edges left behind).
+    if "rembg" not in sys.modules:
+        _install_absent("rembg", "background removal is BiRefNet's job in this pipeline")
     # `o_voxel`'s package __init__ imports every submodule, and two of them
     # (`postprocess`, `rasterize`) import nvdiffrast at the top for work this
     # runner never asks for. **Importing the package at all needs the name.**
