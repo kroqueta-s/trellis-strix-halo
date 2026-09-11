@@ -79,6 +79,16 @@ own output. `metrics.resolution` reports what it actually ran at.
 140 s per step against 13.6 s at 1024. 28.40 GB also leaves only 1.6 GB under
 the cap, so a different subject could cross it.
 
+**And the time is quadratic in the token count, by design.** `SLatFlowModel`
+runs its sparse attention with `attn_mode='full'`
+(`trellis2/models/structured_latent_flow.py:71`), so every token attends to
+every other one. The cascade holds the count just under `max_num_tokens`
+(49,152), against roughly 14,000 at 1024 - **3.4x the tokens, and 3.4 squared
+is 11.6x** against the 10.3x measured. Nothing about this port changes that
+exponent: the stage is already on the fast attention path, and a faster
+attention kernel moves the constant, not the shape of the curve. **The only
+lever is fewer tokens**, which is the same thing as a lower resolution.
+
 **1024 is the default** for that reason: 1408 costs eight times the time for
 1.8× the faces.
 
