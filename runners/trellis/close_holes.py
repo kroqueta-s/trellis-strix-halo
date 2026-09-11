@@ -105,7 +105,10 @@ def _loop_labels(edges: np.ndarray, vertex_count: int) -> np.ndarray:
 
 
 def close_holes(
-    mesh: trimesh.Trimesh, passes: int = 1, max_extent: float = 0.05
+    mesh: trimesh.Trimesh,
+    passes: int = 1,
+    max_extent: float = 0.05,
+    max_edges: int = 0,
 ) -> tuple[trimesh.Trimesh, CloseStats]:
     """Fill boundary loops with a fan from each loop's centroid, until none are left.
 
@@ -135,6 +138,10 @@ def close_holes(
         passes: Give up after this many rounds rather than looping forever.
         max_extent: Widest loop to close, as a fraction of the longest side.
             0 closes every loop.
+        max_edges: Longest loop to close, counted in edges. 0 is no limit.
+            **This is what `pymeshfix`'s `fill_small_boundaries(nbe=...)`
+            meant**, and it is here so that the TRELLIS.1 postprocessing can
+            stop depending on an AGPL library.
 
     Returns:
         The closed mesh and what it took. **`fan_area_fraction` says how much
@@ -149,7 +156,7 @@ def close_holes(
     left_open = 0
     fan_area = 0.0
     for _ in range(passes):
-        work, report = _close_once(work, max_extent)
+        work, report = _close_once(work, max_extent, max_edges)
         left_open = report.loops_left_open
         fan_area += report.fan_area_fraction
         if first_boundary < 0:
@@ -173,7 +180,7 @@ def close_holes(
 
 
 def _close_once(
-    mesh: trimesh.Trimesh, max_extent: float = 0.0
+    mesh: trimesh.Trimesh, max_extent: float = 0.0, max_edges: int = 0
 ) -> tuple[trimesh.Trimesh, CloseStats]:
     """One fan pass over every boundary loop narrow enough to be a hole."""
     edges = _directed_boundary_edges(mesh)
@@ -192,6 +199,15 @@ def _close_once(
     centroids = sums / weights[:, None]
 
     left_open = 0
+    if max_edges > 0:
+        counts_per_loop = np.bincount(labels, minlength=loop_count)
+        short = counts_per_loop <= max_edges
+        left_open += int((~short).sum())
+        keep = short[labels]
+        if not keep.any():
+            return mesh, CloseStats(0, before, before, 0, 0, 0, left_open, 0.0)
+        edges = edges[keep]
+        labels = labels[keep]
     if max_extent > 0:
         # A loop's extent is the box its vertices span; anything wider than the
         # threshold is an opening, not a hole.
