@@ -41,7 +41,13 @@ def _rotation(yaw: float, pitch: float) -> np.ndarray:
 
 
 def _render_one(
-    verts: np.ndarray, normals: np.ndarray, size: int, yaw: float, pitch: float, splat: int
+    verts: np.ndarray,
+    normals: np.ndarray,
+    size: int,
+    yaw: float,
+    pitch: float,
+    splat: int,
+    two_sided: bool = False,
 ) -> np.ndarray:
     """Draw one view: orthographic projection, z-buffer, flat Lambert shading."""
     rot = _rotation(yaw, pitch)
@@ -56,7 +62,14 @@ def _render_one(
 
     light = np.array([0.4, 0.6, 1.0])
     light /= np.linalg.norm(light)
-    shade = np.clip(n @ light, 0.0, 1.0) * 0.75 + 0.25
+    # **Two-sided lighting shows the shape when the winding does not agree.**
+    # TRELLIS.2's meshes come out with about half their faces wound the other
+    # way (49.2% measured at 512), which renders as salt-and-pepper speckle and
+    # hides exactly the detail a visual check is for. Taking the magnitude
+    # lights both sides, so what is on screen is the geometry rather than the
+    # orientation.
+    facing = np.abs(n @ light) if two_sided else np.clip(n @ light, 0.0, 1.0)
+    shade = np.clip(facing, 0.0, 1.0) * 0.75 + 0.25
 
     zbuf = np.full((size, size), -np.inf, dtype=np.float64)
     img = np.zeros((size, size), dtype=np.float64)
@@ -81,6 +94,7 @@ def render(
     splat: int = 1,
     rotx: float = 0.0,
     largest_only: bool = False,
+    two_sided: bool = False,
 ) -> None:
     """Draw the mesh from several viewpoints into a single PNG strip.
 
@@ -107,7 +121,9 @@ def render(
     normals = _vertex_normals(verts, faces)
 
     angles = [(i * 2.0 * np.pi / views, np.deg2rad(15.0)) for i in range(views)]
-    tiles = [_render_one(verts, normals, size, yaw, pitch, splat) for yaw, pitch in angles]
+    tiles = [
+        _render_one(verts, normals, size, yaw, pitch, splat, two_sided) for yaw, pitch in angles
+    ]
     strip = np.concatenate(tiles, axis=1)
     Image.fromarray((strip * 255).astype(np.uint8)).save(out_path)
 
@@ -121,6 +137,11 @@ def main() -> int:
     parser.add_argument("--splat", type=int, default=1)
     parser.add_argument("--rotx", type=float, default=0.0)
     parser.add_argument(
+        "--two-sided",
+        action="store_true",
+        help="light both faces of a triangle (for meshes whose winding is inconsistent)",
+    )
+    parser.add_argument(
         "--largest-only", action="store_true", help="draw only the largest connected component"
     )
     args = parser.parse_args()
@@ -132,6 +153,7 @@ def main() -> int:
         args.splat,
         args.rotx,
         args.largest_only,
+        args.two_sided,
     )
     print(f"wrote {args.out}")
     return 0

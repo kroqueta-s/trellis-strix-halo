@@ -16,6 +16,15 @@ orchestrator can drive it as a child process —
 runner and its siblings behind a single interface, one loaded at a time. It
 also runs standalone (see Quickstart).
 
+**There is a second runner here, for
+[TRELLIS.2](https://github.com/microsoft/TRELLIS.2)** (`runners/trellis2/`, in
+its own virtual environment). It reaches far more detail - millions of faces
+rather than hundreds of thousands - and upstream needs six CUDA-only packages
+to do it, none of which is compiled here either. What it costs, what it cannot
+do, and the traps it took to get there are in
+[`docs/trellis2.md`](docs/trellis2.md). **It is not finished**: the meshes come
+out watertight but not orientable, and there is no texture.
+
 | Input image | Mesh (4 views) |
 |---|---|
 | ![input](assets/sample.png) | ![mesh](assets/preview.png) |

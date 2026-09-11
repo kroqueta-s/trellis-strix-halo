@@ -41,6 +41,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Whether the dual-grid extraction closes the sparse region's edge (TRELLIS.2).
+# **Upstream leaves it open**; see `flexible_dual_grid_to_mesh` for the measurement
+# that made this the default.
+_CLOSE_MESH = True
+
 # Attention heads computed at once. Measured best on Hunyuan3D at 4 on gfx1151.
 DEFAULT_HEAD_CHUNK = 4
 
@@ -233,6 +238,56 @@ def _neighbor_index_map(coords: torch.Tensor, kernel_size: int) -> torch.Tensor:
     return out
 
 
+def _submanifold_conv(
+    feats: torch.Tensor,
+    rulebook: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """The convolution itself, shared by the two backends that ask for it.
+
+    `weight` is KRSC (`[out, kD, kH, kW, in]`), `rulebook` is `[K, N]` of input
+    indices with `-1` for an inactive neighbour, and the result is `[N, out]`.
+
+    **Output voxels are processed in chunks.** Doing them all at once makes the
+    gathered features `[N, in]` alone exceed 700 MB at resolution 256 with 192
+    input channels, and there are only 32 GB of dedicated VRAM.
+
+    **The accumulator is fp32 even when the features are fp16**: a 3^3 kernel
+    over 1024 channels sums 27,648 products per output, which leaves fp16 no
+    headroom.
+    """
+    out_channels, in_channels = weight.shape[0], weight.shape[-1]
+    n = feats.shape[0]
+    # [out, K, in] -> [K, in, out] (built once and reused)
+    w_all = (
+        weight.reshape(out_channels, -1, in_channels).permute(1, 2, 0).contiguous().to(feats.dtype)
+    )
+    kernels = w_all.shape[0]
+    center = kernels // 2
+
+    out = torch.empty(n, out_channels, device=feats.device, dtype=feats.dtype)
+    bias_f = None if bias is None else bias.float()
+    for start in range(0, n, VOXEL_CHUNK):
+        end = min(start + VOXEL_CHUNK, n)
+        acc = torch.zeros(end - start, out_channels, device=feats.device)
+        for k in range(kernels):
+            if kernels == 1 or k == center:
+                # The centre is always the voxel itself: submanifold means
+                # output coordinates equal input coordinates.
+                acc += (feats[start:end] @ w_all[k]).float()
+                continue
+            idx = rulebook[k, start:end].long()
+            valid = idx >= 0
+            gathered = feats.index_select(0, idx.clamp_(min=0))
+            gathered[~valid] = 0
+            acc += (gathered @ w_all[k]).float()
+        if bias_f is not None:
+            acc += bias_f
+        out[start:end] = acc.to(feats.dtype)
+    return out
+
+
 class _SubMConv3dImpl(nn.Module):
     """Submanifold sparse 3D convolution (stride 1, output coordinates equal input coordinates).
 
@@ -291,35 +346,7 @@ class _SubMConv3dImpl(nn.Module):
         if feats.dim() != 2:
             feats = feats.reshape(feats.shape[0], -1)
         rulebook = self._rulebook(x)
-        n = feats.shape[0]
-        # [out, K, in] -> [K, in, out] (built once and reused)
-        weight = self.weight.reshape(self.out_channels, -1, self.in_channels)
-        w_all = weight.permute(1, 2, 0).contiguous().to(feats.dtype)
-        kernels = w_all.shape[0]
-        center = kernels // 2
-
-        out = torch.empty(n, self.out_channels, device=feats.device, dtype=feats.dtype)
-        bias = None if self.bias is None else self.bias.float()
-        # **Output voxels are processed in chunks.** Doing them all at once makes
-        # the gathered features `[N, in]` alone exceed 700 MB at resolution 256
-        # with 192 input channels.
-        for start in range(0, n, VOXEL_CHUNK):
-            end = min(start + VOXEL_CHUNK, n)
-            acc = torch.zeros(end - start, self.out_channels, device=feats.device)
-            for k in range(kernels):
-                if kernels == 1 or k == center:
-                    # The centre is always the voxel itself: submanifold means
-                    # output coordinates equal input coordinates.
-                    acc += (feats[start:end] @ w_all[k]).float()
-                    continue
-                idx = rulebook[k, start:end].long()
-                valid = idx >= 0
-                gathered = feats.index_select(0, idx.clamp_(min=0))
-                gathered[~valid] = 0
-                acc += (gathered @ w_all[k]).float()
-            if bias is not None:
-                acc += bias
-            out[start:end] = acc.to(feats.dtype)
+        out = _submanifold_conv(feats, rulebook, self.weight, self.bias)
 
         return SparseConvTensor(
             out,
@@ -623,6 +650,382 @@ def _install_dense_sdpa(head_chunk: int) -> None:
         return torch.cat(outs, dim=1)
 
     F.scaled_dot_product_attention = sdpa  # type: ignore[assignment]
+
+
+# --------------------------------------------------------------------------------------
+# Replacement for o_voxel's hashmap (**TRELLIS.2 only**)
+# --------------------------------------------------------------------------------------
+#
+# `o_voxel.convert.flexible_dual_grid_to_mesh` - the function that turns the
+# decoder's dual grid into a mesh - is pure torch except for two calls into that
+# package's CUDA extension: a hashmap from a voxel coordinate to the row it came
+# from. Nothing else on the image-to-mesh path touches `_C`, so replacing those
+# two calls is enough to run the extraction without building anything.
+#
+# **This section has no counterpart in the Hi3DGen runner**, whose upstream is
+# TRELLIS.1 and never imports `o_voxel`. The rest of this file stays identical.
+#
+# **What a miss is**: `hashmap_lookup_3d_cuda` returns the largest value of the
+# value type both for an absent key and for a coordinate outside the grid
+# (`o-voxel/src/hash/hash.cu`), and the caller tests against `0xffffffff`.
+
+
+def _linearize_3d(coords: torch.Tensor, w: int, h: int, d: int) -> torch.Tensor:
+    """Flatten `[N, 4]` (batch, x, y, z) exactly as the kernels do.
+
+    `b*W*H*D + x*H*D + y*D + z`, in int64 so the product cannot wrap: the
+    largest grid TRELLIS.2 offers (1536^3) is 3.6e9, already past a signed
+    32-bit range.
+    """
+    c = coords.long()
+    return ((c[:, 0] * w + c[:, 1]) * h + c[:, 2]) * d + c[:, 3]
+
+
+def _table_as_int64(table: torch.Tensor) -> torch.Tensor:
+    """Read a hashmap array as int64, refusing the case that would wrap.
+
+    The caller picks uint32 or uint64 by grid volume
+    (`o_voxel/convert/flexible_dual_grid.py`), and **uint64 is only reached past
+    2^32 voxels** - beyond every resolution TRELLIS.2 offers. Rather than carry
+    an unsigned path that nothing exercises, a key that would not survive the
+    conversion raises.
+    """
+    if table.dtype == torch.uint64:
+        sentinel = torch.iinfo(torch.uint64).max
+        as_int = table.to(torch.int64)
+        if bool(((as_int < 0) & (table != sentinel)).any()):
+            raise NotImplementedError("o_voxel hashmap keys past 2^63 are not supported")
+        return torch.where(table == sentinel, torch.iinfo(torch.int64).max, as_int)
+    return table.to(torch.int64)
+
+
+def _hashmap_insert_3d_idx_as_val(
+    hashmap_keys: torch.Tensor,
+    hashmap_values: torch.Tensor,
+    coords: torch.Tensor,
+    w: int,
+    h: int,
+    d: int,
+) -> None:
+    """Store `coordinate -> row index` **in the caller's own two tensors**.
+
+    Upstream fills them by open addressing on the GPU. Here they hold the keys
+    **sorted at the front**, with the empty sentinel - the largest value of the
+    key type, which is what upstream also leaves in an empty slot - filling the
+    tail. The tail keeps the array sorted, so a lookup is one `searchsorted`
+    over the whole array with no count to carry. It is the idiom the
+    submanifold convolution already uses for its neighbour index.
+
+    **Duplicate coordinates keep the first row.** Upstream's kernel races for
+    them; the pipeline produces none, and being deterministic is worth more
+    here than reproducing a race.
+    """
+    keys = _linearize_3d(coords, w, h, d)
+    order = torch.argsort(keys, stable=True)
+    ordered = keys[order]
+    first = torch.ones_like(ordered, dtype=torch.bool)
+    first[1:] = ordered[1:] != ordered[:-1]
+    unique_keys = ordered[first]
+    unique_rows = order[first]
+
+    count = int(unique_keys.numel())
+    if count > hashmap_keys.numel():
+        raise ValueError(f"hashmap too small: {count} keys into {hashmap_keys.numel()} slots")
+
+    hashmap_keys.fill_(torch.iinfo(hashmap_keys.dtype).max)
+    hashmap_keys[:count] = unique_keys.to(hashmap_keys.dtype)
+    hashmap_values[:count] = unique_rows.to(hashmap_values.dtype)
+
+
+def _hashmap_lookup_3d(
+    hashmap_keys: torch.Tensor,
+    hashmap_values: torch.Tensor,
+    coords: torch.Tensor,
+    w: int,
+    h: int,
+    d: int,
+) -> torch.Tensor:
+    """Look coordinates up, returning the stored row or the miss value."""
+    c = coords.long()
+    inside = (
+        (c[:, 1] >= 0)
+        & (c[:, 1] < w)
+        & (c[:, 2] >= 0)
+        & (c[:, 2] < h)
+        & (c[:, 3] >= 0)
+        & (c[:, 3] < d)
+    )
+    query = _linearize_3d(coords, w, h, d)
+    table = _table_as_int64(hashmap_keys)
+    # A coordinate outside the grid can linearize to a negative number, which
+    # `searchsorted` would place before every key; `inside` rejects it anyway.
+    position = torch.searchsorted(table, query.clamp(min=0)).clamp(max=table.numel() - 1)
+    hit = inside & (table[position] == query)
+
+    out = torch.full_like(query, torch.iinfo(hashmap_values.dtype).max)
+    out[hit] = _table_as_int64(hashmap_values)[position[hit]]
+    return out.to(hashmap_values.dtype)
+
+
+# Offsets of the four voxels that share an edge, per axis. **The order is
+# upstream's** (`o_voxel/convert/flexible_dual_grid.py`): it decides which way
+# round a quad is wound, so it is copied exactly rather than re-derived.
+_EDGE_NEIGHBOURS = (
+    ((0, 0, 0), (0, 0, 1), (0, 1, 1), (0, 1, 0)),
+    ((0, 0, 0), (1, 0, 0), (1, 0, 1), (0, 0, 1)),
+    ((0, 0, 0), (0, 1, 0), (1, 1, 0), (1, 0, 0)),
+)
+
+
+def _voxel_index(active: torch.Tensor, query: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+    """Index of each queried voxel in `active`, or -1. The same sorted lookup as everywhere here."""
+    scale = torch.tensor(
+        [int(grid[1]) * int(grid[2]), int(grid[2]), 1], device=active.device, dtype=torch.long
+    )
+    keys = (active.long() * scale).sum(dim=1)
+    order = torch.argsort(keys)
+    sorted_keys = keys[order]
+    wanted = (query.long() * scale).sum(dim=1)
+    position = torch.searchsorted(sorted_keys, wanted).clamp(max=sorted_keys.numel() - 1)
+    found = sorted_keys[position] == wanted
+    inside = ((query >= 0) & (query < grid.to(query.device))).all(dim=1)
+    return torch.where(found & inside, order[position], torch.full_like(wanted, -1))
+
+
+def flexible_dual_grid_to_mesh(
+    coords: torch.Tensor,
+    dual_vertices: torch.Tensor,
+    intersected_flag: torch.Tensor,
+    split_weight: torch.Tensor | None = None,
+    aabb: Any = None,
+    voxel_size: Any = None,
+    grid_size: Any = None,
+    train: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract the mesh from the dual grid, **and close it at the edge of the sparse region**.
+
+    Upstream drops every quad whose four voxels are not all active
+    (`connected_voxel_valid`), which is where TRELLIS.2's meshes are open: not
+    because the geometry is broken, but because the sparse structure stops
+    there. Measured on this machine at resolution 512: **118,777 boundary
+    edges**, and nothing downstream could close them - `trimesh.repair` reached
+    20,677, `manifold3d` refused the mesh outright, MeshFix ran single-threaded
+    for 23 minutes without finishing.
+
+    So the hole is closed where it is made. A missing neighbour contributes a
+    vertex at **the centre of its own voxel**, which is where a dual vertex
+    would sit with no surface to pull it, and the quad is emitted as usual.
+    **The dual vertices the model produced are used unchanged**, so the sharp
+    features that TRELLIS.2 exists for are not touched - this is not a
+    re-meshing and nothing is smoothed.
+
+    Set `TRELLIS2_CLOSE_MESH=off` to get upstream's behaviour back.
+    """
+    if train:
+        raise NotImplementedError("training-mode extraction is not used by this runner")
+
+    device = coords.device
+    n = dual_vertices.shape[0]
+    if isinstance(aabb, (list, tuple, np.ndarray)):
+        aabb = torch.tensor(np.asarray(aabb), dtype=torch.float32, device=device)
+    if grid_size is None:
+        raise ValueError("grid_size is required")
+    if isinstance(grid_size, int):
+        grid_size = [grid_size] * 3
+    grid = torch.tensor(np.asarray(grid_size), dtype=torch.long, device=device).reshape(3)
+    if voxel_size is None:
+        voxel_size = (aabb[1] - aabb[0]) / grid.to(torch.float32)
+
+    vertices = (coords.float() + dual_vertices) * voxel_size + aabb[0].reshape(1, 3)
+
+    offsets = torch.tensor(_EDGE_NEIGHBOURS, dtype=torch.long, device=device).unsqueeze(0)
+    neighbours = coords.long().reshape(n, 1, 1, 3) + offsets  # [N, 3, 4, 3]
+    connected = neighbours[intersected_flag]  # [M, 4, 3]
+    m = connected.shape[0]
+    if m == 0:
+        return vertices, torch.zeros((0, 3), dtype=torch.long, device=device)
+
+    index = _voxel_index(coords, connected.reshape(-1, 3), grid).reshape(m, 4)
+    missing = index < 0
+
+    if _CLOSE_MESH and bool(missing.any()):
+        # One synthetic vertex per missing voxel, at the centre of that voxel.
+        absent = connected.reshape(-1, 3)[missing.reshape(-1)]
+        unique, inverse = torch.unique(absent, dim=0, return_inverse=True)
+        extra = (unique.float() + 0.5) * voxel_size + aabb[0].reshape(1, 3)
+        vertices = torch.cat([vertices, extra], dim=0)
+        index = index.clone()
+        index[missing] = inverse + n
+    else:
+        keep = ~missing.any(dim=1)
+        index = index[keep]
+    if index.shape[0] == 0:
+        return vertices, torch.zeros((0, 3), dtype=torch.long, device=device)
+
+    quad = vertices[index]  # [L, 4, 3]
+    if split_weight is None:
+        # Upstream's rule: split the quad the way that keeps the two triangles
+        # most nearly coplanar.
+        first = torch.cross(quad[:, 1] - quad[:, 0], quad[:, 2] - quad[:, 0], dim=1)
+        second = torch.cross(quad[:, 2] - quad[:, 1], quad[:, 3] - quad[:, 1], dim=1)
+        align_a = (first * second).sum(dim=1).abs()
+        first = torch.cross(quad[:, 2] - quad[:, 1], quad[:, 3] - quad[:, 1], dim=1)
+        second = torch.cross(quad[:, 3] - quad[:, 2], quad[:, 0] - quad[:, 2], dim=1)
+        align_b = (first * second).sum(dim=1).abs()
+        pick = (align_a > align_b).unsqueeze(1)
+    else:
+        weight = split_weight.reshape(-1)
+        padded = torch.cat([weight, weight.new_zeros(vertices.shape[0] - weight.shape[0])])
+        corners = padded[index]
+        pick = (corners[:, 0] * corners[:, 2] > corners[:, 1] * corners[:, 3]).unsqueeze(1)
+
+    split_a = index[:, [0, 1, 2, 0, 2, 3]]
+    split_b = index[:, [0, 1, 3, 3, 1, 2]]
+    return vertices, torch.where(pick, split_a, split_b).reshape(-1, 3)
+
+
+def install_o_voxel_extraction(close: bool = True) -> bool:
+    """Replace `o_voxel.convert.flexible_dual_grid_to_mesh` **before the VAE imports it**.
+
+    `fdg_vae` does `from o_voxel.convert import ...` at module level, so the
+    replacement has to be in place before `trellis2.models` is imported.
+
+    Returns:
+        Whether the replacement was installed.
+    """
+    global _CLOSE_MESH
+    _CLOSE_MESH = close
+    try:
+        import o_voxel.convert as convert
+    except ImportError as exc:
+        print(f"[shims] o_voxel is not importable: {type(exc).__name__}: {exc}")
+        return False
+    convert.flexible_dual_grid_to_mesh = flexible_dual_grid_to_mesh
+    sys.modules["o_voxel.convert"].flexible_dual_grid_to_mesh = flexible_dual_grid_to_mesh
+    return True
+
+
+def _make_o_voxel_c() -> types.ModuleType:
+    """Build the `o_voxel._C` stand-in holding **only the two functions used**."""
+    module = _new_module("o_voxel._C")
+    module.hashmap_insert_3d_idx_as_val_cuda = _hashmap_insert_3d_idx_as_val  # type: ignore[attr-defined]
+    module.hashmap_lookup_3d_cuda = _hashmap_lookup_3d  # type: ignore[attr-defined]
+    return module
+
+
+def install_o_voxel_hashmap() -> None:
+    """Take the place of `o_voxel._C` **before `o_voxel` is imported**.
+
+    The rest of that package is pure python and is imported from the upstream
+    checkout unchanged; only the compiled half is replaced.
+    """
+    sys.modules["o_voxel._C"] = _make_o_voxel_c()
+
+
+def _flex_gemm_submanifold_conv3d(
+    feats: torch.Tensor,
+    coords: torch.Tensor,
+    _spatial_size: Any,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    neighbor_cache: torch.Tensor | None,
+    dilation: Any = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`flex_gemm.ops.spconv.sparse_submanifold_conv3d`, on the same rulebook.
+
+    Returns the features **and the rulebook**, which the caller caches on the
+    sparse tensor and hands back for the next convolution at the same
+    resolution - the same reuse the spconv path gets from `indice_key`.
+    """
+    if dilation not in (1, (1, 1, 1), [1, 1, 1]):
+        raise NotImplementedError(f"dilation {dilation} is unsupported (this path never uses it)")
+    kernel = int(weight.shape[1])
+    if neighbor_cache is None:
+        if kernel == 1:
+            neighbor_cache = torch.arange(
+                coords.shape[0], device=coords.device, dtype=torch.int32
+            ).unsqueeze(0)
+        else:
+            neighbor_cache = _neighbor_index_map(coords, kernel)
+    return _submanifold_conv(feats, neighbor_cache, weight, bias), neighbor_cache
+
+
+def _install_flex_gemm() -> None:
+    """Stand in for `flex_gemm`, **with a working sparse convolution**.
+
+    **This is the backend the published checkpoints were saved with.** Its
+    convolution keeps the weight on the module itself (`conv.weight`), while the
+    spconv backend nests it one level down (`conv.conv.weight`), so loading a
+    TRELLIS.2 checkpoint through the spconv path leaves **every convolution
+    weight uninitialized** - and the decoder then predicts no subdivision at
+    all, which surfaces far away as an empty tensor. Measured 2026-09-11:
+    `blocks.0.0.conv.conv.weight` held 32 NaNs and 2 infinities, because it was
+    never written.
+
+    The arithmetic is the same submanifold convolution as the spconv shim, and
+    the weight layout is the same KRSC, so `tests/test_shims.py` covers both.
+    `grid_sample` stays absent: it belongs to texture.
+    """
+    module = _new_module("flex_gemm", is_package=True)
+    ops = _new_module("flex_gemm.ops", is_package=True)
+    spconv_ops = _new_module("flex_gemm.ops.spconv", is_package=True)
+
+    spconv_ops.sparse_submanifold_conv3d = _flex_gemm_submanifold_conv3d  # type: ignore[attr-defined]
+    # The algorithm and the hashmap ratio choose between CUDA kernels that do
+    # not exist here; there is one implementation, so both are accepted and
+    # ignored rather than raising in the middle of a forward pass.
+    spconv_ops.set_algorithm = lambda *_args, **_kwargs: None  # type: ignore[attr-defined]
+    spconv_ops.set_hashmap_ratio = lambda *_args, **_kwargs: None  # type: ignore[attr-defined]
+
+    ops.spconv = spconv_ops  # type: ignore[attr-defined]
+    module.ops = ops  # type: ignore[attr-defined]
+    sys.modules["flex_gemm"] = module
+    sys.modules["flex_gemm.ops"] = ops
+    sys.modules["flex_gemm.ops.spconv"] = spconv_ops
+
+    _install_absent("flex_gemm.ops.grid_sample", "texture sampling only (not produced here)")
+    ops.grid_sample = sys.modules["flex_gemm.ops.grid_sample"]  # type: ignore[attr-defined]
+
+
+def install_trellis2(close_mesh: bool = True) -> None:
+    """Everything TRELLIS.2 needs on top of `install()`. **Call it before importing.**
+
+    Three names are imported by the module that carries `Mesh`, and only one of
+    them does any work on the image-to-mesh path:
+
+    - `o_voxel._C`: **the mesh extraction runs through it**, so it is replaced
+      with a working implementation above.
+    - `cumesh`: a GPU mesh library, reached only through `Mesh.fill_holes`,
+      `simplify` and `remove_faces`. **This runner calls none of them** - it
+      drives the pipeline stage by stage and does its own postprocessing - so a
+      stand-in that raises when called says so rather than guessing.
+    - `flex_gemm`: **the sparse convolution the checkpoints were saved with**,
+      so its half is implemented rather than stubbed (`_install_flex_gemm`).
+      Only `ops.grid_sample`, which samples texture attributes, stays absent.
+
+    A stand-in that raises is the point: **it can never return a wrong mesh
+    quietly.** If a future change reaches one of these, it stops with the name
+    that was called.
+    """
+    install_o_voxel_hashmap()
+    _install_absent("cumesh", "a CUDA mesh library with no Windows + ROCm build")
+    _install_flex_gemm()
+    # **The postprocessing this runner shares with TRELLIS.1 imports `rembg`
+    # at module level and never calls it there** - background removal belongs to
+    # the pipeline, and TRELLIS.2 does it with BiRefNet instead. Without a
+    # stand-in the invisible-face removal fails and the mesh comes back
+    # unchanged, which is easy to miss because it is caught and reported as a
+    # warning (seen 2026-09-11: 118,871 boundary edges left behind).
+    if "rembg" not in sys.modules:
+        _install_absent("rembg", "background removal is BiRefNet's job in this pipeline")
+    # `o_voxel`'s package __init__ imports every submodule, and two of them
+    # (`postprocess`, `rasterize`) import nvdiffrast at the top for work this
+    # runner never asks for. **Importing the package at all needs the name.**
+    install_absent_nvdiffrast()
+    # **Last, because it imports the real `o_voxel`**, which needs every
+    # stand-in above to be in place first.
+    if not install_o_voxel_extraction(close=close_mesh):
+        raise ImportError("o_voxel is not importable (is the checkout on sys.path?)")
 
 
 # --------------------------------------------------------------------------------------
