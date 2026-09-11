@@ -258,6 +258,7 @@ class MeshResult:
     stages: dict[str, float] = field(default_factory=dict)
     post: dict[str, Any] = field(default_factory=dict)
     topology: dict[str, Any] = field(default_factory=dict)
+    vertex_colors: dict[str, Any] = field(default_factory=dict)
 
 
 def _sampler_params(steps: int, guidance: float) -> dict[str, Any]:
@@ -294,6 +295,7 @@ def generate_mesh(
     seed: int = 0,
     max_tokens: int | None = None,
     target_faces: int | None = None,
+    vertex_colors: bool | None = None,
     progress: Callable[..., None] | None = None,
 ) -> MeshResult:
     """Generate one mesh from one image.
@@ -308,6 +310,7 @@ def generate_mesh(
     pipeline = load_pipeline(progress)
     target = int(resolution or config.RESOLUTION)
     tokens = int(max_tokens or config.MAX_TOKENS)
+    want_colors = config.VERTEX_COLORS if vertex_colors is None else bool(vertex_colors)
 
     def say(stage: str, message: str) -> None:
         if progress is not None:
@@ -368,8 +371,31 @@ def generate_mesh(
             watch.stage = "decode"
             say("decode", f"decoding to a mesh at {target}")
             mark = time.perf_counter()
-            meshes, _subs = pipeline.decode_shape_slat(slat, target)
+            # **The substructures are what the texture decoder is guided by.**
+            # They are held only while they are needed, because at 1024 they are
+            # the largest thing on the card after the weights.
+            meshes, subs = pipeline.decode_shape_slat(slat, target)
             stages["decode_sec"] = time.perf_counter() - mark
+
+            voxels = None
+            if want_colors:
+                watch.stage = "tex_slat"
+                say("tex_slat", "sampling the texture latent")
+                _STEPS.bind(progress, "tex_slat", "sampling the texture latent")
+                mark = time.perf_counter()
+                try:
+                    tex_slat = _sample_texture(pipeline, cond, slat, target)
+                finally:
+                    _STEPS.bind(None, "tex_slat")
+                stages["tex_slat_sec"] = time.perf_counter() - mark
+
+                watch.stage = "tex_decode"
+                say("tex_decode", "decoding the texture latent into voxel colours")
+                mark = time.perf_counter()
+                voxels = pipeline.decode_tex_slat(tex_slat, subs)[0]
+                stages["tex_decode_sec"] = time.perf_counter() - mark
+                del tex_slat
+            del subs, slat
             gen_sec = time.perf_counter() - started
 
     extracted = meshes[0]
@@ -384,6 +410,16 @@ def generate_mesh(
     with _DeviceWatch(progress=progress, stage="postprocess"):
         mesh, post = _postprocess(mesh, progress, target_faces)
 
+        colors: dict[str, Any] = {"enabled": bool(want_colors)}
+        if voxels is not None:
+            mark = time.perf_counter()
+            say("vertex_colors", f"colouring {len(mesh.vertices):,} vertices")
+            mesh, colors = _apply_vertex_colors(mesh, voxels, pipeline, target)
+            colors["sec"] = round(time.perf_counter() - mark, 2)
+            del voxels
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     return MeshResult(
         mesh=mesh,
         load_sec=_LOAD_SEC,
@@ -397,6 +433,7 @@ def generate_mesh(
         stages={k: round(v, 2) for k, v in stages.items()},
         post=post,
         topology=_topology(mesh),
+        vertex_colors=colors,
     )
 
 
@@ -432,6 +469,79 @@ def _sample_shape(
         params,
         tokens,
     )
+
+
+def _sample_texture(pipeline: Any, cond: dict[str, Any], slat: Any, target: int) -> Any:
+    """Sample the texture latent on the shape latent's own voxels.
+
+    **The conditioning is the one already computed.** Upstream feeds the texture
+    flow the 512 conditioning at 512 and the 1024 one everywhere above, which is
+    exactly `get_cond([image], min(target, 1024))` - the vector this runner
+    already has.
+
+    There is one texture flow per resolution and, as with the shape flow, only
+    512 and 1024 exist; above 1024 the cascade still ends on the 1024 model.
+    """
+    name = "tex_slat_flow_model_512" if target <= 512 else "tex_slat_flow_model_1024"
+    model = pipeline.models.get(name)
+    if model is None:
+        raise FileNotFoundError(
+            f"{name} is not in the pipeline: the texture checkpoints were not downloaded. "
+            f"Run install-trellis2.ps1 -WithTexture, or turn TRELLIS2_VERTEX_COLORS off"
+        )
+    return pipeline.sample_tex_slat(
+        cond, model, slat, _sampler_params(config.TEX_STEPS, config.TEX_GUIDANCE)
+    )
+
+
+def _apply_vertex_colors(
+    mesh: trimesh.Trimesh, voxels: Any, pipeline: Any, resolution: int
+) -> tuple[trimesh.Trimesh, dict[str, Any]]:
+    """Carry the decoded voxel colours onto the mesh's vertices.
+
+    **This runs after the post-processing, not before.** The colour of a point
+    is interpolated from the voxels around it, so it does not care which mesh
+    the point belongs to: decimation, hole closing and manifolding can all
+    rewrite the vertices first and the colours still land. A UV layout could not
+    survive any of those.
+
+    The attributes carry metallic, roughness and alpha as well
+    (`pipeline.pbr_attr_layout`). **Only the base colour is kept** - a PLY has
+    nowhere to put the rest, and inventing a place for it would be guessing at
+    what a caller wants.
+    """
+    from trellis2.representations import MeshWithVoxel
+
+    vertices = torch.as_tensor(mesh.vertices, dtype=torch.float32, device=voxels.feats.device)
+    with torch.no_grad():
+        attrs = MeshWithVoxel(
+            vertices,
+            torch.as_tensor(mesh.faces, dtype=torch.int32, device=vertices.device),
+            origin=[-0.5, -0.5, -0.5],
+            voxel_size=1 / resolution,
+            coords=voxels.coords[:, 1:],
+            attrs=voxels.feats,
+            voxel_shape=torch.Size([*voxels.shape, *voxels.spatial_shape]),
+            layout=pipeline.pbr_attr_layout,
+        ).query_vertex_attrs()
+
+    base = attrs[:, pipeline.pbr_attr_layout["base_color"]].clamp(0, 1)
+    rgb = (base.float().cpu().numpy() * 255).round().astype(np.uint8)
+    opaque = np.full((rgb.shape[0], 1), 255, dtype=np.uint8)
+    rgba = np.concatenate([rgb, opaque], axis=1)
+    mesh.visual = trimesh.visual.ColorVisuals(mesh=mesh, vertex_colors=rgba)
+    # **A vertex outside every active voxel comes back black**, because there is
+    # nothing around it to interpolate. Counting them says how much of the mesh
+    # the texture decoder never saw, which is the only way to tell a black model
+    # from a failed one.
+    unreached = int((attrs.abs().sum(dim=1) == 0).sum())
+    return mesh, {
+        "enabled": True,
+        "n_vertices": int(len(mesh.vertices)),
+        "n_voxels": int(voxels.coords.shape[0]),
+        "unreached_vertices": unreached,
+        "mean_rgb": [round(float(v), 4) for v in base.float().mean(dim=0).tolist()],
+    }
 
 
 def decimate(mesh: trimesh.Trimesh, target: int) -> trimesh.Trimesh:

@@ -950,6 +950,113 @@ def _flex_gemm_submanifold_conv3d(
     return _submanifold_conv(feats, neighbor_cache, weight, bias), neighbor_cache
 
 
+# Query points sampled at once by `_grid_sample_3d`. **This sets its VRAM
+# peak**: every point holds an int64 coordinate per corner while it is looked
+# up. A mesh at 1024 carries millions of vertices, so the work is cut up.
+QUERY_CHUNK = 1 << 21
+
+
+def _build_hashmap(
+    coords: torch.Tensor, w: int, h: int, d: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate and fill the coordinate hashmap the two shimmed kernels share.
+
+    The key width follows upstream's rule (`flex_gemm/ops/utils.py`): 32 bits
+    while the volume fits, 64 bits above it. **Every resolution TRELLIS.2 offers
+    stays under 2^32** - 1536^3 is 3.6e9 - so the wide path is never taken here.
+    """
+    batches = int(coords[:, 0].max()) + 1 if coords.numel() else 1
+    volume = int(w) * int(h) * int(d) * batches
+    key_dtype = torch.uint32 if volume < 2**32 else torch.uint64
+    slots = max(int(coords.shape[0]), 1)
+    keys = torch.full((slots,), torch.iinfo(key_dtype).max, dtype=key_dtype, device=coords.device)
+    values = torch.empty((slots,), dtype=torch.uint32, device=coords.device)
+    _hashmap_insert_3d_idx_as_val(keys, values, coords, w, h, d)
+    return keys, values
+
+
+def _grid_sample_3d(
+    feats: torch.Tensor,
+    coords: torch.Tensor,
+    shape: torch.Size,
+    grid: torch.Tensor,
+    mode: str = "trilinear",
+) -> torch.Tensor:
+    """`flex_gemm.ops.grid_sample.grid_sample_3d`: trilinear sampling of a sparse volume.
+
+    This is how a texture attribute reaches a vertex: the decoder produces one
+    attribute vector per active voxel, and a point in space is interpolated from
+    the eight voxels around it. **The point does not have to lie on the mesh**,
+    which is why vertex colours survive decimation and hole closing.
+
+    **The CUDA kernel is the reference** (`FlexGEMM`'s
+    `hashmap_lookup_grid_sample_3d_trilinear_neighbor_map_weight_kernel`), not
+    that package's own torch version: the two disagree for a query below 0.5,
+    where the kernel takes `floor(q - 0.5)` and the torch one truncates toward
+    zero. The kernel is what produced the published results, so it is what is
+    reproduced.
+
+    A corner that is outside the grid, or that no active voxel occupies, gets
+    **weight zero, and the rest are renormalized** - so a vertex on the outside
+    of the shell is not darkened by the empty space behind it.
+
+    Args:
+        feats: `[N, C]`, one attribute vector per active voxel.
+        coords: `[N, 4]` as (batch, x, y, z).
+        shape: `[B, C, W, H, D]`; only the last four are read.
+        grid: `[B, L, 3]` query points **in voxel units**, not normalized.
+        mode: only `trilinear` is on this path.
+    """
+    if mode != "trilinear":
+        raise NotImplementedError(f"grid_sample_3d mode {mode!r} is unused on this path")
+    if feats.dim() != 2:
+        raise ValueError(f"features must be [N, C], got {tuple(feats.shape)}")
+    if coords.dim() != 2 or coords.shape[1] != 4:
+        raise ValueError(f"coordinates must be [N, 4], got {tuple(coords.shape)}")
+    if grid.dim() != 3 or grid.shape[2] != 3:
+        raise ValueError(f"query points must be [B, L, 3], got {tuple(grid.shape)}")
+
+    _, w, h, d = (int(size) for size in shape[-4:])
+    batches, length = int(grid.shape[0]), int(grid.shape[1])
+    channels = int(feats.shape[1])
+    keys, values = _build_hashmap(coords, w, h, d)
+    miss = torch.iinfo(torch.uint32).max
+
+    points = grid.reshape(-1, 3).float()
+    batch_of = torch.arange(batches, device=grid.device, dtype=torch.long)
+    batch_of = batch_of.repeat_interleave(length)
+    out = torch.zeros(points.shape[0], channels, dtype=torch.float32, device=feats.device)
+
+    for start in range(0, points.shape[0], QUERY_CHUNK):
+        stop = min(start + QUERY_CHUNK, points.shape[0])
+        query = points[start:stop]
+        base = torch.floor(query - 0.5)
+        totals = torch.zeros(query.shape[0], dtype=torch.float32, device=feats.device)
+        summed = torch.zeros(query.shape[0], channels, dtype=torch.float32, device=feats.device)
+        for corner in range(8):
+            offset = torch.tensor(
+                [corner & 1, (corner >> 1) & 1, (corner >> 2) & 1],
+                dtype=torch.float32,
+                device=query.device,
+            )
+            here = base + offset
+            wanted = torch.cat([batch_of[start:stop, None], here.long()], dim=1)
+            found = _hashmap_lookup_3d(keys, values, wanted, w, h, d).to(torch.int64)
+            hit = found != miss
+            if not bool(hit.any()):
+                continue
+            weight = torch.prod(1 - (query - here - 0.5).abs(), dim=1) * hit
+            # **A miss is the largest value of the value type, not -1**, so it
+            # has to be steered to a real row before the gather rather than
+            # clamped; its weight is already zero.
+            rows = torch.where(hit, found, torch.zeros_like(found))
+            totals += weight
+            summed += weight[:, None] * feats.index_select(0, rows).float()
+        out[start:stop] = summed / totals.clamp_min(1e-12)[:, None]
+
+    return out.view(batches, length, channels)
+
+
 def _install_flex_gemm() -> None:
     """Stand in for `flex_gemm`, **with a working sparse convolution**.
 
@@ -964,7 +1071,8 @@ def _install_flex_gemm() -> None:
 
     The arithmetic is the same submanifold convolution as the spconv shim, and
     the weight layout is the same KRSC, so `tests/test_shims.py` covers both.
-    `grid_sample` stays absent: it belongs to texture.
+    `grid_sample`, which carries the texture attributes from the voxels to the
+    mesh, is implemented too (`_grid_sample_3d`).
     """
     module = _new_module("flex_gemm", is_package=True)
     ops = _new_module("flex_gemm.ops", is_package=True)
@@ -983,8 +1091,11 @@ def _install_flex_gemm() -> None:
     sys.modules["flex_gemm.ops"] = ops
     sys.modules["flex_gemm.ops.spconv"] = spconv_ops
 
-    _install_absent("flex_gemm.ops.grid_sample", "texture sampling only (not produced here)")
-    ops.grid_sample = sys.modules["flex_gemm.ops.grid_sample"]  # type: ignore[attr-defined]
+    grid_sample_ops = _new_module("flex_gemm.ops.grid_sample", is_package=True)
+    grid_sample_ops.grid_sample_3d = _grid_sample_3d  # type: ignore[attr-defined]
+    grid_sample_ops.set_hashmap_ratio = lambda *_args, **_kwargs: None  # type: ignore[attr-defined]
+    ops.grid_sample = grid_sample_ops  # type: ignore[attr-defined]
+    sys.modules["flex_gemm.ops.grid_sample"] = grid_sample_ops
 
 
 def install_trellis2(close_mesh: bool = True) -> None:
@@ -1000,8 +1111,9 @@ def install_trellis2(close_mesh: bool = True) -> None:
       drives the pipeline stage by stage and does its own postprocessing - so a
       stand-in that raises when called says so rather than guessing.
     - `flex_gemm`: **the sparse convolution the checkpoints were saved with**,
-      so its half is implemented rather than stubbed (`_install_flex_gemm`).
-      Only `ops.grid_sample`, which samples texture attributes, stays absent.
+      so its half is implemented rather than stubbed (`_install_flex_gemm`),
+      together with `ops.grid_sample`, which carries the texture attributes
+      from the voxel grid to the mesh.
 
     A stand-in that raises is the point: **it can never return a wrong mesh
     quietly.** If a future change reaches one of these, it stops with the name

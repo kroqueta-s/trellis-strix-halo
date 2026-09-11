@@ -9,7 +9,8 @@ thousands** — and it needs six CUDA-only packages to do it.
 This runner (`runners/trellis2/`) runs the image-to-mesh half of it on
 Windows + ROCm with **nothing compiled**: the CUDA halves are replaced at launch
 time, the same way the TRELLIS.1 runner replaces `spconv` and `flash_attn`.
-Texture is not implemented.
+**A texture map is not implemented; colour per vertex is** — see
+[Vertex colours](#vertex-colours).
 
 Everything below was measured on an **ASUS ProArt PX13** (Ryzen AI MAX+ 395,
 Radeon 8060S / gfx1151, 32 GB dedicated VRAM, factory power limits), Windows 11,
@@ -49,7 +50,8 @@ carelessly is off by an order of magnitude.
 | `flash_attn` (sparse attention) | Same file — `F.scaled_dot_product_attention` | Agreement with a naive attention reference |
 | `o_voxel._C` (GPU hashmap) | Same file — coordinate linearization and `searchsorted` | A python dictionary is an exact reference (`tests/test_shims2.py`) |
 | `o_voxel.convert.flexible_dual_grid_to_mesh` | Same file — the extraction, reimplemented | With closing off it reproduces upstream **to the face**: 3,454,810 |
-| `cumesh`, `nvdiffrast`, `flex_gemm.ops.grid_sample` | Stands-in that **raise when called** | Nothing on the image-to-mesh path calls them |
+| `flex_gemm.ops.grid_sample` (sparse trilinear sampling) | Same file — the CUDA kernel's rule in torch, over the same hashmap | `F.grid_sample` agrees on a full grid; a dictionary states the sparse rule (`tests/test_shims2.py`) |
+| `cumesh`, `nvdiffrast` | Stands-in that **raise when called** | Nothing on the image-to-mesh path calls them |
 
 **The dense attention needs no shim at all**: upstream accepts
 `ATTN_BACKEND=sdpa`, and on gfx1151 the AOTriton flash kernels are available in
@@ -133,6 +135,40 @@ Holes are the other half: thousands of pinholes rather than a few openings
 (**2,978 loops, median 3 vertices, 95.2 % under 32** on a 700 k mesh).
 `runners/trellis/close_holes.py` closes each with a fan from its centroid.
 
+### Vertex colours
+
+`TRELLIS2_VERTEX_COLORS=on` (or `vertex_colors` on the call) runs the texture
+flow and its decoder as well, and carries the result onto the mesh's vertices.
+**It is not a texture map.** The decoder produces one attribute vector per
+active voxel, and each vertex is trilinearly interpolated from the eight voxels
+around it — so the colour follows the *position*, not the surface. That is what
+makes it survive decimation, hole closing and the manifold conversion, all of
+which replace the vertices outright; a UV atlas would not survive any of them.
+
+On the mecha at 512, against the same run without it:
+
+| Stage | Seconds |
+|---|--:|
+| Texture latent (12 steps) | 10.4 |
+| Texture decode | 4.8 |
+| **Added to generation** | **15.1 of 64.4 (+31 %)** |
+| Colouring 738,847 vertices | **0.12** |
+
+Loading costs more too — **64.7 s against 42–45 s**, because the pipeline holds
+eight models rather than five — and it needs 6.1 GB more on disk
+(`install-trellis2.ps1 -WithTexture`). **Peak VRAM did not move**: 5.22 GB, with
+no spill.
+
+**511 vertices of 738,847 (0.07 %) came back black** — the ones no active voxel
+surrounds, which cannot be interpolated from anything.
+`metrics.vertex_colors.unreached_vertices` counts them every run, because a
+model that is black because the texture stage failed and one that is black
+because it is black look identical otherwise.
+
+Only the base colour is kept. The decoder also produces metallic, roughness and
+alpha (`pipeline.pbr_attr_layout`), and a PLY has nowhere to put them.
+`tools/render_mesh.py --color` draws what came out.
+
 ## Gotchas
 
 **The published checkpoints are `flex_gemm`-shaped.** Every sparse convolution
@@ -162,6 +198,12 @@ spread — while the tuning pass itself costs 21 minutes and the results are no
 longer bit-reproducible (3,454,810 faces became 3,413,090). hipBLASLt is
 already doing this job.
 
+**FlexGEMM's own torch reference disagrees with its CUDA kernel.**
+`grid_sample_3d` takes `floor(q - 0.5)` as the base voxel in
+`grid_sample.cu`, and `.int()` — truncation toward zero — in
+`grid_sample_torch.py`. They differ for any query below 0.5. **The kernel is
+what produced the published results**, so it is what this shim reproduces.
+
 **Smart App Control blocks freshly installed binaries intermittently.** Two
 instances here: `torch/lib/aotriton_v2.dll` and
 `fast_simplification/_replay.pyd`, both `WinError 4551`, both loading on the
@@ -179,9 +221,9 @@ Read-only preset is enough.
 
 ## Limits
 
-- **No texture.** The stage exists upstream and is reachable in principle —
-  UV unwrapping can be done with `xatlas` rather than CuMesh — but it is not
-  implemented here.
+- **No texture map.** Colour reaches the vertices (see below) but not a UV
+  atlas: that needs unwrapping (`xatlas` can do it rather than CuMesh) and a
+  bake, and neither is implemented here.
 - **What the decoder produces is neither closed nor orientable.** Its flags say
   which grid edges the surface crosses, and **about 5 % of the primal faces
   carry an odd number of crossings** (4.99 % at 512, 5.02 % at 1024, measured as

@@ -14,11 +14,16 @@
 
     What is downloaded: the four geometry checkpoints (about 8.1 GB), DINOv3
     (1.2 GB) and BiRefNet (about 0.9 GB). **The texture checkpoints are not
-    fetched** - this runner produces geometry - which saves 8.5 GB.
+    fetched unless -WithTexture is given**, which adds 6.1 GB and is what
+    TRELLIS2_VERTEX_COLORS needs. The two encoders, which are for training, are
+    never fetched.
 
 .EXAMPLE
     $env:HF_TOKEN = "hf_..."
     .\install-trellis2.ps1
+
+.EXAMPLE
+    .\install-trellis2.ps1 -WithTexture
 #>
 [CmdletBinding()]
 param(
@@ -27,7 +32,10 @@ param(
     [string]$Root = "",
     [string]$WeightsRoot = "",
     [string]$Python = "py -3.12",
-    [string]$HfToken = ""
+    [string]$HfToken = "",
+    # Also fetch the texture flow models and their decoder (6.1 GB), which is
+    # what colours the vertices. Geometry does not need them.
+    [switch]$WithTexture
 )
 
 # Native tools report progress on stderr, and Windows PowerShell 5.1 turns
@@ -121,7 +129,8 @@ function Get-HfFile([string]$repoId, [string]$file, [string]$target, [string]$to
     Write-Host ("    got  {0}  {1:N0} bytes  {2:N1} MB/s" -f $file, $length, ($length / 1MB / $seconds))
 }
 
-Write-Host "==> Downloading the geometry weights (about 8.1 GB; the texture ones are skipped)"
+$geometry = if ($WithTexture) { "8.1 GB plus 6.1 GB of texture" } else { "about 8.1 GB; the texture ones are skipped" }
+Write-Host "==> Downloading the weights ($geometry)"
 foreach ($file in @(
     "pipeline.json", "README.md",
     "ckpts/ss_flow_img_dit_1_3B_64_bf16.json", "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
@@ -130,6 +139,21 @@ foreach ($file in @(
     "ckpts/shape_dec_next_dc_f16c32_fp16.json", "ckpts/shape_dec_next_dc_f16c32_fp16.safetensors"
 )) {
     Get-HfFile $WeightsRepo $file (Join-Path $WeightsRoot ($file -replace '/', '\')) ""
+}
+
+# **Texture is opt-in.** `write_local_pipeline.py` keeps the texture entries in
+# the description only when their checkpoints are present, so this switch is the
+# whole difference between a geometry runner and one that can colour vertices.
+if ($WithTexture) {
+    foreach ($file in @(
+        "ckpts/tex_dec_next_dc_f16c32_fp16.json", "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors",
+        "ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.json",
+        "ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors",
+        "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.json",
+        "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors"
+    )) {
+        Get-HfFile $WeightsRepo $file (Join-Path $WeightsRoot ($file -replace '/', '\')) ""
+    }
 }
 
 # The sparse-structure decoder is the same checkpoint TRELLIS.1 uses. It comes

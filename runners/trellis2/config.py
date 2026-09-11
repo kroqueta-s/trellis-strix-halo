@@ -70,6 +70,12 @@ SLAT_STEPS: int = _int("TRELLIS2_SLAT_STEPS", 0)
 SS_GUIDANCE: float = _float("TRELLIS2_SS_GUIDANCE", 0.0)
 SLAT_GUIDANCE: float = _float("TRELLIS2_SLAT_GUIDANCE", 0.0)
 
+# The texture flow has **its own** sampler settings upstream (12 steps, guidance
+# 1.0), so it gets its own keys rather than borrowing the shape ones: changing
+# how the geometry is sampled should not quietly change the colours too.
+TEX_STEPS: int = _int("TRELLIS2_TEX_STEPS", 0)
+TEX_GUIDANCE: float = _float("TRELLIS2_TEX_GUIDANCE", 0.0)
+
 # Attention head chunk, used only when the fast attention path is unavailable.
 ATTN_HEAD_CHUNK: int = _int("TRELLIS2_ATTN_HEAD_CHUNK", 4)
 
@@ -91,6 +97,37 @@ PREFER_HIPBLASLT: bool = _bool("TRELLIS2_PREFER_HIPBLASLT", True)
 # only 1.6 GB under this cap.
 VRAM_LIMIT_GB: float = _float("TRELLIS2_VRAM_LIMIT_GB", 30.0)
 HEARTBEAT_SEC: float = _float("TRELLIS2_HEARTBEAT_SEC", 10.0)
+
+# Sample the texture latent as well, and carry its colours onto the mesh's
+# vertices. **This is not a texture map**: the decoder produces one colour per
+# active voxel and every vertex is interpolated from the eight around it, so the
+# colours survive decimation, hole closing and manifolding - none of which keeps
+# a UV layout. A texture map needs UV unwrapping and a bake, which is separate
+# work.
+#
+# **Off by default** because it costs a second 1.3B flow and a second decoder
+# pass; `metrics.vertex_colors` reports what it cost when it is on.
+VERTEX_COLORS: bool = _bool("TRELLIS2_VERTEX_COLORS", False)
+
+
+def texture_weights_present() -> bool:
+    """Whether the pipeline description names a texture flow. **Reads no weights.**
+
+    `capabilities` has to answer at once (contract §3), and what decides this is
+    whether the texture checkpoints were downloaded - `write_local_pipeline.py`
+    keeps those entries only when their files are there. So the description is
+    read, not the 2.6 GB behind it.
+    """
+    import json
+
+    description = WEIGHTS_DIR / PIPELINE_CONFIG
+    if not description.is_file():
+        return False
+    try:
+        models = json.loads(description.read_text(encoding="utf-8"))["args"]["models"]
+    except (ValueError, KeyError, OSError):
+        return False
+    return any(name.startswith("tex_slat_flow_model") for name in models)
 
 # --- Post-processing -------------------------------------------------------
 # Decimate to this many faces **before anything else is done to the mesh**.

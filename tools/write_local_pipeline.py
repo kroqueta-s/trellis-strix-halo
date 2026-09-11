@@ -5,9 +5,13 @@
 **the downloaded `pipeline.json` is never edited** and this one sits beside it.
 Three things change:
 
-- the texture models are dropped, because this runner returns geometry;
+- the texture models are kept **only when their checkpoints are there**, so a
+  geometry-only install is described as geometry-only rather than failing to
+  load a file it never downloaded;
 - the image conditioner and the background remover point at directories on this
-  machine rather than at hub repositories, **one of which is gated**;
+  machine rather than at hub repositories, **one of which is gated** - and a
+  path an earlier run already wrote is kept if it still exists, because an
+  operator may have pointed one at a copy shared with another runner;
 - the sparse-structure decoder points at the copy in the weights directory.
 
     python tools\\write_local_pipeline.py C:\\dev\\models\\trellis2
@@ -15,9 +19,11 @@ Three things change:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 
 def write_local_pipeline(weights: Path) -> Path:
@@ -39,10 +45,29 @@ def write_local_pipeline(weights: Path) -> Path:
     config = json.loads(source.read_text(encoding="utf-8"))
     args = config["args"]
 
-    dropped = [name for name in args["models"] if name.startswith("tex_")]
+    # **A missing checkpoint is dropped, not left to fail at load time.**
+    # `from_pretrained` walks this table and loads every entry, so naming a file
+    # that was never downloaded turns into an exception inside the pipeline -
+    # and that one is swallowed (see `docs/trellis2.md`).
+    dropped = [
+        name
+        for name, ckpt in args["models"].items()
+        if name.startswith("tex_") and not (weights / f"{ckpt}.safetensors").is_file()
+    ]
     for name in dropped:
         del args["models"][name]
     args["models"]["sparse_structure_decoder"] = "ckpts/ss_dec_conv3d_16l8_fp16"
+
+    target = weights / "pipeline.local.json"
+    # **What is already there wins, as long as it is still there.** These two
+    # are the only settings an operator has a reason to move by hand - BiRefNet
+    # in particular is often shared with another runner rather than downloaded
+    # twice - and regenerating this file for an unrelated reason should not
+    # quietly point them somewhere empty.
+    previous: dict[str, Any] = {}
+    if target.is_file():
+        with contextlib.suppress(ValueError, KeyError, OSError):
+            previous = json.loads(target.read_text(encoding="utf-8"))["args"]
 
     for section, local in (
         ("image_cond_model", weights / "dinov3-vitl16-pretrain-lvd1689m"),
@@ -50,11 +75,12 @@ def write_local_pipeline(weights: Path) -> Path:
     ):
         entry = args[section]
         key = "model_name" if "model_name" in entry["args"] else next(iter(entry["args"]))
-        entry["args"][key] = str(local)
+        kept = previous.get(section, {}).get("args", {}).get(key)
+        entry["args"][key] = kept if kept and Path(kept).is_dir() else str(local)
+        print(f"{section}: {entry['args'][key]}")
 
-    target = weights / "pipeline.local.json"
     target.write_text(json.dumps(config, indent=4), encoding="utf-8")
-    print(f"dropped the texture models: {dropped}")
+    print(f"texture models without a checkpoint, dropped: {dropped}")
     print(f"models: {sorted(args['models'])}")
     print(f"wrote {target}")
     return target

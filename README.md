@@ -22,8 +22,9 @@ its own virtual environment). It reaches far more detail - millions of faces
 rather than hundreds of thousands - and upstream needs six CUDA-only packages
 to do it, none of which is compiled here either. What it costs, what it cannot
 do, and the traps it took to get there are in
-[`docs/trellis2.md`](docs/trellis2.md). **It is not finished**: the meshes come
-out watertight but not orientable, and there is no texture.
+[`docs/trellis2.md`](docs/trellis2.md). **It is not finished**: colour reaches
+the vertices but there is no texture map, and whether the watertight result is
+actually printable has not been checked.
 
 | Input image | Mesh (4 views) |
 |---|---|

@@ -148,6 +148,142 @@ def test_a_miss_survives_the_callers_int_cast() -> None:
     assert valid.tolist() == [True, False], (out.tolist(), valid.tolist())
 
 
+# --------------------------------------------------------------------------------------
+# grid_sample_3d - trilinear sampling of a sparse volume (the texture path)
+# --------------------------------------------------------------------------------------
+#
+# **`F.grid_sample` is the reference for a full grid.** When every voxel is
+# active, sampling a sparse volume is ordinary trilinear interpolation, and
+# torch's own implementation is an independent one - not a second copy of the
+# arithmetic under test. Voxel centre `i` sits at `i + 0.5` in the query units
+# used here, which is `align_corners=False`.
+#
+# Where the grid is sparse there is nothing to compare against but the kernel's
+# own rule (`FlexGEMM`'s
+# `hashmap_lookup_grid_sample_3d_trilinear_neighbor_map_weight_kernel`): a
+# corner that is missing or outside contributes nothing, and the weights that
+# remain are renormalized. A dictionary states it directly.
+
+
+def _dense_reference(feats: torch.Tensor, size: int, queries: torch.Tensor) -> torch.Tensor:
+    """`F.grid_sample` over the same volume, as `[L, C]`."""
+    channels = feats.shape[1]
+    volume = feats.t().reshape(1, channels, size, size, size)
+    # torch's last grid axis indexes the last spatial dimension, so the query's
+    # (x, y, z) is handed over reversed.
+    normalized = (2 * queries / size - 1).flip(-1).reshape(1, 1, 1, -1, 3)
+    sampled = torch.nn.functional.grid_sample(
+        volume, normalized, mode="bilinear", padding_mode="border", align_corners=False
+    )
+    return sampled.reshape(channels, -1).t()
+
+
+def _sparse_reference(
+    feats: torch.Tensor, coords: torch.Tensor, size: int, queries: torch.Tensor
+) -> torch.Tensor:
+    """The kernel's rule, spelled out over a dictionary."""
+    table = {tuple(c): row for row, c in enumerate(coords.tolist())}
+    out = torch.zeros(queries.shape[0], feats.shape[1], dtype=torch.float32)
+    rows = feats.float().cpu()
+    for i, query in enumerate(queries.tolist()):
+        base = [int(torch.floor(torch.tensor(v - 0.5))) for v in query]
+        total = 0.0
+        for corner in range(8):
+            here = [base[axis] + ((corner >> axis) & 1) for axis in range(3)]
+            if any(c < 0 or c >= size for c in here):
+                continue
+            row = table.get((0, *here))
+            if row is None:
+                continue
+            weight = 1.0
+            for axis in range(3):
+                weight *= 1 - abs(query[axis] - here[axis] - 0.5)
+            total += weight
+            out[i] += weight * rows[row]
+        out[i] /= max(total, 1e-12)
+    return out
+
+
+def _queries(n: int, low: float, high: float) -> torch.Tensor:
+    g = torch.Generator().manual_seed(7)
+    return (torch.rand(n, 3, generator=g) * (high - low) + low).to(DEVICE)
+
+
+def test_grid_sample_matches_torch_on_a_full_grid() -> None:
+    """With every voxel active this is plain trilinear interpolation."""
+    size, channels = 6, 3
+    coords = torch.stack(
+        torch.meshgrid(*[torch.arange(size) for _ in range(3)], indexing="ij"), dim=-1
+    ).reshape(-1, 3)
+    coords = torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=1).int().to(DEVICE)
+    feats = torch.randn(coords.shape[0], channels, generator=torch.Generator().manual_seed(3)).to(
+        DEVICE
+    )
+    # Kept clear of the border, where the reference pads and this one renormalizes.
+    queries = _queries(512, 0.6, size - 0.6)
+
+    got = shims._grid_sample_3d(
+        feats, coords, torch.Size([1, channels, size, size, size]), queries.unsqueeze(0)
+    )[0]
+    want = _dense_reference(feats, size, queries)
+    error = (got - want).abs().max().item()
+    assert error < 1e-4, f"max difference {error}"
+
+
+def test_grid_sample_renormalizes_around_the_holes() -> None:
+    """Half the voxels removed: the surviving corners carry the whole weight."""
+    size, channels = 8, 4
+    coords = torch.stack(
+        torch.meshgrid(*[torch.arange(size) for _ in range(3)], indexing="ij"), dim=-1
+    ).reshape(-1, 3)
+    keep = torch.rand(coords.shape[0], generator=torch.Generator().manual_seed(11)) > 0.5
+    coords = coords[keep]
+    coords = torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=1).int().to(DEVICE)
+    feats = torch.randn(coords.shape[0], channels, generator=torch.Generator().manual_seed(5)).to(
+        DEVICE
+    )
+    queries = _queries(256, 0.0, float(size))
+
+    got = shims._grid_sample_3d(
+        feats, coords, torch.Size([1, channels, size, size, size]), queries.unsqueeze(0)
+    )[0]
+    want = _sparse_reference(feats, coords.cpu(), size, queries.cpu())
+    error = (got.cpu() - want).abs().max().item()
+    assert error < 1e-4, f"max difference {error}"
+
+
+def test_grid_sample_returns_zero_where_nothing_is_near() -> None:
+    """**A point with no active voxel around it gets zero, not a neighbour's colour.**"""
+    size, channels = 8, 2
+    coords = torch.tensor([[0, 1, 1, 1]], dtype=torch.int32, device=DEVICE)
+    feats = torch.ones(1, channels, device=DEVICE)
+    queries = torch.tensor([[1.5, 1.5, 1.5], [6.5, 6.5, 6.5]], device=DEVICE)
+
+    got = shims._grid_sample_3d(
+        feats, coords, torch.Size([1, channels, size, size, size]), queries.unsqueeze(0)
+    )[0]
+    # The voxel's own centre returns the voxel exactly; far away returns nothing.
+    assert torch.allclose(got[0], torch.ones(channels, device=DEVICE)), got[0].tolist()
+    assert torch.all(got[1] == 0), got[1].tolist()
+
+
+def test_grid_sample_refuses_the_mode_it_does_not_implement() -> None:
+    """`nearest` is not on this path, and guessing at it would be worse than stopping."""
+    coords = torch.tensor([[0, 0, 0, 0]], dtype=torch.int32, device=DEVICE)
+    feats = torch.ones(1, 1, device=DEVICE)
+    try:
+        shims._grid_sample_3d(
+            feats,
+            coords,
+            torch.Size([1, 1, 2, 2, 2]),
+            torch.zeros(1, 1, 3, device=DEVICE),
+            "nearest",
+        )
+    except NotImplementedError:
+        return
+    raise AssertionError("nearest should not be silently answered")
+
+
 def main() -> int:
     """Run every test."""
     print(f"device: {DEVICE}")

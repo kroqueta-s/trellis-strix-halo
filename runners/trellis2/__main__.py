@@ -80,10 +80,13 @@ def m_capabilities(params: dict[str, Any], progress: Any) -> dict[str, Any]:
             "image_to_mesh": True,
             "text_to_mesh": False,
             "multi_image_to_mesh": False,
-            # **Not implemented yet**, though unlike TRELLIS.1 it is reachable:
-            # the texture stage needs UV unwrapping (xatlas can do it) and a
-            # rasterizer, not CUDA specifically.
+            # **A texture map is not implemented**: that needs UV unwrapping
+            # (xatlas can do it) and a bake, neither of which is here.
             "texture": False,
+            # **Colours per vertex are.** The texture flow and its decoder run,
+            # and every vertex is interpolated from the voxels around it - so
+            # this survives the post-processing, where a UV layout would not.
+            "vertex_colors": config.texture_weights_present(),
         },
         "params": {
             "resolution": {
@@ -98,16 +101,24 @@ def m_capabilities(params: dict[str, Any], progress: Any) -> dict[str, Any]:
             # 0 keeps the model's own tessellation.
             "target_faces": {"type": "int", "default": config.TARGET_FACES, "min": 0},
             "seed": {"type": "int", "default": 0, "min": 0},
+            # **Costs a second 1.3B flow and a second decoder pass**, which is
+            # why it is a choice and not always on.
+            "vertex_colors": {
+                "type": "bool",
+                "default": config.VERTEX_COLORS and config.texture_weights_present(),
+            },
         },
         "notes": (
-            "spconv, flash_attn, flex_gemm's sparse convolution and o_voxel's hashmap are "
-            "replaced by pure-torch launch-time shims (no build exists for Windows + ROCm); "
-            "cumesh, nvdiffrast and flex_gemm's grid_sample stand in and raise if called. "
+            "spconv, flash_attn, o_voxel's hashmap and flex_gemm's sparse convolution and "
+            "grid sampling are replaced by pure-torch launch-time shims (no build exists for "
+            "Windows + ROCm); cumesh and nvdiffrast stand in and raise if called. "
             "**The mesh is not watertight**: the decoder's own field is open (32.8% of its "
             "2x2 loops are odd at 512), the boundary loops are closed here, and what is left "
             "is the boundary non-manifold edges make. The winding is inconsistent by "
             "construction and is left that way, because correcting it costs more than the "
-            "generation - see metrics.topology. Z-up, normalized scale, no texture. "
+            "generation - see metrics.topology. Z-up, normalized scale. **No texture map**; "
+            "with vertex_colors the texture flow runs and its colours are carried onto the "
+            "vertices, which survives decimation and hole closing. "
             "Asking for 1536 yields 1408: upstream applies its own token limit."
         ),
     }
@@ -132,7 +143,7 @@ def m_unload(params: dict[str, Any], progress: Any) -> dict[str, Any]:
     return {"unloaded": freed, "vram_used_gb": round(used_gb, 2)}
 
 
-_ALLOWED = frozenset({"resolution", "max_tokens", "seed", "target_faces"})
+_ALLOWED = frozenset({"resolution", "max_tokens", "seed", "target_faces", "vertex_colors"})
 
 
 def m_image_to_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
@@ -169,6 +180,7 @@ def m_image_to_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
         seed=int(params.get("seed", 0)),
         max_tokens=int(params["max_tokens"]) if params.get("max_tokens") else None,
         target_faces=int(params["target_faces"]) if "target_faces" in params else None,
+        vertex_colors=bool(params["vertex_colors"]) if "vertex_colors" in params else None,
         progress=progress,
     )
 
@@ -207,6 +219,10 @@ def m_image_to_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
             "post": result.post,
             # **The state of the mesh, counted rather than claimed.**
             "topology": result.topology,
+            # **Whether the vertices carry colour, and how much of the mesh the
+            # texture decoder reached.** A vertex no active voxel surrounds
+            # comes back black, and that is worth counting rather than hiding.
+            "vertex_colors": result.vertex_colors,
         },
         # **Up was checked; forward was not** (contract §5). A mesh imported on
         # the wrong horizontal axis renders perfectly correctly, so nobody finds
@@ -220,6 +236,7 @@ def m_image_to_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
             # **What it ran with**, which is the setting unless the caller said
             # otherwise - and 0 when nothing was decimated.
             "target_faces": result.post.get("decimate_to", 0),
+            "vertex_colors": bool(result.vertex_colors.get("enabled")),
         },
     }
 
