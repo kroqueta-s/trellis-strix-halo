@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: MIT
 """Generate one mesh from one image, no JSON required.
 
 Run with the repository's virtual environment:
