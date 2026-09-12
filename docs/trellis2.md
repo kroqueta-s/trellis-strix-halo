@@ -263,9 +263,16 @@ worth taking** (2026-09-12, the same 1024 decode through all three):
 | Volume through forge at 80 mm | 22,023 mm³ | **18,672 mm³** | 22,199 mm³ |
 
 **The 1024 lattice carves a different solid, not a finer one.** Rays pass
-through narrower gaps, so 15 % of the volume goes, and what is left has six
-times the plate one corner thick - 0.078 mm at 80 mm, which no printer will
-make. The surface comes out pitted rather than detailed.
+through the gaps `close_holes` leaves open (36,787 boundary edges here), and
+a finer lattice's barrier is thinner against them: 15 % of the volume goes,
+and what is left has six times the plate one corner thick - 0.078 mm at
+80 mm, which no printer will make. The surface comes out pitted rather than
+detailed. **How much goes depends on the gaps, not the lattice alone**
+(measured 2026-09-13, the same decode): closing the holes before decimating
+leaves 31,876 boundary edges and loses 13.5 %; closing every loop, whatever
+its size, leaves 23,328 and loses 9.1 % - against a 512 lattice that gains
+volume from the same patches. The plates and the 90-110 s of carving do not
+move with the gaps.
 
 **And the face budget is not what limits the detail**: the carve produces
 about 2.87 M faces whichever budget it is given, because the lattice decides
@@ -329,18 +336,43 @@ active voxel surrounds cannot be interpolated from anything and comes back
 black; on the mesh as the decoder extracted it that was 1,161 of 755,968
 (0.15 %) at 1024 and 511 of 738,847 (0.07 %) at 512. **On the carved solid it
 is 390,100 of 750,214 (52 %) at 1024 and 91,935 of 754,118 (12 %) at 512**
-(measured 2026-09-12). The carve makes a new surface out of a lattice, up to a
-cell away from the one the decoder drew, and a cell of the 512 lattice is two
-voxels wide at a 1024 decode - outside the eight that a trilinear sample reads.
-Carving on a 1024 lattice does not fix it (51.9 %): the finer carve moves the
-surface somewhere else again.
+(measured 2026-09-12). Two things move the surface: the carve makes a new
+one out of a lattice, up to a cell away from the one the decoder drew (a cell
+of the 512 lattice is two voxels at a 1024 decode, outside the eight a
+trilinear sample reads), and **where the decoder left a gap the carve bridges
+it with surface the decoder never drew** - at 1024 a quarter of the print
+mesh's vertices lie more than 8 voxels (0.6 mm at 80 mm) from any vertex of
+the raw decode, the 90th percentile at 23 voxels. Carving on a 1024 lattice
+does not fix it (51.9 %): the finer carve moves the surface somewhere else
+again.
 
-`metrics.vertex_colors.unreached_vertices` counts them every run, because a
-model that is black because the texture stage failed and one that is black
-because it is black look identical otherwise. `tools/render_mesh.py --color`
-draws what came out; at 512 the black areas are the tracks and dark panels,
-which are black in the image too, and at 1024 they are mottled over the whole
-model.
+**So a point the eight corners miss is given its nearest voxels instead**,
+the nearest weighted most, out to `TRELLIS2_COLOUR_REACH` voxels (a k-d tree
+over the voxel centres; a widening cube search was measured first and left a
+third of the vertices black at 1024 for 2.7 s). Measured 2026-09-13, vertices
+black and covered texels black:
+
+| | 1024 | 512 | Cost at 1024 (vertices, bake) |
+|---|--:|--:|--:|
+| No search | 52 % / 44 % | 12.2 % / 9.8 % | — |
+| Reach 8 | 25 % / 20 % | **0.38 % / 0.24 %** | +1.9 s, +1.4 s |
+| **Reach 32** (default) | **5.1 % / 4.1 %** | same | +4.2 s, +7.4 s |
+
+At 512 the lattice offset was the whole problem and 8 voxels ends it. At
+1024 the bridged surface has no colour of its own, and 32 voxels (2.5 mm)
+gives it the nearest drawn colour - a guess, and a better one than black;
+what is still black lies further than that from anything the decoder drew.
+Colouring the bridged surface from the model rather than its neighbours
+would mean decoding the texture latent on the carved mesh's own grid, which
+is what `texture_mesh` does for a mesh from outside (0.05 % black on the same
+carved mesh), and is not done here.
+
+`metrics.vertex_colors.unreached_vertices` counts what stayed black every
+run, because a model that is black because the texture stage failed and one
+that is black because it is black look identical otherwise; `searched`,
+`search_unreached` and `search_distance_p50/p90/max` say how much of the
+colour came from the search and from how far. `tools/render_mesh.py --color`
+draws what came out.
 
 A PLY carries the base colour alone, because it has nowhere to put the rest;
 the GLB carries all four (below).
@@ -421,8 +453,11 @@ meant to be printed.
 covered texels whose colour came back exactly zero - the same test the vertex
 colours use - and `texels_black_after_dilate` says what the dilation did about
 them, which is nothing: it fills texels no face wrote, and these were written.
-Measured 2026-09-12 at 512: 221,065 of 2,262,652 covered texels (9.8 %), all
-still there afterwards. At 1024 it is 44 %, for the reason under Vertex colours.
+Measured 2026-09-12 at 512 without the nearest-voxel search: 221,065 of
+2,262,652 covered texels (9.8 %), all still there afterwards, and 44 % at
+1024. With the search (the default), 0.24 % and 4.1 %; the bake's report
+carries the same `searched` and `search_distance_*` fields as the vertex
+colours, for the reason under Vertex colours.
 
 The bake runs **after the carve and before the manifold conversion**, on a mesh
 decimated to `TRELLIS2_TEXTURE_TARGET_FACES` (200,000). The textured GLB is

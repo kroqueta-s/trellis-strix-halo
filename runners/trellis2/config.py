@@ -124,6 +124,24 @@ HEARTBEAT_SEC: float = _float("TRELLIS2_HEARTBEAT_SEC", 10.0)
 # pass; `metrics.vertex_colors` reports what it cost when it is on.
 VERTEX_COLORS: bool = _bool("TRELLIS2_VERTEX_COLORS", False)
 
+# How far, in voxels, a colour query looks for the nearest active voxels around
+# a point that none of the eight voxels around it were active for. **The carved
+# solid's surface is the lattice's, not the decoder's**: the input was
+# decimated (1.7 voxels of error at 1024) and quantized to a cell of the 512
+# lattice (two voxels at 1024), and where the decoder left a gap the carve
+# bridges it with surface the decoder never drew - a quarter of the print
+# mesh's vertices at 1024 lie more than 8 voxels from the decoded surface.
+# Measured 2026-09-13 on the mecha, vertices black / covered texels black:
+#   no search      1024: 52% / 44%    512: 12.2% / 9.8%
+#   reach 8        1024: 25% / 20%    512: 0.38% / 0.24%   (+1.9 s / +0.3 s)
+#   reach 32       1024: 5.1% / 4.1%  512: same            (+4.2 s, bake +7 s)
+# 32 voxels is 2.5 mm on an 80 mm print at 1024: the bridged surface takes the
+# colour of the nearest drawn surface, which is a guess, and a better one than
+# black. 0 is the plain trilinear sample. `metrics.vertex_colors.searched` says
+# how often the search was needed, `unreached_vertices` how often it was not
+# enough, and `search_distance_p90` how far it went (23 voxels at 1024).
+COLOUR_REACH: float = _float("TRELLIS2_COLOUR_REACH", 32.0)
+
 # Unwrap the surface and bake the colours into a texture map as well. **This is
 # a different thing from vertex colours**: the colour lives in an image, so its
 # resolution is the texture's rather than the mesh's, and detail finer than a
@@ -308,10 +326,11 @@ SHELL_THICKNESS: float = _float("TRELLIS2_SHELL_THICKNESS", 0.0375)
 # dozen bytes: 512 peaks near 2.5 GB; 1024 is eight times that.
 #
 # **1024 was measured and is not better** (2026-09-12, a 1024 decode carved
-# both ways): the rays reach through narrower gaps, so the solid loses 15% of
-# its volume (22,023 -> 18,672 mm3 at 80 mm) and comes out with six times the
-# plate one corner thick - 0.078 mm at that size - for 110.5 s of carving
-# against 17.3 s. Finer here buys a different solid, not a finer one.
+# both ways): the rays reach through the gaps `close_holes` leaves, so the solid
+# loses 15% of its volume (22,023 -> 18,672 mm3 at 80 mm; 9-15% depending on
+# how many gaps are closed first, measured 2026-09-13) and comes out with six
+# times the plate one corner thick - 0.078 mm at that size - for 110.5 s of
+# carving against 17.3 s. Finer here buys a different solid, not a finer one.
 SHELL_GRID: int = _int("TRELLIS2_SHELL_GRID", 512)
 
 # Band only: fill every enclosed pocket. Carving always fills them - a print

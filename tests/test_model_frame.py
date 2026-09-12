@@ -29,6 +29,10 @@ UP = {
     "x": np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
     "y": np.array([[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
     "z": np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]]),
+    # A leading minus says the file's up is the negative axis.
+    "-x": np.array([[0.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]),
+    "-y": np.array([[0.0, 0.0, 0.0], [0.0, -1.0, 0.0]]),
+    "-z": np.array([[0.0, 0.0, 0.0], [0.0, 0.0, -1.0]]),
 }
 
 
@@ -52,7 +56,7 @@ def test_no_axis_mirrors_the_model() -> None:
     It puts the axis where it belongs, so the model stands up correctly, and
     turns every face inside out on the way.
     """
-    for axis in ("x", "y", "z"):
+    for axis in UP:
         volume = _signed_volume(_to_model_frame(TETRAHEDRON.copy(), axis))
         assert volume > 0, f"{axis} mirrored the mesh (signed volume {volume})"
 
