@@ -121,6 +121,59 @@ def test_dilation_spreads_outward_and_stops() -> None:
     assert done == 0, done
 
 
+def test_a_folded_face_reads_the_atlas_but_does_not_write_it() -> None:
+    """A grid with one triangle turned over: the unwrap marks it, and the bake skips it."""
+    try:
+        import trimesh
+        import xatlas  # noqa: F401
+    except ImportError as exc:
+        print(f"  skipped (no {exc.name})")
+        return
+    from runners.trellis2 import config
+
+    n = 9
+    xs, ys = np.meshgrid(np.arange(n, dtype=float), np.arange(n, dtype=float), indexing="ij")
+    vertices = np.column_stack([xs.ravel(), ys.ravel(), np.zeros(n * n)])
+    faces = []
+    for i in range(n - 1):
+        for j in range(n - 1):
+            a, b, c, d = i * n + j, (i + 1) * n + j, (i + 1) * n + j + 1, i * n + j + 1
+            faces += [[a, b, c], [a, c, d]]
+    vertices[4 * n + 4, 0] += 1.2
+    vertices[4 * n + 4, 1] += 0.3
+    grid = trimesh.Trimesh(vertices=vertices, faces=np.array(faces), process=False)
+    saved = (config.CHART_FOLD_AREA, config.CHART_MIN_FACES)
+    try:
+        # Out of reach, so the turned triangle stays in the chart and is folded.
+        config.CHART_FOLD_AREA = 1e9
+        config.CHART_MIN_FACES = 4
+        size = 64
+        _v, packed, uvs, folded, report = texture.unwrap(grid, size, in_process=True)
+        assert report.folded_faces == 1, report.as_dict()
+        assert int(folded.sum()) == 1 and len(folded) == len(packed)
+        # The folded face's own texels are under other faces of its chart.
+        uv_t = torch.as_tensor(uvs, device=DEVICE)
+        face_t = torch.as_tensor(packed, device=DEVICE)
+        theirs, _t, _w = texture._cover(uv_t, face_t[torch.as_tensor(folded, device=DEVICE)], size)
+        others, _t, _w = texture._cover(uv_t, face_t[torch.as_tensor(~folded, device=DEVICE)], size)
+        assert theirs.numel() > 0 and bool(torch.isin(theirs, others).all()), (theirs, others)
+        # And the bake writes only the others: its coverage is theirs alone.
+        _textured, baked = texture.bake(
+            grid,
+            lambda points: torch.ones(len(points), 3, device=points.device),
+            size,
+            dilate=0,
+            in_process=True,
+        )
+        assert baked["folded_faces"] == 1, baked
+        assert baked["texels_covered"] == int(others.unique().numel()), (
+            baked["texels_covered"],
+            int(others.unique().numel()),
+        )
+    finally:
+        config.CHART_FOLD_AREA, config.CHART_MIN_FACES = saved
+
+
 def test_the_unwrap_keeps_the_surface() -> None:
     """xatlas cuts and duplicates vertices; **it must not drop faces**."""
     try:
@@ -130,7 +183,7 @@ def test_the_unwrap_keeps_the_surface() -> None:
         print(f"  skipped (no {exc.name})")
         return
     mesh = trimesh.creation.icosphere(subdivisions=2)
-    vertices, faces, uvs, report = texture.unwrap(mesh, in_process=True)
+    vertices, faces, uvs, _folded, report = texture.unwrap(mesh, in_process=True)
     assert len(faces) == len(mesh.faces), (len(faces), len(mesh.faces))
     assert len(vertices) == len(uvs) >= len(mesh.vertices)
     assert report.vertices_before == len(mesh.vertices)
@@ -157,7 +210,7 @@ def test_the_packed_atlas_fits_and_fills() -> None:
     for _ in range(3):
         mesh = mesh.subdivide()
     size = 128
-    vertices, faces, uvs, report = texture.unwrap(mesh, size, in_process=True)
+    vertices, faces, uvs, _folded, report = texture.unwrap(mesh, size, in_process=True)
 
     assert len(faces) == len(mesh.faces), (len(faces), len(mesh.faces))
     assert len(vertices) == len(uvs), (len(vertices), len(uvs))

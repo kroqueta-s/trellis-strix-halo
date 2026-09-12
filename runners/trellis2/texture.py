@@ -49,6 +49,8 @@ class BakeReport:
     n_charts: int = 0
     faces_in_large_charts: float = 0.0
     median_faces_per_chart: float = 0.0
+    folds_moved: int = 0
+    folds_own_chart: int = 0
     folded_faces: int = 0
     vertices_before: int = 0
     vertices_after: int = 0
@@ -87,7 +89,7 @@ def _in_child(function: Any, *arguments: Any) -> Any:
 
 def unwrap(
     mesh: trimesh.Trimesh, size: int = 2048, in_process: bool = False
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, BakeReport]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, BakeReport]:
     """Cut the surface into charts and lay them flat, then pack them.
 
     **The charts are decided here, not by xatlas.** Asked to both cut and pack,
@@ -106,7 +108,8 @@ def unwrap(
     that module. `in_process` skips the child; it is for the tests, whose
     shapes are small enough that nothing has time to notice.
 
-    Returns the new vertices, faces and per-vertex UVs in 0..1.
+    Returns the new vertices, faces and per-vertex UVs in 0..1, and which faces
+    are folded: those keep their UVs but must not write the atlas (`bake`).
     """
     from . import charts as charting
     from . import unwrap_worker
@@ -115,13 +118,26 @@ def unwrap(
 
     mark = time.perf_counter()
     vertices, faces, flat, chart_report = charting.project_charts(
-        mesh, smoothing_rounds=config.CHART_SMOOTHING, min_faces=config.CHART_MIN_FACES
+        mesh,
+        smoothing_rounds=config.CHART_SMOOTHING,
+        min_faces=config.CHART_MIN_FACES,
+        fold_area=config.CHART_FOLD_AREA,
     )
     report.chart_sec = round(time.perf_counter() - mark, 2)
     report.n_charts = chart_report.charts
     report.faces_in_large_charts = chart_report.faces_in_large_charts
     report.median_faces_per_chart = chart_report.median_faces_per_chart
+    report.folds_moved = chart_report.folds_moved
+    report.folds_own_chart = chart_report.folds_own_chart
     report.folded_faces = chart_report.folded_faces
+
+    # **The folds are read off the projection, before packing.** A face whose
+    # projected triangle turns over lands on its neighbours in the atlas; it
+    # keeps its UVs and reads what is there, but writing would put its colour
+    # over theirs. The packed atlas cannot tell: the packer is free to mirror
+    # a whole chart (930 of 2,184 on the 200 k specimen), and a sliver's sign
+    # does not survive the float32 rounding of the packing.
+    folded = _turned_over(flat, faces)
 
     mark = time.perf_counter()
     arguments = (np.ascontiguousarray(flat, dtype=np.float32), faces, int(size))
@@ -131,11 +147,27 @@ def unwrap(
         vmapping, indices, uvs = _in_child(unwrap_worker.pack, *arguments)
     report.pack_sec = round(time.perf_counter() - mark, 2)
 
+    vmapping = np.asarray(vmapping, dtype=np.int64)
+    indices = np.asarray(indices, dtype=np.int64)
+    # The fold mask is per face in the order handed to the packer, which xatlas
+    # keeps (checked on every run, since a silent reorder would misplace it).
+    if not np.array_equal(vmapping[indices], faces):
+        raise RuntimeError("xatlas returned the faces in a different order than it was given")
     vertices = np.asarray(vertices, dtype=np.float64)[vmapping]
-    faces = np.asarray(indices, dtype=np.int64)
     uvs = np.asarray(uvs, dtype=np.float32)
     report.vertices_after = int(len(vertices))
-    return vertices, faces, uvs, report
+    return vertices, indices, uvs, folded, report
+
+
+def _turned_over(uvs: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """Which faces project with a negative area: turned over in their chart."""
+    if len(faces) == 0:
+        return np.zeros(0, dtype=bool)
+    p = np.asarray(uvs, dtype=np.float64)[faces]
+    signed = (p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1]) - (p[:, 1, 1] - p[:, 0, 1]) * (
+        p[:, 2, 0] - p[:, 0, 0]
+    )
+    return signed < 0
 
 
 def _cover(
@@ -244,7 +276,7 @@ def bake(
     Returns:
         The unwrapped mesh carrying the texture, and what the bake counted.
     """
-    vertices, faces, uvs, report = unwrap(mesh, size, in_process=in_process)
+    vertices, faces, uvs, folded, report = unwrap(mesh, size, in_process=in_process)
     report.texture_size = int(size)
     report.texels_total = int(size) * int(size)
 
@@ -256,8 +288,11 @@ def bake(
 
     colour = torch.zeros(size * size, 3, dtype=torch.float32, device=device)
     filled = torch.zeros(size * size, dtype=torch.bool, device=device)
-    for start in range(0, int(face_t.shape[0]), TRIANGLE_CHUNK):
-        chunk = face_t[start : start + TRIANGLE_CHUNK]
+    # A folded face keeps its UVs - it reads the atlas where it lands - but
+    # writes nothing, so that it does not paint over the faces it overlaps.
+    writers = face_t[torch.as_tensor(~folded, device=device)]
+    for start in range(0, int(writers.shape[0]), TRIANGLE_CHUNK):
+        chunk = writers[start : start + TRIANGLE_CHUNK]
         texel, triangle, weights = _cover(uv_t, chunk, size)
         if texel.numel() == 0:
             continue

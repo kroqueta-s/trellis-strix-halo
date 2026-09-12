@@ -338,9 +338,22 @@ vertex colours: the hazard stripes on the armour, the beacons, the tracks and
 the decals on the chest survive, where a chart of five triangles broke them
 across a seam.
 
-**3,826 faces of 200,000 (1.9 %) come out folded** - their projection turns
-over, because a smoothed normal does not describe them. They are reported as
-`metrics.texture.folded_faces`.
+**Faces that fold.** A face whose own normal points away from its chart's
+axis turns over in projection and lands on its neighbours: 4,250 of 200,000
+(2.1 %) on the 512 specimen, 2,488 of them against their own smoothed
+normal, because the surface is rough at the scale of a triangle. Left
+alone they would have written their colour over the faces under them -
+1.7 % of the covered texels, 5,551 of those in *other* charts. So each one
+is moved to a neighbouring chart it does not fold in (1,215), or given a
+chart of its own along its own normal when it is at least
+`TRELLIS2_CHART_FOLD_AREA` times the median face (2; 73 faces), and the
+slivers that remain - 2,962, holding 0.6 % of the area, a third of a median
+face each - keep their place but **read the atlas without writing it**
+(the bake skips them; they are read off the projection before packing,
+because the packer mirrors whole charts and a sliver's orientation does not
+survive its float32 rounding). Charts 2,105 → 2,178, faces in charts of
+fifty or more 95.5 % → 95.4 %. `metrics.texture` reports `folds_moved`,
+`folds_own_chart` and `folded_faces`.
 
 The bake runs **after the carve and before the manifold conversion**, on a mesh
 decimated to `TRELLIS2_TEXTURE_TARGET_FACES` (200,000). The textured GLB is
@@ -443,7 +456,8 @@ Read-only preset is enough.
 
 - **The texture map costs a second 1.3B flow**, like the vertex colours it
   shares its query with, and 8.8 s more for the charts, the packing and the
-  bake. Both are off by default. What it does not do is match the print mesh:
+  bake. The vertex colours are off by default and the texture map is on.
+  What it does not do is match the print mesh:
   the atlas belongs to a coarser surface (see above).
 - **What the decoder produces is neither closed nor orientable.** Its flags say
   which grid edges the surface crosses, and **about 5 % of the primal faces

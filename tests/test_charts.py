@@ -78,6 +78,67 @@ def test_an_inconsistently_wound_mesh_shatters() -> None:
     assert report.charts > 10 * clean.charts, (report.charts, clean.charts)
 
 
+def test_folded_faces_are_moved_or_given_a_chart() -> None:
+    """A face pointing away from its chart's axis goes to a neighbour it fits, or gets its own.
+
+    Four faces in a row, all in a +Z chart but face 2, which is +X. Face 1
+    points -Z and borders face 2 while pointing +X too, so it moves there;
+    face 3 points -Z, borders only +Z faces, and is large, so it gets a chart
+    of its own along -Z; face 0 is a -Z sliver with nowhere to go, and stays.
+    """
+    from runners.trellis2.charts import _AXIS_VECTORS, _unfold
+
+    chart = np.array([0, 0, 1, 0])
+    chart_direction = np.array([4, 0])  # +Z, +X
+    normals = np.array(
+        [
+            [0.0, 0.0, -1.0],  # sliver, folded, no neighbour to take it
+            [0.6, 0.0, -0.8],  # folded in +Z, fits +X
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0],  # folded, large, only +Z neighbours
+        ]
+    )
+    area = np.array([0.1, 1.0, 1.0, 5.0])
+    left = np.array([0, 1, 1, 2])
+    right = np.array([1, 2, 3, 3])
+    out, directions, moved, own = _unfold(chart, chart_direction, normals, area, left, right, 2.0)
+    assert (moved, own) == (1, 1), (moved, own)
+    assert out[1] == out[2], out
+    assert out[0] != out[3] and out[3] != out[1], out
+    assert len(directions) == 3
+    assert np.array_equal(_AXIS_VECTORS[directions[out[3]]], [0, 0, -1]), directions
+    # Nothing folds any more except the sliver that was left.
+    dot = (normals * _AXIS_VECTORS[directions[out]]).sum(axis=1)
+    assert np.array_equal(dot <= 0, [True, False, False, False]), dot
+
+
+def test_a_folded_triangle_in_a_flat_grid_gets_its_own_chart() -> None:
+    """One vertex dragged past an opposite edge turns one triangle over; it leaves the chart.
+
+    Its smoothed normal still says +Z, so the chart takes it, and its own
+    says -Z, so it folds. Kept folded when the area threshold is out of
+    reach; given a chart of its own when the threshold is zero.
+    """
+    n = 9
+    xs, ys = np.meshgrid(np.arange(n, dtype=float), np.arange(n, dtype=float), indexing="ij")
+    vertices = np.column_stack([xs.ravel(), ys.ravel(), np.zeros(n * n)])
+    faces = []
+    for i in range(n - 1):
+        for j in range(n - 1):
+            a, b, c, d = i * n + j, (i + 1) * n + j, (i + 1) * n + j + 1, i * n + j + 1
+            faces += [[a, b, c], [a, c, d]]
+    vertices[4 * n + 4, 0] += 1.2
+    vertices[4 * n + 4, 1] += 0.3
+    grid = trimesh.Trimesh(vertices=vertices, faces=np.array(faces), process=False)
+    _v, _f, _uv, kept = project_charts(grid, smoothing_rounds=10, min_faces=4, fold_area=1e9)
+    assert kept.folded_faces == 1, kept.as_dict()
+    assert kept.folds_own_chart == 0, kept.as_dict()
+    _v, _f, _uv, report = project_charts(grid, smoothing_rounds=10, min_faces=4, fold_area=0.0)
+    assert report.folded_faces == 0, report.as_dict()
+    assert report.folds_own_chart == kept.folded_faces, report.as_dict()
+    assert report.charts == kept.charts + kept.folded_faces, (report.charts, kept.charts)
+
+
 def main() -> int:
     """Run every test."""
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

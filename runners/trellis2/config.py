@@ -171,6 +171,16 @@ CHART_SMOOTHING: int = _int("TRELLIS2_CHART_SMOOTHING", 10)
 # 200,000 faces). 50 is the size at which a chart is worth a seam.
 CHART_MIN_FACES: int = _int("TRELLIS2_CHART_MIN_FACES", 50)
 
+# A face whose own normal points away from its chart's axis folds over in
+# projection. It is moved to a neighbouring chart it does not fold in; when
+# none takes it, it gets a chart of its own if its area is at least this many
+# times the median face's, and is otherwise left folded, reading the atlas
+# but not writing it. **Measured 2026-09-12** on the 200 k specimen: 4,250
+# folded faces (2.1%), 1,215 with a neighbour to go to; of the rest, 73 are
+# at least twice the median face (0.08% of the area) and 2,962 are slivers
+# (0.4%). A chart for every one would have doubled the chart count.
+CHART_FOLD_AREA: float = _float("TRELLIS2_CHART_FOLD_AREA", 2.0)
+
 # Rounds of spreading the colours past the edge of each chart. **Without it a
 # renderer filtering across a seam pulls in the empty background and draws a
 # black line along every cut.** 4 is enough for bilinear filtering at any
