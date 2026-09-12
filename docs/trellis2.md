@@ -213,6 +213,9 @@ through `forge.prepare_mesh` at 80 mm:
 The 1024 repair is `manifold3d`'s decompose-and-union on 1.6 M faces, on
 forge's side; the runner's own part is the 37 s.
 
+Both meshes were then sliced in Bambu Studio as they came, with no repair
+and no error (2026-09-12).
+
 `TRELLIS2_SHELL_MODE=band` is the older construction: every point within
 half of `TRELLIS2_SHELL_THICKNESS` of the surface is solid, which guarantees a
 wall thickness (0.0375 is 3 mm on an 80 mm print) but grows the silhouette by
