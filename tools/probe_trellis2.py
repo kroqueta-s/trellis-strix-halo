@@ -116,7 +116,9 @@ def main() -> int:
     )
     parser.add_argument("--max-tokens", type=int, default=49152)
     parser.add_argument(
-        "--no-close", action="store_true", help="leave the sparse region's edge open, as upstream does"
+        "--no-close",
+        action="store_true",
+        help="leave the sparse region's edge open, as upstream does",
     )
     args = parser.parse_args()
 

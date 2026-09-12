@@ -37,7 +37,9 @@ def test_a_closed_mesh_is_left_alone() -> None:
 def test_one_punched_hole_closes() -> None:
     """Remove a face from a box and it comes back watertight."""
     box = trimesh.creation.box()
-    punched = trimesh.Trimesh(vertices=box.vertices.copy(), faces=box.faces[1:].copy(), process=False)
+    punched = trimesh.Trimesh(
+        vertices=box.vertices.copy(), faces=box.faces[1:].copy(), process=False
+    )
     assert _boundary(punched) == 3
 
     closed, stats = close_holes(punched, max_extent=0)
@@ -58,7 +60,9 @@ def test_many_holes_close_and_keep_the_volume() -> None:
     rng = np.random.default_rng(0)
     drop = rng.choice(len(sphere.faces), size=40, replace=False)
     keep = np.setdiff1d(np.arange(len(sphere.faces)), drop)
-    punched = trimesh.Trimesh(vertices=sphere.vertices.copy(), faces=sphere.faces[keep], process=False)
+    punched = trimesh.Trimesh(
+        vertices=sphere.vertices.copy(), faces=sphere.faces[keep], process=False
+    )
 
     closed, stats = close_holes(punched, max_extent=0)
     assert _boundary(closed) == 0, stats.as_dict()
@@ -103,7 +107,9 @@ def test_a_wide_loop_is_left_open() -> None:
     wide = centre[:, 2] > 0.9 * sphere.vertices[:, 2].max()
     drop = np.flatnonzero(wide)
     keep = np.setdiff1d(np.arange(len(sphere.faces)), np.append(drop, 3000))
-    punched = trimesh.Trimesh(vertices=sphere.vertices.copy(), faces=sphere.faces[keep], process=False)
+    punched = trimesh.Trimesh(
+        vertices=sphere.vertices.copy(), faces=sphere.faces[keep], process=False
+    )
 
     closed, stats = close_holes(punched, max_extent=0.05)
     assert stats.loops_left_open >= 1, stats.as_dict()

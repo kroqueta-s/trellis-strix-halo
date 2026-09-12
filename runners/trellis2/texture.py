@@ -111,9 +111,7 @@ def unwrap(
     from . import charts as charting
     from . import unwrap_worker
 
-    report = BakeReport(
-        faces=int(len(mesh.faces)), vertices_before=int(len(mesh.vertices))
-    )
+    report = BakeReport(faces=int(len(mesh.faces)), vertices_before=int(len(mesh.vertices)))
 
     mark = time.perf_counter()
     vertices, faces, flat, chart_report = charting.project_charts(
@@ -188,9 +186,7 @@ def _cover(
     beta = (ep[:, 0] * e2[:, 1] - ep[:, 1] * e2[:, 0]) / safe
     gamma = (e1[:, 0] * ep[:, 1] - e1[:, 1] * ep[:, 0]) / safe
     alpha = 1.0 - beta - gamma
-    inside = (
-        (alpha >= 0) & (beta >= 0) & (gamma >= 0) & (area.abs() >= 1e-12)
-    )
+    inside = (alpha >= 0) & (beta >= 0) & (gamma >= 0) & (area.abs() >= 1e-12)
 
     texel = (y * size + x)[inside]
     return texel, index[triangle][inside], torch.stack([alpha, beta, gamma], dim=1)[inside]

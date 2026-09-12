@@ -327,9 +327,9 @@ def test_texture_mesh_renames_the_mesh_into_place() -> None:
     out = _texture_mesh()
     written = [p for p in WRITES if p.name.startswith("textured.ply")]
     assert written, WRITES
-    assert all(p.name != "textured.ply" for p in written), (
-        f"written straight to its name: {written}"
-    )
+    assert all(
+        p.name != "textured.ply" for p in written
+    ), f"written straight to its name: {written}"
     assert Path(out["mesh_path"]).name == "textured.ply", out["mesh_path"]
 
 

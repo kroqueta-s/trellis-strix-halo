@@ -17,9 +17,7 @@ from __future__ import annotations
 import numpy as np
 
 
-def unwrap(
-    vertices: np.ndarray, faces: np.ndarray
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def unwrap(vertices: np.ndarray, faces: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Cut the surface open and lay it flat. Returns `(vmapping, indices, uvs)`.
 
     **xatlas's own defaults.** They were compared against a relaxed chart search
@@ -35,9 +33,9 @@ def unwrap(
     )
 
 
-def pack(uvs: np.ndarray, faces: np.ndarray, resolution: int) -> tuple[
-    np.ndarray, np.ndarray, np.ndarray
-]:
+def pack(
+    uvs: np.ndarray, faces: np.ndarray, resolution: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Lay charts that are already flat into one atlas. Returns `(vmapping, indices, uvs)`.
 
     The charts come from `charts.project_charts` in **world units**, so every
