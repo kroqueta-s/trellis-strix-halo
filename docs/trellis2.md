@@ -136,6 +136,50 @@ Dropping debris used to scale with the **component count** (87,630 parts on
 that mesh), which is why it barely moved between the two columns; see the
 table above for what that cost actually was.
 
+### The print mesh is a shell, because the model does not produce a solid
+
+**What the decoder emits is a thin, double-walled skin.** Cross-sections of
+the 512 specimen on the primal lattice show every part outlined twice — an
+outer and an inner surface two or three cells apart — and the space between
+them, and the space inside, connected to the outside through openings wider
+than 24 cells (5 % of the model): flooding the lattice from outside reaches
+the interior however the openings are closed, up to a closing radius of 12
+cells. That is why sewing the surface shut (`make_manifold` alone) gave a
+manifold enclosing a volume of 0.0023 against a silhouette of about 0.1, with
+a quarter of the points near the surface at winding number −1: a surface that
+does not separate an inside from an outside has no orientation to propagate,
+and the sewn result depends on which fill rule a slicer applies.
+
+So the print mesh is made from the surface instead (`runners/trellis2/shell.py`):
+every point within half a wall of the surface is solid, every pocket the
+outside cannot reach is filled, and the boundary of that solid is extracted
+with surface nets. **Closed by construction, oriented by which side is solid,
+and no wall thinner than asked** — which is what Blender's solidify and
+OpenVDB's mesh-to-volume do with a surface soup. `TRELLIS2_SHELL_THICKNESS` is
+the wall as a fraction of the longest side; the runner does not know
+millimetres, and the default 0.0375 is 3 mm on an 80 mm print.
+
+Measured on the 512 mecha (1.34 M faces at the shell's input, a 536-cell lattice):
+
+| Wall | Shell | Decimate to 1.5 M | `make_manifold` | `manifold3d` | Volume |
+|---|--:|--:|--:|---|--:|
+| 0.0375 (3 mm / 80 mm) | 17.5 s (14.1 s of it the distance transform) | 1.2 s | 5.0 s, nothing to close | `NoError` | 0.0977 |
+| 0.015 (1.2 mm / 80 mm) | 15.3 s | 2.5 s | 5.5 s | `NoError` | 0.0557 |
+
+Through the runner, on the same image at 512 with the shell on: generation
+56.2 s, then decimation 2.7 s, debris 1.5 s (71,473 parts), holes 1.4 s,
+**shell 28.4 s** (23.7 s of it the distance transform, measured while a
+compiler was using the other cores), decimation of the shell 1.4 s and
+`make_manifold` 5.8 s — **41 s of post-processing against 80 s before the
+shell existed**, for a mesh that is watertight, edge-manifold, consistently
+wound and 0.0977 in volume.
+
+**The price is detail narrower than the wall, and half a wall of growth
+outward.** At 3 mm the hydraulics and track links round off; at 1.2 mm they
+survive. Both renders are checked by eye; the wall is the operator's choice
+and `metrics.post.shell` reports it in cells, together with how many pockets
+were filled and what they hold.
+
 ### What comes out
 
 The model's raw output carries a great deal of debris — **18,898 parts at 512
@@ -303,13 +347,14 @@ Read-only preset is enough.
   (`Error.NoError`, genus 1207), which is what meshforge's `repair_manifold`
   needs. `TRELLIS2_MAKE_MANIFOLD=off` returns the model's own surface instead.
 
-  **It costs, and the cost is in `metrics`.** Closing those seams adds patch
-  worth **2.2–2.5× the input surface area**
-  (`post.manifold.close.fan_area_fraction`), nearly all of it internal — the
-  silhouette and the detail survive, checked by eye — while the enclosed volume
-  comes out at 0.0023 against 0.024 for the open surface, which says the inside
-  is a nest of shells rather than a solid. **Topologically clean is not the same
-  as printable**, and that part is not verified yet.
+  **Sewn on its own it is not a solid.** Closing those seams adds patch worth
+  **2.2–2.5× the input surface area**
+  (`post.manifold.close.fan_area_fraction`), nearly all of it internal, and
+  the enclosed volume comes out at 0.0023 with a quarter of the space near the
+  surface wound inside-out — because the surface is a double-walled skin with
+  wide openings (see *The print mesh is a shell*). With `TRELLIS2_SHELL=on`,
+  the default, `make_manifold` runs on the shell instead and has nothing to
+  close; the sewn manifold is what `TRELLIS2_SHELL=off` gives.
 - **Half the faces are wound the other way** (49.2 % at 512). Correcting that
   costs more than the generation on an undecimated mesh, so it is left to the
   caller, after decimation. `tools/render_mesh.py --two-sided` exists because a

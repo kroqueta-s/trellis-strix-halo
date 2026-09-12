@@ -33,7 +33,7 @@ from runners.trellis import close_holes as holes
 from runners.trellis import postprocess, shims, split_manifold
 from runners.trellis.steps import StepCounter, count_tqdm
 
-from . import config, texture
+from . import config, shell, texture
 
 NAME = "trellis2"
 VERSION = "4B"
@@ -675,6 +675,40 @@ def _postprocess(
         bake_report["faces"] = int(len(surface.faces))
         bake_report["enabled"] = True
         report["texture_sec"] = round(time.perf_counter() - mark, 2)
+
+    # **The print mesh is a solid made from the surface, not the surface
+    # sewn shut.** The decoder's output is a thin double-walled skin with
+    # openings too wide to close (see `shell`), so sewing it gives a manifold
+    # that encloses a tenth of the silhouette's volume with a quarter of it
+    # wound inside-out. Thickening every point of the surface into a wall,
+    # and filling what the outside cannot reach, gives a closed solid with a
+    # guaranteed wall - at the price of half a wall's growth outward.
+    if config.SHELL:
+        mark = time.perf_counter()
+        if progress is not None:
+            progress(
+                "shell",
+                f"thickening the surface into a wall {config.SHELL_THICKNESS:.4f} of the "
+                f"longest side on a {config.SHELL_GRID} grid",
+            )
+        mesh, shell_report = shell.thicken(
+            mesh,
+            grid=config.SHELL_GRID,
+            thickness=config.SHELL_THICKNESS,
+            fill_cavities=config.SHELL_FILL_CAVITIES,
+        )
+        report["shell"] = shell_report.as_dict()
+        report["shell_sec"] = round(time.perf_counter() - mark, 2)
+        # The offset surface has about as many faces as the input; the same
+        # budget applies to it.
+        if 0 < target < len(mesh.faces):
+            mark = time.perf_counter()
+            if progress is not None:
+                progress(
+                    "decimate", f"reducing the shell's {len(mesh.faces):,} faces to {target:,}"
+                )
+            mesh = decimate(mesh, target)
+            report["shell_decimate_sec"] = round(time.perf_counter() - mark, 2)
 
     if config.MAKE_MANIFOLD:
         mark = time.perf_counter()

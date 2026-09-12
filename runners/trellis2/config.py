@@ -162,6 +162,7 @@ def texture_weights_present() -> bool:
         return False
     return any(name.startswith("tex_slat_flow_model") for name in models)
 
+
 # --- Post-processing -------------------------------------------------------
 # Decimate to this many faces **before anything else is done to the mesh**.
 # 0 turns it off and the model's own tessellation is kept.
@@ -202,8 +203,35 @@ CLOSE_HOLES: bool = _bool("TRELLIS2_CLOSE_HOLES", True)
 # 0 closes everything. `metrics.post.fan_area_fraction` reports what it cost.
 CLOSE_MAX_EXTENT: float = _float("TRELLIS2_CLOSE_MAX_EXTENT", 0.05)
 
+# Thicken the surface into a solid shell before the manifold conversion.
+# **The decoder's output is a thin double-walled skin, not a solid** (measured
+# 2026-09-12: openings wider than 24 cells at 512, so no fill from outside
+# reaches an inside), and a manifold sewn out of it encloses a tenth of the
+# silhouette's volume. The shell makes every point within half a wall of the
+# surface solid and fills every pocket the outside cannot reach. It costs
+# about 20 s at 512 (a 14 s distance transform) and grows the silhouette by
+# half a wall. `metrics.post.shell` reports what it did.
+SHELL: bool = _bool("TRELLIS2_SHELL", True)
+
+# The wall, as a fraction of the longest side. **The runner does not know
+# millimetres**: 0.0375 is 3 mm on an 80 mm print, the operator's target.
+# Detail narrower than the wall closes, and everything grows outward by half
+# of it, so a finer print wants a smaller number.
+SHELL_THICKNESS: float = _float("TRELLIS2_SHELL_THICKNESS", 0.0375)
+
+# Cells along the longest side for the shell's lattice. Memory is about
+# (grid + wall)^3 x 12 bytes: 512 is 2.5 GB at the peak and 18 s; 1024 would be
+# eight times both. The wall is what limits the detail, not the grid.
+SHELL_GRID: int = _int("TRELLIS2_SHELL_GRID", 512)
+
+# Fill every enclosed pocket. Off leaves the model hollow wherever the
+# surface happened to enclose something, which a slicer treats as a cavity.
+SHELL_FILL_CAVITIES: bool = _bool("TRELLIS2_SHELL_FILL_CAVITIES", True)
+
 # Separate the touching sheets, cut what cannot be oriented, and close the
-# seams, so that the mesh is a closed orientable manifold. **This is what makes
+# seams, so that the mesh is a closed orientable manifold. **After the shell
+# this only separates surface-nets sheets that touch along an edge** and
+# closes nothing (measured 2026-09-12: `fan_area_fraction` 0.0). **This is what makes
 # `manifold3d` - and therefore forge's `repair_manifold` - accept it**:
 # measured 2026-09-12, `Error.NoError`, 1,517,778 triangles, genus 1207, where
 # without it manifold3d refuses and forge reports "repairing did not make this
