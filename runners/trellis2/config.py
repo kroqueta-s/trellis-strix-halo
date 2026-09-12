@@ -109,6 +109,39 @@ HEARTBEAT_SEC: float = _float("TRELLIS2_HEARTBEAT_SEC", 10.0)
 # pass; `metrics.vertex_colors` reports what it cost when it is on.
 VERTEX_COLORS: bool = _bool("TRELLIS2_VERTEX_COLORS", False)
 
+# Unwrap the surface and bake the colours into a texture map as well. **This is
+# a different thing from vertex colours**: the colour lives in an image, so its
+# resolution is the texture's rather than the mesh's, and detail finer than a
+# triangle survives. It needs the same texture checkpoints.
+#
+# **It produces a second mesh**, in `extra.textured_glb`. A UV atlas is bound to
+# the vertices it was built for, so the bake happens before `make_manifold`
+# rewrites them - `mesh_path` still holds the manifold geometry, and the GLB
+# holds the surface the texture was made for.
+TEXTURE: bool = _bool("TRELLIS2_TEXTURE", False)
+
+# The texture is this many pixels square. **The number that matters is texels
+# per triangle**: 2048 gives 4.19 M texels, which on a 1.5 M-face mesh is 2.8
+# per triangle - only 5.5x what the vertices already carried. The gain is real
+# after a heavier decimation, or at 4096 (16.8 M texels).
+TEXTURE_SIZE: int = _int("TRELLIS2_TEXTURE_SIZE", 2048)
+
+# Reduce to this many faces **before unwrapping**. The textured GLB is a thing
+# to look at; `mesh_path` is the thing to print, and it keeps every face.
+#
+# **This is what makes the unwrap affordable.** Measured 2026-09-12 on the mesh
+# at the bake point: 13.0 s at 100 k faces, 31.9 s at 200 k, and the full
+# 1.34 M was still running after ten minutes. The atlas is what carries the
+# detail here, not the triangles - 200 k faces under a 2048 texture is 21 texels
+# per triangle, against 2.8 at 1.5 M. 0 unwraps the mesh as it stands.
+TEXTURE_TARGET_FACES: int = _int("TRELLIS2_TEXTURE_TARGET_FACES", 200_000)
+
+# Rounds of spreading the colours past the edge of each chart. **Without it a
+# renderer filtering across a seam pulls in the empty background and draws a
+# black line along every cut.** 4 is enough for bilinear filtering at any
+# reasonable mip level; it stops early when nothing is left to fill.
+TEXTURE_DILATE: int = _int("TRELLIS2_TEXTURE_DILATE", 4)
+
 
 def texture_weights_present() -> bool:
     """Whether the pipeline description names a texture flow. **Reads no weights.**
