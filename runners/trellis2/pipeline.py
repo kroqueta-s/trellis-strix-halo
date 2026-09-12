@@ -30,8 +30,7 @@ import trimesh
 from PIL import Image
 
 from runners.trellis import close_holes as holes
-from runners.trellis import split_manifold
-from runners.trellis import postprocess, shims
+from runners.trellis import postprocess, shims, split_manifold
 from runners.trellis.steps import StepCounter, count_tqdm
 
 from . import config, texture
@@ -42,6 +41,8 @@ VERSION = "4B"
 _PIPELINE: Any = None
 _LOAD_SEC: float = 0.0
 _FAST_ATTENTION: bool = False
+# Whether the compiled mesh -> dual grid conversion loaded (native/o_voxel_cpu/).
+_NATIVE_O_VOXEL: bool = False
 # Counts whichever sampling loop is running. Rebound for each stage.
 _STEPS = StepCounter()
 
@@ -157,9 +158,16 @@ def _prepare_environment() -> None:
         if entry not in sys.path:
             sys.path.insert(0, entry)
 
-    global _FAST_ATTENTION
+    global _FAST_ATTENTION, _NATIVE_O_VOXEL
     _FAST_ATTENTION = shims.install(head_chunk=config.ATTN_HEAD_CHUNK)
     shims.install_trellis2(close_mesh=config.CLOSE_MESH)
+    # **Optional, and after the stand-in exists.** The compiled conversion is
+    # only there when the operator built it (native/o_voxel_cpu/).
+    _NATIVE_O_VOXEL = shims.install_o_voxel_cpu(config.NATIVE_DIR)
+    print(
+        f"[trellis2] o_voxel_cpu {'loaded' if _NATIVE_O_VOXEL else 'not built'}",
+        file=sys.stderr,
+    )
 
 
 def _adapt(pipeline: Any) -> None:

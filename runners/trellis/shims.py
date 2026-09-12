@@ -922,6 +922,40 @@ def install_o_voxel_hashmap() -> None:
     sys.modules["o_voxel._C"] = _make_o_voxel_c()
 
 
+def install_o_voxel_cpu(directory: str) -> bool:
+    """Add upstream's mesh -> dual grid conversion to the stand-in, **if it was built**.
+
+    `native/o_voxel_cpu/` compiles that one CPU function of o-voxel into a
+    module of its own (see its README). It is optional: nothing on the
+    image-to-mesh path needs it, and `texture_mesh` is what will. A missing
+    or unloadable module - Smart App Control refuses freshly built binaries,
+    sometimes once and sometimes for good - is reported and otherwise ignored,
+    so the runner never fails to start over an optional piece.
+
+    Returns:
+        Whether the conversion is now available on `o_voxel._C`.
+    """
+    if not directory:
+        return False
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
+    try:
+        import o_voxel_cpu  # type: ignore[import-not-found]
+    except Exception as exc:  # noqa: BLE001 - ImportError, OSError, or whatever the loader raises
+        print(
+            f"[shims] o_voxel_cpu is not loadable from {directory} "
+            f"({type(exc).__name__}: {exc}); texture_mesh stays unavailable",
+            file=sys.stderr,
+        )
+        return False
+    stand_in = sys.modules.get("o_voxel._C")
+    if stand_in is None:
+        install_o_voxel_hashmap()
+        stand_in = sys.modules["o_voxel._C"]
+    stand_in.mesh_to_flexible_dual_grid_cpu = o_voxel_cpu.mesh_to_flexible_dual_grid_cpu  # type: ignore[attr-defined]
+    return True
+
+
 def _flex_gemm_submanifold_conv3d(
     feats: torch.Tensor,
     coords: torch.Tensor,

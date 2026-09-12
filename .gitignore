@@ -8,3 +8,7 @@ __pycache__/
 # and carry the operator's environment and reasoning, which would mislead anyone
 # reading them as documentation. See the language rules in CLAUDE.md.
 docs/local/
+
+# Compiled modules and their build directories are bound to one torch build.
+native/o_voxel_cpu/build/
+*.pyd

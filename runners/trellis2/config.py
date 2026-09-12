@@ -52,6 +52,11 @@ WEIGHTS_DIR: Path = _path("TRELLIS2_WEIGHTS_DIR")
 # directories on this machine.
 PIPELINE_CONFIG: str = _str("TRELLIS2_PIPELINE_CONFIG", "pipeline.local.json")
 
+# Where `native/o_voxel_cpu/build.ps1` put the compiled mesh -> dual grid
+# conversion. **Optional**: empty means it was not built, and nothing on the
+# image-to-mesh path needs it. The runner says on stderr whether it loaded.
+NATIVE_DIR: str = _str("TRELLIS2_NATIVE_DIR", "")
+
 # Output resolution. **Measured 2026-09-11** on assets/sample.png: 512 takes
 # 49.6 s and 3.45 M faces, 1024 takes 209.3 s and 14.86 M faces, and asking for
 # 1536 gets 1408 back (upstream's own token limit) for 1602.6 s and 26.24 M
@@ -161,6 +166,7 @@ def texture_weights_present() -> bool:
     except (ValueError, KeyError, OSError):
         return False
     return any(name.startswith("tex_slat_flow_model") for name in models)
+
 
 # --- Post-processing -------------------------------------------------------
 # Decimate to this many faces **before anything else is done to the mesh**.
