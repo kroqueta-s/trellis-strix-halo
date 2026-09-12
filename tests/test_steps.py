@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: MIT
 """Verify the step counter (**a wrong count is worse than no count**).
 
 Progress that lies is worse than a heartbeat, so what is pinned here is the
