@@ -548,14 +548,23 @@ def _to_model_frame(vertices: np.ndarray, up_axis: str | None) -> np.ndarray:
     assumes a Y-up file; doing that to our own output would lay the model on
     its face. So the caller says which way is up and nothing is assumed.
 
+    **The axis is rotated into place, not swapped with Z.** Exchanging two
+    coordinates is a reflection: it mirrors the model and turns every face
+    inside out, which nothing downstream announces - the dual grid conversion
+    simply takes minutes instead of seconds on a mesh wound the wrong way
+    (measured 2026-09-12: 5.5 s became more than five minutes on the same
+    1.5 M-face mesh). Upstream rotates for the same reason when it writes a
+    Y-up GLB (`trellis2_texturing.py`), and this is that rotation inverted.
+
     The normalization is upstream's: centre the bounding box and scale the
     longest side to just under one, because the encoder's grid is the unit cube.
     """
     axis = (up_axis or "z").lower().lstrip("-")
+    x, y, z = vertices[:, 0], vertices[:, 1], vertices[:, 2]
     if axis == "x":
-        vertices = vertices[:, [2, 1, 0]]
+        vertices = np.column_stack([-z, y, x])
     elif axis == "y":
-        vertices = vertices[:, [0, 2, 1]]
+        vertices = np.column_stack([x, -z, y])
     elif axis != "z":
         raise ValueError(f"up_axis must be one of x, y, z (got {up_axis!r})")
 
