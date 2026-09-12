@@ -124,6 +124,28 @@ def test_make_manifold_produces_a_manifold() -> None:
     assert made.volume > 0, made.volume
 
 
+def test_the_copies_survive_being_welded_by_position() -> None:
+    """What leaves make_manifold stays manifold after merge_vertices().
+
+    forge's repair_manifold merges vertices by position first; copies left at
+    one position would be welded back and the junctions would return with
+    them (measured 2026-09-12: 14,231 copies, 20,163 non-manifold edges).
+    """
+    from runners.trellis.split_manifold import make_manifold
+
+    mesh = _two_boxes_touching_at_a_vertex()
+    made, _report = make_manifold(mesh)
+    welded = made.copy()
+    welded.merge_vertices()
+    _boundary, non_manifold = count_non_manifold(welded)
+    assert non_manifold == 0, non_manifold
+    assert welded.is_watertight
+    # And nothing that was not duplicated has moved.
+    tree = trimesh.proximity.ProximityQuery(mesh)
+    distance = np.abs(tree.vertex(made.vertices)[0])
+    assert float(distance.max()) < 1e-4 * float(np.ptp(mesh.vertices, axis=0).max())
+
+
 def main() -> int:
     """Run every test."""
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

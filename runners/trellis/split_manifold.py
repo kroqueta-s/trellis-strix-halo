@@ -200,8 +200,11 @@ def split_non_manifold(
     new_faces = labels.reshape(face_count, 3)
     if separation > 0:
         # Pull each copy a little towards the middle of the faces that kept it,
-        # so that copies of one original stop sharing a position.
+        # so that copies of one original stop sharing a position. **Only the
+        # copies move**: a vertex that was never duplicated stays exactly
+        # where it was.
         scale = separation * float(np.ptp(vertices, axis=0).max())
+        copies = np.bincount(group_vertex, minlength=len(vertices))[group_vertex] > 1
         centres = np.zeros_like(new_vertices)
         weights = np.zeros(len(new_vertices))
         for corner in range(3):
@@ -209,7 +212,8 @@ def split_non_manifold(
             np.add.at(weights, new_faces[:, corner], 1.0)
         direction = centres / np.maximum(weights, 1)[:, None] - new_vertices
         length = np.linalg.norm(direction, axis=1, keepdims=True)
-        new_vertices = new_vertices + scale * direction / np.maximum(length, 1e-12)
+        moved = new_vertices + scale * direction / np.maximum(length, 1e-12)
+        new_vertices = np.where(copies[:, None], moved, new_vertices)
 
     split = trimesh.Trimesh(vertices=new_vertices, faces=new_faces, process=False)
     boundary_after, non_manifold_after = count_non_manifold(split)
@@ -312,8 +316,21 @@ def orient_faces(
     }
 
 
-def make_manifold(mesh: trimesh.Trimesh) -> tuple[trimesh.Trimesh, dict[str, Any]]:
+def make_manifold(
+    mesh: trimesh.Trimesh, separation: float = 1e-5
+) -> tuple[trimesh.Trimesh, dict[str, Any]]:
     """Turn the decoder's surface into a closed, orientable, manifold one.
+
+    `separation` is how far each duplicated vertex is pulled towards its own
+    sheet, as a fraction of the longest side. **It must not be zero for a mesh
+    that leaves this process**: copies left at one position are welded back
+    together by anything that merges vertices by position - forge's
+    `repair_manifold` does so as its first step - and the junctions return
+    with them. Measured 2026-09-12 on the carved 512 specimen: 14,231
+    coincident copies became 20,163 non-manifold edges after
+    `merge_vertices()`, and `manifold3d` refused the result. At 1e-5 the copies
+    sit 0.5 % of a cell apart on a 512 lattice, far beyond trimesh's merge
+    tolerance of 1e-8, and invisibly close for any other purpose.
 
     Four steps, each one measured on the way past:
 
@@ -342,13 +359,13 @@ def make_manifold(mesh: trimesh.Trimesh) -> tuple[trimesh.Trimesh, dict[str, Any
     from .close_holes import close_holes
 
     report: dict[str, Any] = {"faces_in": int(len(mesh.faces))}
-    work, split_stats = split_non_manifold(mesh)
+    work, split_stats = split_non_manifold(mesh, separation=separation)
     report["split"] = split_stats.as_dict()
 
     cut = conflicting_edges(work)
     report["conflicting_edges"] = int(cut.sum())
     if cut.any():
-        work, second = split_non_manifold(work, cut=cut)
+        work, second = split_non_manifold(work, separation=separation, cut=cut)
         report["cut"] = second.as_dict()
 
     work, orient_stats = orient_faces(work)
