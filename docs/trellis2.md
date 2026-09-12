@@ -195,6 +195,24 @@ decimation 2.7 s, debris 1.5 s (71,473 parts), holes 1.3 s, **carving
 **25 s of post-processing**, against 80 s before this work, for a mesh that
 is watertight, edge-manifold, consistently wound and 0.0423 in volume.
 
+**And it stays that way downstream.** meshforge's `prepare_mesh` starts by
+welding vertices by position, dropping degenerate faces and dropping
+duplicate faces, and the first carved meshes came out of it "not watertight"
+although the runner had reported them so: coincident vertices (surface nets
+placing crossings on lattice corners, split copies left at one point) and
+isolated two-face pillows did not survive the welding. `make_manifold` now
+keeps every copy 1e-5 of the longest side apart, the crossings sit a quarter
+of the way along their edges, and pillows are dropped whole — measured
+through `forge.prepare_mesh` at 80 mm:
+
+| Resolution | Runner post-processing | forge repair | Watertight | Size (mm) | Faces |
+|---|--:|--:|---|---|--:|
+| 512 | 27 s | 36 s | yes, no warnings | 80.0 × 36.7 × 65.8 | 1,516,508 |
+| 1024 (generation 157 s) | 37 s | 354 s | yes, no warnings | 80.0 × 37.9 × 67.2 | 1,595,448 |
+
+The 1024 repair is `manifold3d`'s decompose-and-union on 1.6 M faces, on
+forge's side; the runner's own part is the 37 s.
+
 `TRELLIS2_SHELL_MODE=band` is the older construction: every point within
 half of `TRELLIS2_SHELL_THICKNESS` of the surface is solid, which guarantees a
 wall thickness (0.0375 is 3 mm on an 80 mm print) but grows the silhouette by
