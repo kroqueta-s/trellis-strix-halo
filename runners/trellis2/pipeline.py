@@ -20,7 +20,7 @@ import gc
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -483,9 +483,14 @@ def generate_mesh(
     # minutes, and a caller watching for liveness cannot tell a long stage from
     # a stuck one: the switch test gave up on exactly this gap (2026-09-12).
     query = _colour_query(voxels, pipeline, target) if voxels is not None else None
+    bake_query = (
+        _colour_query(voxels, pipeline, target, PBR_CHANNELS)
+        if voxels is not None and want_texture
+        else None
+    )
     with _DeviceWatch(progress=progress, stage="postprocess"):
         mesh, post, textured, bake_report = _postprocess(
-            mesh, progress, target_faces, query if want_texture else None, atlas
+            mesh, progress, target_faces, bake_query, atlas
         )
 
         colors: dict[str, Any] = {"enabled": bool(want_colors)}
@@ -494,7 +499,7 @@ def generate_mesh(
             say("vertex_colors", f"colouring {len(mesh.vertices):,} vertices")
             mesh, colors = _apply_vertex_colors(mesh, query)
             colors["sec"] = round(time.perf_counter() - mark, 2)
-        del voxels, query
+        del voxels, query, bake_query
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -688,7 +693,12 @@ def texture_mesh(
             say("texture", f"charting and baking a {atlas}x{atlas} texture")
             budget = int(config.TEXTURE_TARGET_FACES)
             surface = decimate(mesh, budget) if 0 < budget < len(mesh.faces) else mesh
-            textured, bake_report = texture.bake(surface, query, atlas, config.TEXTURE_DILATE)
+            textured, bake_report = texture.bake(
+                surface,
+                _colour_query(voxels, pipeline, target, PBR_CHANNELS),
+                atlas,
+                config.TEXTURE_DILATE,
+            )
             bake_report["enabled"] = True
             stages["texture_sec"] = time.perf_counter() - mark
     del voxels, query
@@ -767,7 +777,18 @@ def _sample_texture(pipeline: Any, cond: dict[str, Any], slat: Any, target: int)
     )
 
 
-def _colour_query(voxels: Any, pipeline: Any, resolution: int) -> Callable[..., torch.Tensor]:
+# What the bake carries into the GLB, in the order the atlas stores it. **The
+# names are upstream's** (`pipeline.pbr_attr_layout`), so nothing here has to
+# know what a channel means or how many there are.
+PBR_CHANNELS = ("base_color", "metallic", "roughness", "alpha")
+
+
+def _colour_query(
+    voxels: Any,
+    pipeline: Any,
+    resolution: int,
+    names: Sequence[str] = ("base_color",),
+) -> Callable[..., torch.Tensor]:
     """A function from positions to base colour. **The one place either path asks.**
 
     The texture decoder produces an attribute vector per active voxel, and a
@@ -781,11 +802,14 @@ def _colour_query(voxels: Any, pipeline: Any, resolution: int) -> Callable[..., 
     about a texel's position, which lies on a triangle rather than at a vertex.
 
     The attributes carry metallic, roughness and alpha as well
-    (`pipeline.pbr_attr_layout`). **Only the base colour is kept**: neither a
-    PLY nor a plain glTF texture has anywhere to put the rest, and inventing a
-    place for it would be guessing at what a caller wants.
+    (`pipeline.pbr_attr_layout`), and `names` says which of them the caller
+    wants, in the order it wants them. **A PLY has nowhere to put anything but
+    the colour**, so the vertex-colour path asks for that alone; a glTF has a
+    place for all four, so the bake asks for all four (`PBR_CHANNELS`). The
+    extra channels ride the same trilinear sample and cost nothing.
     """
-    base = pipeline.pbr_attr_layout["base_color"]
+    layout = pipeline.pbr_attr_layout
+    wanted = [layout[name] for name in names]
     shape = torch.Size([*voxels.shape, *voxels.spatial_shape])
     # `origin` is -0.5 and `voxel_size` is 1/resolution, as upstream sets them
     # in `decode_latent`, so this is the same mapping into voxel units.
@@ -795,7 +819,7 @@ def _colour_query(voxels: Any, pipeline: Any, resolution: int) -> Callable[..., 
         with torch.no_grad():
             grid = ((points.to(voxels.feats.device) + 0.5) * scale).reshape(1, -1, 3)
             attrs = shims._grid_sample_3d(voxels.feats, voxels.coords, shape, grid)[0]
-        return attrs[:, base].clamp(0, 1).float()
+        return torch.cat([attrs[:, part] for part in wanted], dim=1).clamp(0, 1).float()
 
     return query
 

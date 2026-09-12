@@ -282,15 +282,26 @@ while it is needed. What it costs instead is loading — **63–65 s against
 (`install-trellis2.ps1 -WithTexture`). The geometry is unchanged: 9,273,134
 faces before decimation either way, and the same topology afterwards.
 
-**1,161 vertices of 755,968 (0.15 %) came back black** at 1024, 511 of 738,847
-(0.07 %) at 512 — the ones no active voxel surrounds, which cannot be
-interpolated from anything. `metrics.vertex_colors.unreached_vertices` counts
-them every run, because a model that is black because the texture stage failed
-and one that is black because it is black look identical otherwise.
+**The colours reach the decoder's own mesh and not much else.** A vertex no
+active voxel surrounds cannot be interpolated from anything and comes back
+black; on the mesh as the decoder extracted it that was 1,161 of 755,968
+(0.15 %) at 1024 and 511 of 738,847 (0.07 %) at 512. **On the carved solid it
+is 390,100 of 750,214 (52 %) at 1024 and 91,935 of 754,118 (12 %) at 512**
+(measured 2026-09-12). The carve makes a new surface out of a lattice, up to a
+cell away from the one the decoder drew, and a cell of the 512 lattice is two
+voxels wide at a 1024 decode - outside the eight that a trilinear sample reads.
+Carving on a 1024 lattice does not fix it (51.9 %): the finer carve moves the
+surface somewhere else again.
 
-Only the base colour is kept. The decoder also produces metallic, roughness and
-alpha (`pipeline.pbr_attr_layout`), and a PLY has nowhere to put them.
-`tools/render_mesh.py --color` draws what came out.
+`metrics.vertex_colors.unreached_vertices` counts them every run, because a
+model that is black because the texture stage failed and one that is black
+because it is black look identical otherwise. `tools/render_mesh.py --color`
+draws what came out; at 512 the black areas are the tracks and dark panels,
+which are black in the image too, and at 1024 they are mottled over the whole
+model.
+
+A PLY carries the base colour alone, because it has nowhere to put the rest;
+the GLB carries all four (below).
 
 ### A texture map
 
@@ -354,6 +365,22 @@ because the packer mirrors whole charts and a sliver's orientation does not
 survive its float32 rounding). Charts 2,105 → 2,178, faces in charts of
 fifty or more 95.5 % → 95.4 %. `metrics.texture` reports `folds_moved`,
 `folds_own_chart` and `folded_faces`.
+
+**Metallic, roughness and alpha ride along.** The decoder produces all four
+attributes per voxel (`pipeline.pbr_attr_layout`) and they come out of the same
+trilinear sample as the colour, so carrying them costs the bake 0.06 s of 3.63
+(measured 2026-09-12 at 512). glTF has a place for each: the alpha is the base
+colour texture's fourth channel, and a second texture holds roughness in green
+and metallic in blue. The material is `OPAQUE` even so - the decoder's alpha is
+material information, and a viewer that blended on it would put holes in a mesh
+meant to be printed.
+
+**A texel the decoder never saw is counted, not filled.** `texels_black` is the
+covered texels whose colour came back exactly zero - the same test the vertex
+colours use - and `texels_black_after_dilate` says what the dilation did about
+them, which is nothing: it fills texels no face wrote, and these were written.
+Measured 2026-09-12 at 512: 221,065 of 2,262,652 covered texels (9.8 %), all
+still there afterwards. At 1024 it is 44 %, for the reason under Vertex colours.
 
 The bake runs **after the carve and before the manifold conversion**, on a mesh
 decimated to `TRELLIS2_TEXTURE_TARGET_FACES` (200,000). The textured GLB is
