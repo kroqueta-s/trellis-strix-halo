@@ -34,7 +34,7 @@ from runners.trellis import split_manifold
 from runners.trellis import postprocess, shims
 from runners.trellis.steps import StepCounter, count_tqdm
 
-from . import config
+from . import config, texture
 
 NAME = "trellis2"
 VERSION = "4B"
@@ -259,6 +259,11 @@ class MeshResult:
     post: dict[str, Any] = field(default_factory=dict)
     topology: dict[str, Any] = field(default_factory=dict)
     vertex_colors: dict[str, Any] = field(default_factory=dict)
+    # **The textured mesh is a different mesh.** Its atlas is built before the
+    # manifold conversion, so it carries that stage's geometry rather than the
+    # one `mesh` ends up with. `None` when no texture was asked for.
+    textured: trimesh.Trimesh | None = None
+    texture: dict[str, Any] = field(default_factory=dict)
 
 
 def _sampler_params(steps: int, guidance: float) -> dict[str, Any]:
@@ -296,6 +301,8 @@ def generate_mesh(
     max_tokens: int | None = None,
     target_faces: int | None = None,
     vertex_colors: bool | None = None,
+    texture: bool | None = None,
+    texture_size: int | None = None,
     progress: Callable[..., None] | None = None,
 ) -> MeshResult:
     """Generate one mesh from one image.
@@ -310,7 +317,12 @@ def generate_mesh(
     pipeline = load_pipeline(progress)
     target = int(resolution or config.RESOLUTION)
     tokens = int(max_tokens or config.MAX_TOKENS)
+    want_texture = config.TEXTURE if texture is None else bool(texture)
     want_colors = config.VERTEX_COLORS if vertex_colors is None else bool(vertex_colors)
+    # **Both read the same voxels**, so asking for a texture is enough to make
+    # the texture stage run; the vertex colours are then nearly free.
+    want_voxels = want_colors or want_texture
+    atlas = int(texture_size or config.TEXTURE_SIZE)
 
     def say(stage: str, message: str) -> None:
         if progress is not None:
@@ -378,7 +390,7 @@ def generate_mesh(
             stages["decode_sec"] = time.perf_counter() - mark
 
             voxels = None
-            if want_colors:
+            if want_voxels:
                 watch.stage = "tex_slat"
                 say("tex_slat", "sampling the texture latent")
                 _STEPS.bind(progress, "tex_slat", "sampling the texture latent")
@@ -407,18 +419,21 @@ def generate_mesh(
     # **The post-processing needs a heartbeat too.** At 1024 it runs for
     # minutes, and a caller watching for liveness cannot tell a long stage from
     # a stuck one: the switch test gave up on exactly this gap (2026-09-12).
+    query = _colour_query(voxels, pipeline, target) if voxels is not None else None
     with _DeviceWatch(progress=progress, stage="postprocess"):
-        mesh, post = _postprocess(mesh, progress, target_faces)
+        mesh, post, textured, bake_report = _postprocess(
+            mesh, progress, target_faces, query if want_texture else None, atlas
+        )
 
         colors: dict[str, Any] = {"enabled": bool(want_colors)}
-        if voxels is not None:
+        if voxels is not None and want_colors:
             mark = time.perf_counter()
             say("vertex_colors", f"colouring {len(mesh.vertices):,} vertices")
-            mesh, colors = _apply_vertex_colors(mesh, voxels, pipeline, target)
+            mesh, colors = _apply_vertex_colors(mesh, query)
             colors["sec"] = round(time.perf_counter() - mark, 2)
-            del voxels
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        del voxels, query
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return MeshResult(
         mesh=mesh,
@@ -434,6 +449,8 @@ def generate_mesh(
         post=post,
         topology=_topology(mesh),
         vertex_colors=colors,
+        textured=textured,
+        texture=bake_report,
     )
 
 
@@ -494,38 +511,52 @@ def _sample_texture(pipeline: Any, cond: dict[str, Any], slat: Any, target: int)
     )
 
 
+def _colour_query(voxels: Any, pipeline: Any, resolution: int) -> Callable[..., torch.Tensor]:
+    """A function from positions to base colour. **The one place either path asks.**
+
+    The texture decoder produces an attribute vector per active voxel, and a
+    point in space is trilinearly interpolated from the eight around it. That
+    the colour follows the *position* rather than the surface is the whole
+    reason both the vertex colours and the bake can run wherever they like in
+    the post-processing chain.
+
+    Upstream reaches the same sampler through `MeshWithVoxel.query_attrs`; this
+    calls it directly, because the bake has no mesh to hang it on - it asks
+    about a texel's position, which lies on a triangle rather than at a vertex.
+
+    The attributes carry metallic, roughness and alpha as well
+    (`pipeline.pbr_attr_layout`). **Only the base colour is kept**: neither a
+    PLY nor a plain glTF texture has anywhere to put the rest, and inventing a
+    place for it would be guessing at what a caller wants.
+    """
+    base = pipeline.pbr_attr_layout["base_color"]
+    shape = torch.Size([*voxels.shape, *voxels.spatial_shape])
+    # `origin` is -0.5 and `voxel_size` is 1/resolution, as upstream sets them
+    # in `decode_latent`, so this is the same mapping into voxel units.
+    scale = float(resolution)
+
+    def query(points: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            grid = ((points.to(voxels.feats.device) + 0.5) * scale).reshape(1, -1, 3)
+            attrs = shims._grid_sample_3d(voxels.feats, voxels.coords, shape, grid)[0]
+        return attrs[:, base].clamp(0, 1).float()
+
+    return query
+
+
 def _apply_vertex_colors(
-    mesh: trimesh.Trimesh, voxels: Any, pipeline: Any, resolution: int
+    mesh: trimesh.Trimesh, query: Callable[..., torch.Tensor]
 ) -> tuple[trimesh.Trimesh, dict[str, Any]]:
     """Carry the decoded voxel colours onto the mesh's vertices.
 
-    **This runs after the post-processing, not before.** The colour of a point
-    is interpolated from the voxels around it, so it does not care which mesh
-    the point belongs to: decimation, hole closing and manifolding can all
-    rewrite the vertices first and the colours still land. A UV layout could not
-    survive any of those.
-
-    The attributes carry metallic, roughness and alpha as well
-    (`pipeline.pbr_attr_layout`). **Only the base colour is kept** - a PLY has
-    nowhere to put the rest, and inventing a place for it would be guessing at
-    what a caller wants.
+    **This runs after the post-processing, not before.** Decimation, hole
+    closing and manifolding can all rewrite the vertices first and the colours
+    still land, because `_colour_query` asks about a position. A UV layout could
+    not survive any of those, which is why `texture.bake` runs earlier instead.
     """
-    from trellis2.representations import MeshWithVoxel
-
-    vertices = torch.as_tensor(mesh.vertices, dtype=torch.float32, device=voxels.feats.device)
-    with torch.no_grad():
-        attrs = MeshWithVoxel(
-            vertices,
-            torch.as_tensor(mesh.faces, dtype=torch.int32, device=vertices.device),
-            origin=[-0.5, -0.5, -0.5],
-            voxel_size=1 / resolution,
-            coords=voxels.coords[:, 1:],
-            attrs=voxels.feats,
-            voxel_shape=torch.Size([*voxels.shape, *voxels.spatial_shape]),
-            layout=pipeline.pbr_attr_layout,
-        ).query_vertex_attrs()
-
-    base = attrs[:, pipeline.pbr_attr_layout["base_color"]].clamp(0, 1)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    vertices = torch.as_tensor(mesh.vertices, dtype=torch.float32, device=device)
+    base = query(vertices)
     rgb = (base.float().cpu().numpy() * 255).round().astype(np.uint8)
     opaque = np.full((rgb.shape[0], 1), 255, dtype=np.uint8)
     rgba = np.concatenate([rgb, opaque], axis=1)
@@ -534,11 +565,10 @@ def _apply_vertex_colors(
     # nothing around it to interpolate. Counting them says how much of the mesh
     # the texture decoder never saw, which is the only way to tell a black model
     # from a failed one.
-    unreached = int((attrs.abs().sum(dim=1) == 0).sum())
+    unreached = int((base.abs().sum(dim=1) == 0).sum())
     return mesh, {
         "enabled": True,
         "n_vertices": int(len(mesh.vertices)),
-        "n_voxels": int(voxels.coords.shape[0]),
         "unreached_vertices": unreached,
         "mean_rgb": [round(float(v), 4) for v in base.float().mean(dim=0).tolist()],
     }
@@ -570,7 +600,9 @@ def _postprocess(
     mesh: trimesh.Trimesh,
     progress: Callable[..., None] | None,
     target_faces: int | None = None,
-) -> tuple[trimesh.Trimesh, dict[str, Any]]:
+    bake_query: Callable[..., torch.Tensor] | None = None,
+    texture_size: int = 2048,
+) -> tuple[trimesh.Trimesh, dict[str, Any], trimesh.Trimesh | None, dict[str, Any]]:
     """Drop the debris and close the holes. **The visibility pass is not used.**
 
     Upstream's visibility test plus min-cut - the one the TRELLIS.1 runner
@@ -621,6 +653,30 @@ def _postprocess(
         report.update(stats.as_dict())
         report["close_holes_sec"] = round(time.perf_counter() - mark, 2)
 
+    # **The bake goes here, and the position is the whole design.** A UV atlas
+    # belongs to the vertices and faces it was built for, so it has to be made
+    # after everything that rewrites them and before anything else does. What
+    # comes next is `make_manifold`, which adds patch worth 2.2-2.5x the input
+    # surface area (measured 2026-09-12): an atlas built after it would spend
+    # about 69% of its texels on internal membrane nobody ever sees.
+    textured: trimesh.Trimesh | None = None
+    bake_report: dict[str, Any] = {"enabled": bake_query is not None}
+    if bake_query is not None:
+        mark = time.perf_counter()
+        if progress is not None:
+            progress("texture", f"unwrapping and baking a {texture_size}x{texture_size} texture")
+        # **A coarser mesh than the one that gets printed**, because the
+        # unwrap - not the bake - is what costs, and the texture carries the
+        # detail the triangles no longer do.
+        target = int(config.TEXTURE_TARGET_FACES)
+        surface = decimate(mesh, target) if 0 < target < len(mesh.faces) else mesh
+        textured, bake_report = texture.bake(
+            surface, bake_query, texture_size, config.TEXTURE_DILATE
+        )
+        bake_report["faces"] = int(len(surface.faces))
+        bake_report["enabled"] = True
+        report["texture_sec"] = round(time.perf_counter() - mark, 2)
+
     if config.MAKE_MANIFOLD:
         mark = time.perf_counter()
         if progress is not None:
@@ -630,7 +686,7 @@ def _postprocess(
         report["manifold_sec"] = round(time.perf_counter() - mark, 2)
 
     report["faces_after"] = int(len(mesh.faces))
-    return mesh, report
+    return mesh, report, textured, bake_report
 
 
 def drop_debris(

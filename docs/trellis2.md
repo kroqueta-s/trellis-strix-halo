@@ -177,6 +177,45 @@ Only the base colour is kept. The decoder also produces metallic, roughness and
 alpha (`pipeline.pbr_attr_layout`), and a PLY has nowhere to put them.
 `tools/render_mesh.py --color` draws what came out.
 
+### A texture map
+
+`TRELLIS2_TEXTURE=on` bakes the same colours into a UV map as well, and writes
+it as a second mesh at `extra.textured_glb`. **Unwrapping is xatlas and the bake
+is 40 lines of barycentric arithmetic in UV space** — an atlas's triangles do
+not overlap, so there is no depth test and no need for `nvdiffrast`.
+
+It runs **before `make_manifold`**, because an atlas belongs to the vertices it
+was built for and that stage replaces them. So the two outputs are different
+meshes: the PLY is the watertight one to print, the GLB is the one to look at.
+
+Measured on the mecha at 512:
+
+| Stage | Seconds |
+|---|--:|
+| Unwrap (200,000 faces, in a child process) | **34.4** |
+| Bake into a 2048² texture | **0.25** |
+
+**The unwrap is the whole cost, and it grows brutally with the face count**:
+13.0 s at 100 k, 31.9 s at 200 k, and the full 1.34 M mesh was still running
+after ten minutes. `TRELLIS2_TEXTURE_TARGET_FACES` (default 200,000) is what
+keeps it affordable; the texture carries the detail the triangles no longer do.
+
+**Two things about it are worth knowing before turning it on.**
+
+*It runs in a child process*, because `xatlas.parametrize` holds the GIL for its
+whole run and would otherwise stop the heartbeat — measured at ten minutes of
+silence, which a caller watching for liveness reads as a stall.
+
+*The atlas comes out shattered.* This surface has no large flat regions for
+xatlas to grow charts over, so it produces **35,697 charts from 200,000 faces**
+— about five triangles each — and duplicates the vertices **3.1×**. Coverage is
+43.8 %. The colours are right and the largest charts carry readable markings,
+but **detail finer than a chart still breaks across a seam**, which is the one
+thing a texture map was supposed to buy over vertex colours. Tuning does not
+help: a relaxed chart search gave the same chart count in 13.8 s against 14.8 s,
+and the packer's resolution changed the time by 12 % and the charts not at all.
+**What this needs is a retopology first**, and that is not in this repository.
+
 ## Gotchas
 
 **The published checkpoints are `flex_gemm`-shaped.** Every sparse convolution
@@ -229,9 +268,9 @@ Read-only preset is enough.
 
 ## Limits
 
-- **No texture map.** Colour reaches the vertices (see below) but not a UV
-  atlas: that needs unwrapping (`xatlas` can do it rather than CuMesh) and a
-  bake, and neither is implemented here.
+- **The texture map is not worth turning on yet.** It works and it is measured
+  (see above), but the atlas shatters into ~5-triangle charts on this surface,
+  so it buys little over vertex colours. Both are off by default.
 - **What the decoder produces is neither closed nor orientable.** Its flags say
   which grid edges the surface crosses, and **about 5 % of the primal faces
   carry an odd number of crossings** (4.99 % at 512, 5.02 % at 1024, measured as

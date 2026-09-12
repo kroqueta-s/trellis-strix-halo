@@ -80,13 +80,15 @@ def m_capabilities(params: dict[str, Any], progress: Any) -> dict[str, Any]:
             "image_to_mesh": True,
             "text_to_mesh": False,
             "multi_image_to_mesh": False,
-            # **A texture map is not implemented**: that needs UV unwrapping
-            # (xatlas can do it) and a bake, neither of which is here.
-            "texture": False,
+
             # **Colours per vertex are.** The texture flow and its decoder run,
             # and every vertex is interpolated from the voxels around it - so
             # this survives the post-processing, where a UV layout would not.
             "vertex_colors": config.texture_weights_present(),
+            # **A texture map, baked into a GLB beside the PLY.** Not
+            # `texture_mesh`: that method takes a mesh from anywhere, and this
+            # one only textures what it just generated.
+            "texture": config.texture_weights_present(),
         },
         "params": {
             "resolution": {
@@ -107,6 +109,14 @@ def m_capabilities(params: dict[str, Any], progress: Any) -> dict[str, Any]:
                 "type": "bool",
                 "default": config.VERTEX_COLORS and config.texture_weights_present(),
             },
+            # **Costs the same texture flow as vertex colours, plus the bake.**
+            # The result is a second mesh, because the atlas cannot survive the
+            # manifold conversion that `mesh_path` goes through.
+            "texture": {
+                "type": "bool",
+                "default": config.TEXTURE and config.texture_weights_present(),
+            },
+            "texture_size": {"type": "int", "default": config.TEXTURE_SIZE, "min": 256},
         },
         "notes": (
             "spconv, flash_attn, o_voxel's hashmap and flex_gemm's sparse convolution and "
@@ -116,9 +126,12 @@ def m_capabilities(params: dict[str, Any], progress: Any) -> dict[str, Any]:
             "2x2 loops are odd at 512), the boundary loops are closed here, and what is left "
             "is the boundary non-manifold edges make. The winding is inconsistent by "
             "construction and is left that way, because correcting it costs more than the "
-            "generation - see metrics.topology. Z-up, normalized scale. **No texture map**; "
-            "with vertex_colors the texture flow runs and its colours are carried onto the "
-            "vertices, which survives decimation and hole closing. "
+            "generation - see metrics.topology. Z-up, normalized scale. "
+            "**vertex_colors** runs the texture flow and carries its colours onto the "
+            "vertices, which survives every later step because it follows position. "
+            "**texture** bakes the same colours into a UV map instead, and because an "
+            "atlas cannot survive make_manifold it writes a **second** mesh at "
+            "extra.textured_glb - the surface as it was before the manifold conversion. "
             "Asking for 1536 yields 1408: upstream applies its own token limit."
         ),
     }
@@ -143,7 +156,17 @@ def m_unload(params: dict[str, Any], progress: Any) -> dict[str, Any]:
     return {"unloaded": freed, "vram_used_gb": round(used_gb, 2)}
 
 
-_ALLOWED = frozenset({"resolution", "max_tokens", "seed", "target_faces", "vertex_colors"})
+_ALLOWED = frozenset(
+    {
+        "resolution",
+        "max_tokens",
+        "seed",
+        "target_faces",
+        "vertex_colors",
+        "texture",
+        "texture_size",
+    }
+)
 
 
 def m_image_to_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
@@ -181,6 +204,8 @@ def m_image_to_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
         max_tokens=int(params["max_tokens"]) if params.get("max_tokens") else None,
         target_faces=int(params["target_faces"]) if "target_faces" in params else None,
         vertex_colors=bool(params["vertex_colors"]) if "vertex_colors" in params else None,
+        texture=bool(params["texture"]) if "texture" in params else None,
+        texture_size=int(params["texture_size"]) if params.get("texture_size") else None,
         progress=progress,
     )
 
@@ -193,6 +218,19 @@ def m_image_to_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
     staging = out_dir / "raw.ply.part"
     result.mesh.export(str(staging), file_type="ply")
     os.replace(staging, mesh_path)
+
+    # **A second mesh, because a texture cannot follow the first one.** The
+    # atlas was built before `make_manifold` replaced the vertices, so this is
+    # the surface the texture belongs to - the PLY is still the geometry.
+    # A GLB is one file, so the same write-then-rename works (contract §9);
+    # an .obj with its .mtl and its image would need a directory renamed.
+    extra: dict[str, Any] = {}
+    if result.textured is not None:
+        glb_path = out_dir / "textured.glb"
+        staging = out_dir / "textured.glb.part"
+        result.textured.export(str(staging), file_type="glb")
+        os.replace(staging, glb_path)
+        extra["textured_glb"] = str(glb_path)
 
     return {
         "mesh_path": str(mesh_path),
@@ -223,7 +261,13 @@ def m_image_to_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
             # texture decoder reached.** A vertex no active voxel surrounds
             # comes back black, and that is worth counting rather than hiding.
             "vertex_colors": result.vertex_colors,
+            # **What the bake covered.** An atlas is only worth its cost when
+            # it carries more samples than the vertices did, so the texel count
+            # and the coverage are reported rather than assumed.
+            "texture": result.texture,
         },
+        # **Whatever else this run produced**, passed through by hearth untouched.
+        "extra": extra,
         # **Up was checked; forward was not** (contract §5). A mesh imported on
         # the wrong horizontal axis renders perfectly correctly, so nobody finds
         # that mistake by looking - the first sign is a mirrored joint on a
@@ -237,6 +281,8 @@ def m_image_to_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
             # otherwise - and 0 when nothing was decimated.
             "target_faces": result.post.get("decimate_to", 0),
             "vertex_colors": bool(result.vertex_colors.get("enabled")),
+            "texture": bool(result.texture.get("enabled")),
+            "texture_size": int(result.texture.get("texture_size") or config.TEXTURE_SIZE),
         },
     }
 
