@@ -89,6 +89,14 @@ def m_capabilities(params: dict[str, Any], progress: Any) -> dict[str, Any]:
             # `texture_mesh`: that method takes a mesh from anywhere, and this
             # one only textures what it just generated.
             "texture": config.texture_weights_present(),
+            # **A mesh from anywhere, coloured.** It needs the shape encoder's
+            # weights and the compiled dual-grid conversion on top of the usual
+            # set, so all three are checked - without loading any of them.
+            "texture_mesh": (
+                config.texture_weights_present()
+                and config.encoder_weights_present()
+                and config.native_o_voxel_present()
+            ),
         },
         "params": {
             "resolution": {
@@ -118,6 +126,20 @@ def m_capabilities(params: dict[str, Any], progress: Any) -> dict[str, Any]:
             },
             "texture_size": {"type": "int", "default": config.TEXTURE_SIZE, "min": 256},
         },
+        "method_params": {
+            # **`texture_mesh` is not `image_to_mesh` with a flag** (contract
+            # §3): it takes a mesh from anywhere, so its settings are its own.
+            # `up_axis` is here because nothing may assume it - this runner's
+            # own output is Z-up, while upstream's preprocessing assumes Y-up.
+            "texture_mesh": {
+                "resolution": {"type": "int", "default": config.RESOLUTION, "min": 512},
+                "seed": {"type": "int", "default": 0, "min": 0},
+                "up_axis": {"type": "str", "default": "z"},
+                "vertex_colors": {"type": "bool", "default": config.VERTEX_COLORS},
+                "texture": {"type": "bool", "default": config.TEXTURE},
+                "texture_size": {"type": "int", "default": config.TEXTURE_SIZE, "min": 256},
+            },
+        },
         "notes": (
             "spconv, flash_attn, o_voxel's hashmap and flex_gemm's sparse convolution and "
             "grid sampling are replaced by pure-torch launch-time shims (no build exists for "
@@ -131,7 +153,10 @@ def m_capabilities(params: dict[str, Any], progress: Any) -> dict[str, Any]:
             "vertices, which survives every later step because it follows position. "
             "**texture** bakes the same colours into a UV map instead, and because an "
             "atlas cannot survive make_manifold it writes a **second** mesh at "
-            "extra.textured_glb - the surface as it was before the manifold conversion. "
+            "extra.textured_glb - the surface it was baked from, which is coarser than "
+            "mesh_path. **texture_mesh** puts the same colours on a mesh from anywhere "
+            "without touching its geometry; it needs the shape encoder's weights and the "
+            "compiled o_voxel_cpu, and it asks for up_axis rather than assuming one. "
             "Asking for 1536 yields 1408: upstream applies its own token limit."
         ),
     }
@@ -287,11 +312,109 @@ def m_image_to_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
     }
 
 
+_TEXTURE_MESH_ALLOWED = frozenset(
+    {"resolution", "seed", "up_axis", "vertex_colors", "texture", "texture_size"}
+)
+
+
+def m_texture_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
+    """An existing mesh plus a reference image, to a coloured mesh.
+
+    **The geometry is not touched.** The mesh is turned back into the latent the
+    texture flow conditions on, and the same flow and decoder run as in
+    `image_to_mesh`. The mesh can come from anywhere - this runner's own output,
+    another model's, or one made by hand.
+
+    **`up_axis` is asked for rather than assumed.** Upstream's own preprocessing
+    swaps Y and Z because it assumes a Y-up file; applied to this runner's
+    output, which is Z-up, that lays the model on its face. The default is `z`,
+    which is what `image_to_mesh` reports.
+    """
+    from PIL import Image
+
+    from . import pipeline
+
+    mesh_path = Path(str(params["mesh_path"]))
+    image_path = Path(str(params["image_path"]))
+    out_dir = Path(str(params["out_dir"]))
+    for name, path in (("mesh", mesh_path), ("image", image_path)):
+        if not path.is_file():
+            raise FileNotFoundError(f"input {name} not found: {path}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    consumed = {"mesh_path", "image_path", "out_dir"}
+    unknown = set(params) - _TEXTURE_MESH_ALLOWED - consumed
+    if unknown:
+        raise ValueError(
+            f"unknown parameters: {sorted(unknown)} "
+            f"(accepted: {sorted(_TEXTURE_MESH_ALLOWED)})"
+        )
+
+    progress("texture_mesh", "colouring a mesh that was handed in")
+    result = pipeline.texture_mesh(
+        str(mesh_path),
+        Image.open(image_path),
+        resolution=int(params["resolution"]) if params.get("resolution") else None,
+        seed=int(params.get("seed", 0)),
+        up_axis=str(params["up_axis"]) if params.get("up_axis") else None,
+        vertex_colors=bool(params["vertex_colors"]) if "vertex_colors" in params else None,
+        texture_on=bool(params["texture"]) if "texture" in params else None,
+        texture_size=int(params["texture_size"]) if params.get("texture_size") else None,
+        progress=progress,
+    )
+
+    progress("export", "writing the mesh")
+    coloured = out_dir / "textured.ply"
+    staging = out_dir / "textured.ply.part"
+    result.mesh.export(str(staging), file_type="ply")
+    os.replace(staging, coloured)
+
+    extra: dict[str, Any] = {}
+    if result.textured is not None:
+        glb_path = out_dir / "textured.glb"
+        staging = out_dir / "textured.glb.part"
+        result.textured.export(str(staging), file_type="glb")
+        os.replace(staging, glb_path)
+        extra["textured_glb"] = str(glb_path)
+
+    return {
+        "mesh_path": str(coloured),
+        "n_vertices": int(len(result.mesh.vertices)),
+        "n_faces": int(len(result.mesh.faces)),
+        "metrics": {
+            "load_sec": round(result.load_sec, 2),
+            # **Never use this as a pass/fail signal** (contract §5).
+            "elapsed_sec": round(result.elapsed_sec, 2),
+            "vram_peak_gb": round(result.vram_peak_gb, 2),
+            "vram_over": result.vram_over,
+            "blas_backend": pipeline.blas_backend(),
+            "resolution": result.resolution,
+            **result.stages,
+            "vertex_colors": result.vertex_colors,
+            "texture": result.texture,
+        },
+        "extra": extra,
+        # **The mesh comes back in the frame it went in as**, normalized to the
+        # unit cube: the geometry is untouched apart from that scaling.
+        "up_axis": "z",
+        "forward_axis": None,
+        "params_used": {
+            "resolution": result.resolution,
+            "seed": result.seed,
+            "up_axis": str(params.get("up_axis") or "z"),
+            "vertex_colors": bool(result.vertex_colors.get("enabled")),
+            "texture": bool(result.texture.get("enabled")),
+            "texture_size": int(result.texture.get("texture_size") or config.TEXTURE_SIZE),
+        },
+    }
+
+
 METHODS = {
     "capabilities": m_capabilities,
     "load": m_load,
     "unload": m_unload,
     "image_to_mesh": m_image_to_mesh,
+    "texture_mesh": m_texture_mesh,
 }
 
 

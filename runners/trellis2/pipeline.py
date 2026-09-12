@@ -22,6 +22,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -43,6 +44,10 @@ _LOAD_SEC: float = 0.0
 _FAST_ATTENTION: bool = False
 # Whether the compiled mesh -> dual grid conversion loaded (native/o_voxel_cpu/).
 _NATIVE_O_VOXEL: bool = False
+# The shape encoder, loaded the first time `texture_mesh` is asked for. It is
+# not in the image-to-mesh pipeline's own model list and nothing else needs it,
+# so paying 3.3 s and 354 M parameters on every start would be waste.
+_SHAPE_ENCODER: Any = None
 # Counts whichever sampling loop is running. Rebound for each stage.
 _STEPS = StepCounter()
 
@@ -236,13 +241,56 @@ def load_pipeline(progress: Callable[..., None] | None = None) -> Any:
     return _PIPELINE
 
 
+def encoder_weights() -> Path:
+    """Where the shape encoder's checkpoint would be. **Reads nothing.**"""
+    return config.WEIGHTS_DIR / "ckpts" / "shape_enc_next_dc_f16c32_fp16"
+
+
+def encoder_present() -> bool:
+    """Whether `texture_mesh` has the one weight it needs beyond the usual set.
+
+    `capabilities` has to answer without loading anything (contract §3), so this
+    looks at the file rather than at the 709 MB behind it.
+    """
+    return encoder_weights().with_suffix(".safetensors").is_file()
+
+
+def load_encoder(progress: Callable[..., None] | None = None) -> Any:
+    """Load the mesh-to-latent encoder (a no-op on later calls).
+
+    **Only `texture_mesh` needs it**, so it is not in `pipeline.local.json` and
+    not loaded with the rest: measured 3.3 s and 354 M parameters, against a
+    path that never touches it.
+    """
+    global _SHAPE_ENCODER
+    if _SHAPE_ENCODER is not None:
+        return _SHAPE_ENCODER
+    checkpoint = encoder_weights()
+    if not checkpoint.with_suffix(".safetensors").is_file():
+        raise FileNotFoundError(
+            f"the shape encoder is not downloaded: {checkpoint}.safetensors. "
+            f"texture_mesh needs it to turn a mesh back into a latent"
+        )
+    from trellis2 import models as upstream_models
+
+    if progress is not None:
+        progress("encoder", "loading the shape encoder")
+    started = time.perf_counter()
+    encoder = upstream_models.from_pretrained(str(checkpoint)).eval()
+    if progress is not None:
+        progress("encoder", f"shape encoder loaded ({time.perf_counter() - started:.1f}s)")
+    _SHAPE_ENCODER = encoder
+    return encoder
+
+
 def unload_pipeline() -> bool:
     """Release the weights and give the VRAM back."""
-    global _PIPELINE, _LOAD_SEC
+    global _PIPELINE, _LOAD_SEC, _SHAPE_ENCODER
     if _PIPELINE is None:
         return False
     _PIPELINE = None
     _LOAD_SEC = 0.0
+    _SHAPE_ENCODER = None
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -458,6 +506,201 @@ def generate_mesh(
         topology=_topology(mesh),
         vertex_colors=colors,
         textured=textured,
+        texture=bake_report,
+    )
+
+
+@dataclass
+class TextureResult:
+    """A mesh that arrived from somewhere, and the colours put on it."""
+
+    mesh: trimesh.Trimesh
+    textured: trimesh.Trimesh | None
+    load_sec: float
+    elapsed_sec: float
+    vram_peak_gb: float
+    vram_over: bool
+    resolution: int
+    seed: int
+    stages: dict[str, float] = field(default_factory=dict)
+    vertex_colors: dict[str, Any] = field(default_factory=dict)
+    texture: dict[str, Any] = field(default_factory=dict)
+
+
+def _to_model_frame(vertices: np.ndarray, up_axis: str | None) -> np.ndarray:
+    """Rotate an incoming mesh so its up axis is Z, then normalize it.
+
+    **A mesh this runner produced needs no rotation**: it is already in the
+    model's frame, and `up_axis="z"` is what `image_to_mesh` reports for it.
+    Upstream's `preprocess_mesh` swaps Y and Z unconditionally because it
+    assumes a Y-up file; doing that to our own output would lay the model on
+    its face. So the caller says which way is up and nothing is assumed.
+
+    The normalization is upstream's: centre the bounding box and scale the
+    longest side to just under one, because the encoder's grid is the unit cube.
+    """
+    axis = (up_axis or "z").lower().lstrip("-")
+    if axis == "x":
+        vertices = vertices[:, [2, 1, 0]]
+    elif axis == "y":
+        vertices = vertices[:, [0, 2, 1]]
+    elif axis != "z":
+        raise ValueError(f"up_axis must be one of x, y, z (got {up_axis!r})")
+
+    low, high = vertices.min(axis=0), vertices.max(axis=0)
+    scale = 0.99999 / max(float((high - low).max()), 1e-12)
+    return (vertices - (low + high) / 2) * scale
+
+
+def texture_mesh(
+    mesh_path: str,
+    image: Image.Image,
+    resolution: int | None = None,
+    seed: int = 0,
+    up_axis: str | None = None,
+    vertex_colors: bool | None = None,
+    texture_on: bool | None = None,
+    texture_size: int | None = None,
+    progress: Callable[..., None] | None = None,
+) -> TextureResult:
+    """Colour a mesh that came from somewhere else. **The geometry is not touched.**
+
+    What happens is the reverse of the generating path's first half: the mesh is
+    turned back into the latent the texture flow conditions on, and then the
+    same flow, decoder and colour query run.
+
+    **This needs the compiled dual-grid conversion** (`native/o_voxel_cpu`),
+    because upstream's `mesh_to_flexible_dual_grid` is a C++ routine with no
+    torch equivalent here - unlike `flexible_dual_grid_to_mesh`, which the shims
+    reimplement. `capabilities.texture_mesh` is false without it.
+
+    **The texture decoder runs without guide substructures**, as upstream's
+    texturing pipeline does: those come from decoding a shape latent into a
+    mesh, and here the mesh was handed in.
+    """
+    pipeline = load_pipeline(progress)
+    encoder = load_encoder(progress)
+    target = int(resolution or config.RESOLUTION)
+    want_colors = config.VERTEX_COLORS if vertex_colors is None else bool(vertex_colors)
+    want_texture = config.TEXTURE if texture_on is None else bool(texture_on)
+    atlas = int(texture_size or config.TEXTURE_SIZE)
+    if not (want_colors or want_texture):
+        # **Neither output was asked for.** Saying so beats spending a minute to
+        # hand back the mesh that was handed in.
+        raise ValueError("texture_mesh needs vertex_colors or texture (both are off)")
+
+    def say(stage: str, message: str) -> None:
+        if progress is not None:
+            progress(stage, message)
+
+    import o_voxel
+    from trellis2.modules.sparse import SparseTensor
+
+    stages: dict[str, float] = {}
+    source = trimesh.load(mesh_path, process=False)
+    if isinstance(source, trimesh.Scene):
+        source = source.to_geometry()
+    vertices = _to_model_frame(np.asarray(source.vertices, dtype=np.float64), up_axis)
+    faces = np.asarray(source.faces)
+    say("mesh", f"{len(faces):,} faces in, normalized to the unit cube")
+
+    with _DeviceWatch(progress=progress, stage="texture_mesh") as watch:
+        with torch.no_grad():
+            started = time.perf_counter()
+
+            watch.stage = "voxelize"
+            say("voxelize", f"turning the mesh into a dual grid at {target}")
+            mark = time.perf_counter()
+            coords, dual, flags = o_voxel.convert.mesh_to_flexible_dual_grid(
+                torch.from_numpy(vertices).float(),
+                torch.from_numpy(faces).long(),
+                grid_size=target,
+                aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                # Upstream's own weights, from `encode_shape_slat`.
+                face_weight=1.0,
+                boundary_weight=0.2,
+                regularization_weight=1e-2,
+                timing=False,
+            )
+            stages["voxelize_sec"] = time.perf_counter() - mark
+            say("voxelize", f"{len(coords):,} voxels, {int(flags.sum()):,} crossings")
+
+            watch.stage = "encode"
+            say("encode", "encoding the dual grid into a shape latent")
+            mark = time.perf_counter()
+            batched = torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1)
+            positions = SparseTensor(
+                feats=(dual * target - coords).float(), coords=batched
+            ).cuda()
+            crossings = positions.replace(flags).cuda()
+            shape_slat = encoder.cuda()(positions, crossings)
+            encoder.cpu()
+            stages["encode_sec"] = time.perf_counter() - mark
+
+            watch.stage = "cond"
+            say("cond", "encoding the image into a conditioning vector")
+            mark = time.perf_counter()
+            image = pipeline.preprocess_image(image)
+            cond = pipeline.get_cond([image], min(target, 1024))
+            stages["cond_sec"] = time.perf_counter() - mark
+
+            torch.manual_seed(int(seed))
+            watch.stage = "tex_slat"
+            say("tex_slat", "sampling the texture latent")
+            _STEPS.bind(progress, "tex_slat", "sampling the texture latent")
+            mark = time.perf_counter()
+            try:
+                tex_slat = _sample_texture(pipeline, cond, shape_slat, target)
+            finally:
+                _STEPS.bind(None, "tex_slat")
+            stages["tex_slat_sec"] = time.perf_counter() - mark
+
+            watch.stage = "tex_decode"
+            say("tex_decode", "decoding the texture latent into voxel colours")
+            mark = time.perf_counter()
+            decoder = pipeline.models["tex_slat_decoder"]
+            decoder.cuda()
+            voxels = (decoder(tex_slat) * 0.5 + 0.5)[0]
+            decoder.cpu()
+            stages["tex_decode_sec"] = time.perf_counter() - mark
+            del tex_slat, shape_slat, positions, crossings
+            elapsed = time.perf_counter() - started
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    query = _colour_query(voxels, pipeline, target)
+    colors: dict[str, Any] = {"enabled": False}
+    textured: trimesh.Trimesh | None = None
+    bake_report: dict[str, Any] = {"enabled": False}
+
+    with _DeviceWatch(progress=progress, stage="colouring"):
+        if want_colors:
+            mark = time.perf_counter()
+            say("vertex_colors", f"colouring {len(mesh.vertices):,} vertices")
+            mesh, colors = _apply_vertex_colors(mesh, query)
+            colors["sec"] = round(time.perf_counter() - mark, 2)
+        if want_texture:
+            mark = time.perf_counter()
+            say("texture", f"charting and baking a {atlas}x{atlas} texture")
+            budget = int(config.TEXTURE_TARGET_FACES)
+            surface = decimate(mesh, budget) if 0 < budget < len(mesh.faces) else mesh
+            textured, bake_report = texture.bake(surface, query, atlas, config.TEXTURE_DILATE)
+            bake_report["enabled"] = True
+            stages["texture_sec"] = time.perf_counter() - mark
+    del voxels, query
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return TextureResult(
+        mesh=mesh,
+        textured=textured,
+        load_sec=_LOAD_SEC,
+        elapsed_sec=elapsed,
+        vram_peak_gb=watch.peak_used_gb,
+        vram_over=watch.exceeded,
+        resolution=target,
+        seed=int(seed),
+        stages={k: round(v, 2) for k, v in stages.items()},
+        vertex_colors=colors,
         texture=bake_report,
     )
 

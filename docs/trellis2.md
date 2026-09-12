@@ -333,6 +333,45 @@ because xatlas holds the GIL for its whole run and would otherwise silence the
 heartbeat - measured at ten minutes of silence, which a caller watching for
 liveness reads as a stall.
 
+### Colouring a mesh that came from somewhere else
+
+`texture_mesh` takes a mesh and a reference image and puts the same colours on
+it. **The geometry is not touched.** What happens is the reverse of the
+generating path's first half: the mesh is turned back into the latent the
+texture flow conditions on, and the same flow, decoder and colour query run.
+
+It needs two things the image-to-mesh path does not: the **shape encoder**
+(`ckpts/shape_enc_next_dc_f16c32_fp16`, 709 MB, loaded the first time it is
+asked for) and the **compiled dual-grid conversion** (`native/o_voxel_cpu`).
+Upstream's `mesh_to_flexible_dual_grid` is C++ with no torch equivalent here -
+unlike the extraction the other way, which the shims reimplement.
+`capabilities.texture_mesh` is false unless all three are present, and it is
+answered without loading any of them.
+
+Measured on this runner's own 512 output (1,511,942 faces) with the mecha as
+the reference:
+
+| Stage | Seconds |
+|---|--:|
+| Shape encoder, first call only | 3.3 |
+| Mesh to dual grid (1,084,913 voxels) | 7.7 |
+| Encode to a shape latent | 4.9 |
+| Conditioning | 5.8 |
+| Texture latent (12 steps) | 9.9 |
+| Texture decode | 4.2 |
+| **Total** | **32.6** |
+| Vertex colours (756,679 vertices) | 0.25 |
+| Charting and baking a 2048² texture | 12.1 |
+
+Peak VRAM 5.96 GB. 15 vertices of 756,679 came back black. The colours match
+what `image_to_mesh` produces on the same subject: mean RGB (0.332, 0.287,
+0.158).
+
+**`up_axis` is asked for rather than assumed.** Upstream's own preprocessing
+swaps Y and Z because it assumes a Y-up file; applied to this runner's output,
+which is Z-up, that lays the model on its face. The default is `z`, which is
+what `image_to_mesh` reports for the meshes it writes.
+
 ## Gotchas
 
 **The published checkpoints are `flex_gemm`-shaped.** Every sparse convolution
