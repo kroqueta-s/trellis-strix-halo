@@ -123,7 +123,14 @@ VERTEX_COLORS: bool = _bool("TRELLIS2_VERTEX_COLORS", False)
 # the vertices it was built for, so the bake happens before `make_manifold`
 # rewrites them - `mesh_path` still holds the manifold geometry, and the GLB
 # holds the surface the texture was made for.
-TEXTURE: bool = _bool("TRELLIS2_TEXTURE", False)
+#
+# **On by default.** Measured 2026-09-12 on a detailed mecha: the projection
+# charts put 95.6% of the faces in charts of 50 or more, and the decals read
+# across the seams. The unwrap and bake cost 8.8 s at 512; the texture latent
+# and its decoder add 50% to a 1024 generation (+78.6 s) and nothing to VRAM.
+# `mesh_path` is unchanged either way, so what this buys is a second file to
+# look at, not a different thing to print.
+TEXTURE: bool = _bool("TRELLIS2_TEXTURE", True)
 
 # The texture is this many pixels square. **The number that matters is texels
 # per triangle**: 2048 gives 4.19 M texels, which on a 1.5 M-face mesh is 2.8
