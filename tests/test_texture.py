@@ -141,6 +141,56 @@ def test_the_unwrap_keeps_the_surface() -> None:
     assert float(np.asarray(uvs).min()) >= -1e-6 and float(np.asarray(uvs).max()) <= 1 + 1e-6
 
 
+def test_the_packed_atlas_fits_and_fills() -> None:
+    """Project a box into charts, pack them, and check the atlas is usable.
+
+    **This is the path the runner takes**, end to end without a model: charts
+    by direction, then xatlas placing them. Three things have to hold or the
+    bake writes nonsense - the UVs are in 0..1 (what `_cover` multiplies by the
+    texture size), the faces survive, and no texel is claimed by two charts.
+    """
+    try:
+        import trimesh
+        import xatlas  # noqa: F401
+    except ImportError as exc:
+        print(f"  skipped (no {exc.name})")
+        return
+    # Subdivided until each of the box's six sides is comfortably above
+    # `CHART_MIN_FACES`, so the merging step is not what is being measured.
+    mesh = trimesh.creation.box(extents=(1.0, 0.6, 0.3))
+    for _ in range(3):
+        mesh = mesh.subdivide()
+    size = 128
+    vertices, faces, uvs, report = texture.unwrap(mesh, size, in_process=True)
+
+    assert len(faces) == len(mesh.faces), (len(faces), len(mesh.faces))
+    assert len(vertices) == len(uvs), (len(vertices), len(uvs))
+    # **Within a texel of the square, not exactly inside it.** The packer's
+    # gutter can put a chart's outermost vertex a fraction of a texel past the
+    # edge; `_cover` clamps the bounding box to the atlas, so the cost is a
+    # sliver of one row. What would matter is a chart *outside* the square.
+    slack = 1.5 / size
+    assert float(uvs.min()) >= -slack and float(uvs.max()) <= 1 + slack, (
+        float(uvs.min()),
+        float(uvs.max()),
+    )
+    # A box has six directions, so six charts before any merging.
+    assert report.n_charts >= 1, report.n_charts
+    assert report.faces_in_large_charts > 0.9, report.faces_in_large_charts
+
+    # **The charts have to fill the atlas.** Packing that leaves most of the
+    # texture empty spends the resolution on nothing - the failure this whole
+    # path exists to avoid, where an atlas of confetti covered 44%. A box
+    # projects into six rectangles, so it should pack tightly.
+    surface = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    _textured, report = texture.bake(
+        surface, lambda points: torch.ones(len(points), 3, device=points.device), size,
+        dilate=0, in_process=True,
+    )
+    assert report["coverage"] > 0.6, report["coverage"]
+    assert report["texels_covered"] > 0, report
+
+
 def main() -> int:
     """Run every test."""
     print(f"device: {DEVICE}")

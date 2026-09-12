@@ -279,41 +279,59 @@ alpha (`pipeline.pbr_attr_layout`), and a PLY has nowhere to put them.
 ### A texture map
 
 `TRELLIS2_TEXTURE=on` bakes the same colours into a UV map as well, and writes
-it as a second mesh at `extra.textured_glb`. **Unwrapping is xatlas and the bake
-is 40 lines of barycentric arithmetic in UV space** — an atlas's triangles do
-not overlap, so there is no depth test and no need for `nvdiffrast`.
+it as a second mesh at `extra.textured_glb`. **No `nvdiffrast` and no
+`cumesh`**: the charts are cut here, xatlas only packs them, and the bake is
+barycentric arithmetic in UV space - an atlas's triangles do not overlap, so
+there is no depth test to do.
 
-It runs **before `make_manifold`**, because an atlas belongs to the vertices it
-was built for and that stage replaces them. So the two outputs are different
-meshes: the PLY is the watertight one to print, the GLB is the one to look at.
+**xatlas cannot choose the charts on this surface.** Asked to cut as well as
+pack, it made **35,697 charts from 200,000 faces** - five triangles each -
+tripled the vertices and covered 44 % of the texture, and no chart option
+moved it: a relaxed search gave the same charts in 13.8 s against 14.8 s, and
+the packer's resolution changed the time by 12 % and the charts not at all.
+Two causes, both in the input. Half the faces were wound the other way, and an
+edge whose faces disagree is a boundary no chart may cross; and the surface is
+rough at the scale of a triangle, so chart growth that follows face normals
+stops after a few faces.
 
-Measured on the mecha at 512:
+**So the charts are cut by direction in space** (`runners/trellis2/charts.py`).
+Face normals are smoothed over the adjacency, each face is assigned to the one
+of six axis directions its smoothed normal points along, a chart is a connected
+run of faces sharing a direction, and each chart is laid flat by orthographic
+projection along its axis. Charts too small to carry a picture are merged into
+the neighbour they share the most edges with. Blender's *Smart UV Project* is
+the same idea. The surface it works on is the **carved solid**, whose winding
+is consistent - which removes the first of the two causes outright.
 
-| Stage | Seconds |
-|---|--:|
-| Unwrap (200,000 faces, in a child process) | **34.4** |
-| Bake into a 2048² texture | **0.25** |
+Measured on the mecha at 512, 200,000 faces into a 2048² texture:
 
-**The unwrap is the whole cost, and it grows brutally with the face count**:
-13.0 s at 100 k, 31.9 s at 200 k, and the full 1.34 M mesh was still running
-after ten minutes. `TRELLIS2_TEXTURE_TARGET_FACES` (default 200,000) is what
-keeps it affordable; the texture carries the detail the triangles no longer do.
+| | xatlas chose the charts | Projected charts |
+|---|--:|--:|
+| Charts | 35,697 | **2,248** |
+| Faces in charts of 50 or more | — | **95.6 %** |
+| Vertex growth | 3.1× | **1.29×** |
+| Coverage | 44 % | **55 %** |
+| Cut | 31.9 s | **0.5 s** |
+| Pack | (included) | **5.7 s** |
+| Bake | 0.25 s | **0.5 s** |
+| **Total** | **34.4 s** | **8.8 s** |
 
-**Two things about it are worth knowing before turning it on.**
+**The markings are readable now**, which is the whole point of a texture over
+vertex colours: the hazard stripes on the armour, the beacons, the tracks and
+the decals on the chest survive, where a chart of five triangles broke them
+across a seam.
 
-*It runs in a child process*, because `xatlas.parametrize` holds the GIL for its
-whole run and would otherwise stop the heartbeat — measured at ten minutes of
-silence, which a caller watching for liveness reads as a stall.
+**3,826 faces of 200,000 (1.9 %) come out folded** - their projection turns
+over, because a smoothed normal does not describe them. They are reported as
+`metrics.texture.folded_faces`.
 
-*The atlas comes out shattered.* This surface has no large flat regions for
-xatlas to grow charts over, so it produces **35,697 charts from 200,000 faces**
-— about five triangles each — and duplicates the vertices **3.1×**. Coverage is
-43.8 %. The colours are right and the largest charts carry readable markings,
-but **detail finer than a chart still breaks across a seam**, which is the one
-thing a texture map was supposed to buy over vertex colours. Tuning does not
-help: a relaxed chart search gave the same chart count in 13.8 s against 14.8 s,
-and the packer's resolution changed the time by 12 % and the charts not at all.
-**What this needs is a retopology first**, and that is not in this repository.
+The bake runs **after the carve and before the manifold conversion**, on a mesh
+decimated to `TRELLIS2_TEXTURE_TARGET_FACES` (200,000). The textured GLB is
+therefore a different, coarser mesh than `mesh_path`: the PLY is the solid to
+print, the GLB is the thing to look at. **Packing runs in a child process**,
+because xatlas holds the GIL for its whole run and would otherwise silence the
+heartbeat - measured at ten minutes of silence, which a caller watching for
+liveness reads as a stall.
 
 ## Gotchas
 
@@ -367,9 +385,10 @@ Read-only preset is enough.
 
 ## Limits
 
-- **The texture map is not worth turning on yet.** It works and it is measured
-  (see above), but the atlas shatters into ~5-triangle charts on this surface,
-  so it buys little over vertex colours. Both are off by default.
+- **The texture map costs a second 1.3B flow**, like the vertex colours it
+  shares its query with, and 8.8 s more for the charts, the packing and the
+  bake. Both are off by default. What it does not do is match the print mesh:
+  the atlas belongs to a coarser surface (see above).
 - **What the decoder produces is neither closed nor orientable.** Its flags say
   which grid edges the surface crosses, and **about 5 % of the primal faces
   carry an odd number of crossings** (4.99 % at 512, 5.02 % at 1024, measured as
