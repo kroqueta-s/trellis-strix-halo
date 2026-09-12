@@ -245,6 +245,11 @@ def native_o_voxel_present() -> bool:
 #
 # The default is the operator's staged target: a light first pass to 1-3 M,
 # with the rest of the reduction downstream.
+#
+# **Raising it does not add detail** (measured 2026-09-12 at 3 M): the carve
+# produces about 2.87 M faces whatever this says, because the lattice decides
+# them, so a bigger budget only skips the decimation - which is averaging away
+# the surface-nets staircase for a mean error of 0.17%.
 TARGET_FACES: int = _int("TRELLIS2_TARGET_FACES", 1_500_000)
 
 # Drop free-floating parts smaller than this fraction of the longest side.
@@ -300,7 +305,13 @@ SHELL_VISIBILITY: int = _int("TRELLIS2_SHELL_VISIBILITY", 4)
 SHELL_THICKNESS: float = _float("TRELLIS2_SHELL_THICKNESS", 0.0375)
 
 # Cells along the longest side for the lattice. Memory is about lattice^3 x a
-# dozen bytes: 512 peaks near 2.5 GB; 1024 would be eight times that.
+# dozen bytes: 512 peaks near 2.5 GB; 1024 is eight times that.
+#
+# **1024 was measured and is not better** (2026-09-12, a 1024 decode carved
+# both ways): the rays reach through narrower gaps, so the solid loses 15% of
+# its volume (22,023 -> 18,672 mm3 at 80 mm) and comes out with six times the
+# plate one corner thick - 0.078 mm at that size - for 110.5 s of carving
+# against 17.3 s. Finer here buys a different solid, not a finer one.
 SHELL_GRID: int = _int("TRELLIS2_SHELL_GRID", 512)
 
 # Band only: fill every enclosed pocket. Carving always fills them - a print

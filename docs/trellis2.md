@@ -189,11 +189,30 @@ surface sits within a cell of the input's (median 0.94 cells, 95th percentile
 3.6 — the larger distances are the caps over gaps, where there was no input
 surface to be near). Hydraulics, track links and panel lines survive by eye.
 
-Through the runner on the same image at 512: generation 51.1 s, then
-decimation 2.7 s, debris 1.5 s (71,473 parts), holes 1.3 s, **carving
-12.8 s**, decimation of the solid 1.3 s and `make_manifold` 5.4 s —
-**25 s of post-processing**, against 80 s before this work, for a mesh that
-is watertight, edge-manifold, consistently wound and 0.0423 in volume.
+Through the runner on the same image, with the texture on, **measured
+2026-09-12, second run of two** (the first pays for MIOpen's tuning):
+
+| | 512 | 1024 |
+|---|--:|--:|
+| Generate the shape (preprocess, conditioning, structure, latent, decode) | **45.2 s** | **154.2 s** |
+| Sample and decode the texture latent | 14.1 s | 78.4 s |
+| Decimate | 2.5 s | 10.1 s |
+| Drop debris | 1.4 s | 1.3 s |
+| Close holes | 1.3 s | 1.2 s |
+| **Carve** | **15.7 s** | **17.3 s** |
+| Decimate the solid | 1.3 s | 2.1 s |
+| Drop debris again | 1.3 s | 2.0 s |
+| Unwrap and bake | 3.6 s | 3.8 s |
+| `make_manifold` | 7.0 s | 7.0 s |
+| **Post-processing** | **34 s** | **45 s** |
+| Faces out | 1,508,632 | 1,502,124 |
+| Volume | 0.04316 | 0.04317 |
+
+Both come out watertight, edge-manifold, consistently wound and in one
+part. **The generation column is the shape alone**: the texture flow is a
+separate 14 s at 512 and 78 s at 1024, and comparing a run that sampled it
+with one that did not is the easiest way to think this machine has slowed
+down.
 
 **And it stays that way downstream.** meshforge's `prepare_mesh` starts by
 welding vertices by position, dropping degenerate faces and dropping
@@ -231,6 +250,29 @@ costs minutes there either.
 
 The earlier two meshes, the unions of those 453 and 4,729 parts, were sliced
 in Bambu Studio as they came, with no repair and no error (2026-09-12).
+
+**A finer lattice and a bigger face budget were both measured, and neither is
+worth taking** (2026-09-12, the same 1024 decode through all three):
+
+| | 512 lattice, 1.5 M faces | **1024 lattice** | 512 lattice, **3 M faces** |
+|---|--:|--:|--:|
+| Carve | 17.3 s | **110.5 s** | 19.5 s |
+| Faces the carve produced | 2,872,796 | 16,050,260 | 2,845,736 |
+| One-corner-thick plates (`sheet_corners`) | 58,821 | **375,687** | 56,269 |
+| Post-processing | 44 s | **158 s** | 54 s |
+| Volume through forge at 80 mm | 22,023 mm³ | **18,672 mm³** | 22,199 mm³ |
+
+**The 1024 lattice carves a different solid, not a finer one.** Rays pass
+through narrower gaps, so 15 % of the volume goes, and what is left has six
+times the plate one corner thick - 0.078 mm at 80 mm, which no printer will
+make. The surface comes out pitted rather than detailed.
+
+**And the face budget is not what limits the detail**: the carve produces
+about 2.87 M faces whichever budget it is given, because the lattice decides
+them. Asking for 3 M only skips the decimation, which is doing something
+useful - it averages away the surface-nets staircase on curved surfaces, for a
+mean error of 0.17 %. The one thing it buys is that nothing pinches slivers
+off the surface, so the second debris pass finds a single part to begin with.
 
 `TRELLIS2_SHELL_MODE=band` is the older construction: every point within
 half of `TRELLIS2_SHELL_THICKNESS` of the surface is solid, which guarantees a
