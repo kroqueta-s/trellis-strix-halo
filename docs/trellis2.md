@@ -278,8 +278,9 @@ alpha (`pipeline.pbr_attr_layout`), and a PLY has nowhere to put them.
 
 ### A texture map
 
-`TRELLIS2_TEXTURE=on` bakes the same colours into a UV map as well, and writes
-it as a second mesh at `extra.textured_glb`. **No `nvdiffrast` and no
+`TRELLIS2_TEXTURE` bakes the same colours into a UV map as well, and writes it
+as a second mesh at `extra.textured_glb`. **It is on by default**; `off` skips
+the unwrap and the bake, and `mesh_path` is the same mesh either way. **No `nvdiffrast` and no
 `cumesh`**: the charts are cut here, xatlas only packs them, and the bake is
 barycentric arithmetic in UV space - an atlas's triangles do not overlap, so
 there is no depth test to do.
