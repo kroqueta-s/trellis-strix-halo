@@ -636,9 +636,7 @@ def texture_mesh(
             say("encode", "encoding the dual grid into a shape latent")
             mark = time.perf_counter()
             batched = torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1)
-            positions = SparseTensor(
-                feats=(dual * target - coords).float(), coords=batched
-            ).cuda()
+            positions = SparseTensor(feats=(dual * target - coords).float(), coords=batched).cuda()
             crossings = positions.replace(flags).cuda()
             shape_slat = encoder.cuda()(positions, crossings)
             encoder.cpu()

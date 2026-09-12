@@ -221,7 +221,6 @@ def fill_holes(
     import trimesh
 
     from .close_holes import close_holes
-
     from .split_manifold import count_non_manifold, split_non_manifold
 
     closed, stats = close_holes(
@@ -306,6 +305,7 @@ def ensure_upstream_on_path(repo: str) -> None:
     if repo not in sys.path:
         sys.path.insert(0, repo)
 
+
 def _min_cut(
     n_faces: int,
     dual_edges: np.ndarray,
@@ -349,9 +349,7 @@ def _min_cut(
     ends_b = np.concatenate(
         [dual_edges[:, 1], np.full(len(inner), source), np.full(len(outer), target)]
     )
-    weights = np.concatenate(
-        [capacity, np.full(len(inner), 1000.0), np.full(len(outer), 1000.0)]
-    )
+    weights = np.concatenate([capacity, np.full(len(inner), 1000.0), np.full(len(outer), 1000.0)])
     # **Each undirected edge becomes a pair of directed ones**, which is how an
     # undirected cut is put to a directed maximum flow.
     rows = np.concatenate([ends_a, ends_b])

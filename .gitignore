@@ -1,4 +1,6 @@
 .env
+# Backups of it too: this is a machine's own settings, never anyone else's.
+.env.bak*
 __pycache__/
 *.pyc
 .venv/

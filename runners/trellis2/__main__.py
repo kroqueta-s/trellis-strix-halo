@@ -80,7 +80,6 @@ def m_capabilities(params: dict[str, Any], progress: Any) -> dict[str, Any]:
             "image_to_mesh": True,
             "text_to_mesh": False,
             "multi_image_to_mesh": False,
-
             # **Colours per vertex are.** The texture flow and its decoder run,
             # and every vertex is interpolated from the voxels around it - so
             # this survives the post-processing, where a UV layout would not.
@@ -346,8 +345,7 @@ def m_texture_mesh(params: dict[str, Any], progress: Any) -> dict[str, Any]:
     unknown = set(params) - _TEXTURE_MESH_ALLOWED - consumed
     if unknown:
         raise ValueError(
-            f"unknown parameters: {sorted(unknown)} "
-            f"(accepted: {sorted(_TEXTURE_MESH_ALLOWED)})"
+            f"unknown parameters: {sorted(unknown)} " f"(accepted: {sorted(_TEXTURE_MESH_ALLOWED)})"
         )
 
     progress("texture_mesh", "colouring a mesh that was handed in")

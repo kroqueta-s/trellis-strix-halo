@@ -90,7 +90,8 @@ def test_the_partition_costs_the_maximum_flow() -> None:
             [np.rint(weights * 1000.0), np.full(len(inner), 1000.0), np.full(len(outer), 1000.0)]
         )
         crossing = sum(
-            c for a, b, c in zip(ends_a, ends_b, capacity, strict=True)
+            c
+            for a, b, c in zip(ends_a, ends_b, capacity, strict=True)
             if (int(a) in removed) != (int(b) in removed)
         )
         graph = coo_matrix(
@@ -135,9 +136,9 @@ def test_it_costs_what_igraph_costs() -> None:
         for (a, b), capacity in zip(graph.get_edgelist(), capacities, strict=True):
             if (a in ours) != (b in ours):
                 cost += capacity
-        assert abs(cost - theirs.value) < 1e-6 * max(theirs.value, 1.0), (
-            f"seed {seed}: our cut costs {cost}, igraph's {theirs.value}"
-        )
+        assert abs(cost - theirs.value) < 1e-6 * max(
+            theirs.value, 1.0
+        ), f"seed {seed}: our cut costs {cost}, igraph's {theirs.value}"
 
 
 def main() -> int:

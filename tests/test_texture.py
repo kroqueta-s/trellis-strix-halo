@@ -84,9 +84,7 @@ def test_the_weights_are_a_partition() -> None:
 
 def test_a_degenerate_triangle_claims_nothing() -> None:
     """**A triangle with no area in the atlas must not divide by it.**"""
-    uvs = torch.tensor(
-        [[0.2, 0.2], [0.5, 0.5], [0.8, 0.8]], dtype=torch.float32, device=DEVICE
-    )
+    uvs = torch.tensor([[0.2, 0.2], [0.5, 0.5], [0.8, 0.8]], dtype=torch.float32, device=DEVICE)
     faces = torch.tensor([[0, 1, 2]], dtype=torch.long, device=DEVICE)
     texel, _triangle, weights = texture._cover(uvs, faces, 16)
     assert texel.numel() == 0, f"a flat triangle claimed {texel.numel()} texels"
@@ -95,9 +93,7 @@ def test_a_degenerate_triangle_claims_nothing() -> None:
 
 def test_a_chart_that_misses_the_atlas_is_dropped() -> None:
     """A triangle outside the square has an empty box and must not be indexed."""
-    uvs = torch.tensor(
-        [[2.0, 2.0], [3.0, 2.0], [3.0, 3.0]], dtype=torch.float32, device=DEVICE
-    )
+    uvs = torch.tensor([[2.0, 2.0], [3.0, 2.0], [3.0, 3.0]], dtype=torch.float32, device=DEVICE)
     faces = torch.tensor([[0, 1, 2]], dtype=torch.long, device=DEVICE)
     texel, _triangle, _weights = texture._cover(uvs, faces, 8)
     assert texel.numel() == 0, texel.numel()
@@ -184,8 +180,11 @@ def test_the_packed_atlas_fits_and_fills() -> None:
     # projects into six rectangles, so it should pack tightly.
     surface = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     _textured, report = texture.bake(
-        surface, lambda points: torch.ones(len(points), 3, device=points.device), size,
-        dilate=0, in_process=True,
+        surface,
+        lambda points: torch.ones(len(points), 3, device=points.device),
+        size,
+        dilate=0,
+        in_process=True,
     )
     assert report["coverage"] > 0.6, report["coverage"]
     assert report["texels_covered"] > 0, report
