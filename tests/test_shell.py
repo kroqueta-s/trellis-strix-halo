@@ -21,11 +21,69 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from runners.trellis.split_manifold import count_non_manifold, make_manifold  # noqa: E402
-from runners.trellis2.shell import thicken  # noqa: E402
+from runners.trellis2.shell import solidify, thicken  # noqa: E402
+
+# The rays run on the CPU here: the lattices are small, and the tests must
+# not need a GPU.
+CPU = "cpu"
 
 
 def _sphere(radius: float = 1.0) -> trimesh.Trimesh:
     return trimesh.creation.icosphere(subdivisions=4, radius=radius)
+
+
+def test_carving_keeps_the_surface_and_fills_the_inside() -> None:
+    """A sphere carved by visibility is a ball of the sphere's own radius."""
+    sphere = _sphere()
+    grid = 64
+    solid, report = solidify(sphere, grid=grid, mode="carve", device=CPU)
+    assert report.mode == "carve"
+    boundary, _ = count_non_manifold(solid)
+    assert boundary == 0
+    made = _closed(solid)
+    want = 4 / 3 * np.pi
+    assert abs(made.volume - want) / want < 0.08, (made.volume, want)
+    # The surface stays where it was: no growth outward beyond a cell.
+    cell = sphere.extents.max() / (grid - 1)
+    radius = np.linalg.norm(made.vertices - made.vertices.mean(axis=0), axis=1)
+    assert radius.max() < 1.0 + 1.5 * cell, (radius.max(), cell)
+    assert np.median(radius) < 1.0 + 0.75 * cell, (np.median(radius), cell)
+
+
+def test_carving_fills_a_hollow_with_a_gap() -> None:
+    """A double-walled shell with a hole in it comes back as one solid ball.
+
+    Two concentric spheres with a patch cut out of each: a flood from outside
+    would pour through the gaps and call the whole inside air; the rays do not.
+    """
+    outer = _sphere(1.0)
+    inner = _sphere(0.85)
+    keep_o = outer.triangles_center[:, 2] < 0.9
+    keep_i = inner.triangles_center[:, 0] < 0.8
+    soup = trimesh.util.concatenate(
+        [
+            trimesh.Trimesh(outer.vertices, outer.faces[keep_o], process=False),
+            trimesh.Trimesh(inner.vertices, inner.faces[keep_i], process=False),
+        ]
+    )
+    solid, report = solidify(soup, grid=64, mode="carve", device=CPU)
+    made = _closed(solid)
+    want = 4 / 3 * np.pi
+    assert abs(made.volume - want) / want < 0.1, (made.volume, want, report.as_dict())
+
+
+def test_carving_leaves_a_concavity_open() -> None:
+    """A cup's bowl sees the sky, so it stays air; only what is behind the wall fills."""
+    cup = trimesh.creation.annulus(r_min=0.6, r_max=1.0, height=1.0)
+    # Add a bottom so that the cup encloses a solid ring plus a floor.
+    bottom = trimesh.creation.cylinder(radius=1.0, height=0.2)
+    bottom.apply_translation((0, 0, -0.6))
+    soup = trimesh.util.concatenate([cup, bottom])
+    solid, _report = solidify(soup, grid=64, mode="carve", device=CPU)
+    made = _closed(solid)
+    # Ring wall (pi (1 - 0.36) * 1.0) plus the floor (pi * 0.2): the bowl is empty.
+    want = np.pi * (1.0 - 0.36) * 1.0 + np.pi * 0.2
+    assert abs(made.volume - want) / want < 0.15, (made.volume, want)
 
 
 def _closed(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
@@ -56,7 +114,7 @@ def test_a_closed_sphere_is_filled_when_asked() -> None:
     sphere = _sphere()
     grid = 96
     shell, report = thicken(sphere, grid=grid, thickness=0.1, fill_cavities=True)
-    assert report.cavities_filled >= 1, report
+    assert report.pockets_filled >= 1, report
     made = _closed(shell)
     cell = sphere.extents.max() / (grid - 1)
     half = report.half_cells * cell

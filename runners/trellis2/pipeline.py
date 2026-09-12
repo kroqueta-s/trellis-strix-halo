@@ -677,23 +677,25 @@ def _postprocess(
         report["texture_sec"] = round(time.perf_counter() - mark, 2)
 
     # **The print mesh is a solid made from the surface, not the surface
-    # sewn shut.** The decoder's output is a thin double-walled skin with
-    # openings too wide to close (see `shell`), so sewing it gives a manifold
-    # that encloses a tenth of the silhouette's volume with a quarter of it
-    # wound inside-out. Thickening every point of the surface into a wall,
-    # and filling what the outside cannot reach, gives a closed solid with a
-    # guaranteed wall - at the price of half a wall's growth outward.
+    # sewn shut.** The decoder's output is a thin, incomplete, double-walled
+    # skin (see `shell`), so sewing it gives a manifold that encloses a tenth
+    # of the silhouette's volume with a quarter of it wound inside-out. Carving
+    # the exterior out by visibility keeps the outer surface where the model
+    # put it and fills everything behind it.
     if config.SHELL:
         mark = time.perf_counter()
         if progress is not None:
-            progress(
-                "shell",
-                f"thickening the surface into a wall {config.SHELL_THICKNESS:.4f} of the "
-                f"longest side on a {config.SHELL_GRID} grid",
+            what = (
+                f"carving the exterior by visibility ({config.SHELL_VISIBILITY} of 98 rays)"
+                if config.SHELL_MODE == "carve"
+                else f"thickening into a wall {config.SHELL_THICKNESS:.4f} of the longest side"
             )
-        mesh, shell_report = shell.thicken(
+            progress("shell", f"{what} on a {config.SHELL_GRID} grid")
+        mesh, shell_report = shell.solidify(
             mesh,
             grid=config.SHELL_GRID,
+            mode=config.SHELL_MODE,
+            visibility=config.SHELL_VISIBILITY,
             thickness=config.SHELL_THICKNESS,
             fill_cavities=config.SHELL_FILL_CAVITIES,
         )

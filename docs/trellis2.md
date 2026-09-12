@@ -136,49 +136,69 @@ Dropping debris used to scale with the **component count** (87,630 parts on
 that mesh), which is why it barely moved between the two columns; see the
 table above for what that cost actually was.
 
-### The print mesh is a shell, because the model does not produce a solid
+### The print mesh is carved out of the surface, because the model does not produce a solid
 
-**What the decoder emits is a thin, double-walled skin.** Cross-sections of
-the 512 specimen on the primal lattice show every part outlined twice — an
-outer and an inner surface two or three cells apart — and the space between
-them, and the space inside, connected to the outside through openings wider
-than 24 cells (5 % of the model): flooding the lattice from outside reaches
-the interior however the openings are closed, up to a closing radius of 12
-cells. That is why sewing the surface shut (`make_manifold` alone) gave a
-manifold enclosing a volume of 0.0023 against a silhouette of about 0.1, with
-a quarter of the points near the surface at winding number −1: a surface that
-does not separate an inside from an outside has no orientation to propagate,
-and the sewn result depends on which fill rule a slicer applies.
+**What the decoder emits is a thin, double-walled, incomplete skin.**
+Cross-sections of the 512 specimen on the primal lattice show every part
+outlined twice — an outer and an inner surface two or three cells apart — and
+the outlines are open arcs as often as closed loops. So the space between the
+walls and the space inside are connected to the outside through gaps at every
+scale: flooding the lattice from outside reaches the interior with the floor
+sealed, and with every opening up to 24 cells wide closed. That is why sewing
+the surface shut (`make_manifold` alone) gave a manifold enclosing a volume of
+0.0023 against a silhouette near 0.05, with a quarter of the points near the
+surface at winding number −1: a surface that does not separate an inside from
+an outside has no orientation to propagate, and no fill can say which side is
+which.
 
-So the print mesh is made from the surface instead (`runners/trellis2/shell.py`):
-every point within half a wall of the surface is solid, every pocket the
-outside cannot reach is filled, and the boundary of that solid is extracted
-with surface nets. **Closed by construction, oriented by which side is solid,
-and no wall thinner than asked** — which is what Blender's solidify and
-OpenVDB's mesh-to-volume do with a surface soup. `TRELLIS2_SHELL_THICKNESS` is
-the wall as a fraction of the longest side; the runner does not know
-millimetres, and the default 0.0375 is 3 mm on an 80 mm print.
+**Visibility can.** A point of the exterior is seen from far away in many
+directions; a point in the hollow behind the skin is seen, if at all, only
+through a gap, from a few. `runners/trellis2/shell.py` casts rays in 98
+directions across the lattice with the surface as the occluder and keeps, as
+air, every corner that escapes in at least `TRELLIS2_SHELL_VISIBILITY` of them
+(the space carving of a visual hull); everything else is solid, and the
+boundary of that solid is extracted with surface nets. **The outer surface
+stays where the model put it, nothing grows outward, and the inside is
+filled** — what a slicer wants, and what `forge.hollow` takes apart again
+downstream when a print should be hollow. Closed by construction, and
+oriented by which side is solid.
 
-Measured on the 512 mecha (1.34 M faces at the shell's input, a 536-cell lattice):
+The threshold is measured. On the specimen the count of visible directions is
+sharply bimodal — 3.2 M corners see none, a plateau from twelve to sixteen,
+the exterior at ninety and more — and the solid moves by 0.002 between a
+threshold of 2 and 4. A bowl twice as deep as it is wide (an annulus with a
+floor, `tests/test_shell.py`) keeps its hollow up to 4 and starts to fill at 6.
+So the default is 4: deep concavities stay open, gaps do not let the inside
+leak out.
 
-| Wall | Shell | Decimate to 1.5 M | `make_manifold` | `manifold3d` | Volume |
-|---|--:|--:|--:|---|--:|
-| 0.0375 (3 mm / 80 mm) | 17.5 s (14.1 s of it the distance transform) | 1.2 s | 5.0 s, nothing to close | `NoError` | 0.0977 |
-| 0.015 (1.2 mm / 80 mm) | 15.3 s | 2.5 s | 5.5 s | `NoError` | 0.0557 |
+Measured on the 512 mecha (1.34 M faces at the input, a 516-cell lattice):
 
-Through the runner, on the same image at 512 with the shell on: generation
-56.2 s, then decimation 2.7 s, debris 1.5 s (71,473 parts), holes 1.4 s,
-**shell 28.4 s** (23.7 s of it the distance transform, measured while a
-compiler was using the other cores), decimation of the shell 1.4 s and
-`make_manifold` 5.8 s — **41 s of post-processing against 80 s before the
-shell existed**, for a mesh that is watertight, edge-manifold, consistently
-wound and 0.0977 in volume.
+| Step | Seconds |
+|---|--:|
+| Rasterize the surface (13 samples per triangle, a half-cell grid on any wider one) | 3.0 |
+| 98 rays on the GPU, pockets, erosion, chamfer distance | 7.2 |
+| Surface nets (2.26 M faces) | 1.3 |
+| Decimate to 1.5 M | 1.5 |
+| `make_manifold` (nothing to close) | 5.3 |
 
-**The price is detail narrower than the wall, and half a wall of growth
-outward.** At 3 mm the hydraulics and track links round off; at 1.2 mm they
-survive. Both renders are checked by eye; the wall is the operator's choice
-and `metrics.post.shell` reports it in cells, together with how many pockets
-were filled and what they hold.
+`manifold3d` accepts it (`NoError`), the volume is 0.042, and the solid's
+surface sits within a cell of the input's (median 0.94 cells, 95th percentile
+3.6 — the larger distances are the caps over gaps, where there was no input
+surface to be near). Hydraulics, track links and panel lines survive by eye.
+
+Through the runner on the same image at 512: generation 51.1 s, then
+decimation 2.7 s, debris 1.5 s (71,473 parts), holes 1.3 s, **carving
+12.8 s**, decimation of the solid 1.3 s and `make_manifold` 5.4 s —
+**25 s of post-processing**, against 80 s before this work, for a mesh that
+is watertight, edge-manifold, consistently wound and 0.0423 in volume.
+
+`TRELLIS2_SHELL_MODE=band` is the older construction: every point within
+half of `TRELLIS2_SHELL_THICKNESS` of the surface is solid, which guarantees a
+wall thickness (0.0375 is 3 mm on an 80 mm print) but grows the silhouette by
+half a wall and rounds off detail narrower than the wall — measured on the
+same specimen, 17.5 s and a volume of 0.0977 at 3 mm, with the hydraulics
+rounded away. `metrics.post.shell` reports which mode ran, the threshold, the
+pockets filled and the solid's volume.
 
 ### What comes out
 
@@ -352,7 +372,7 @@ Read-only preset is enough.
   (`post.manifold.close.fan_area_fraction`), nearly all of it internal, and
   the enclosed volume comes out at 0.0023 with a quarter of the space near the
   surface wound inside-out — because the surface is a double-walled skin with
-  wide openings (see *The print mesh is a shell*). With `TRELLIS2_SHELL=on`,
+  gaps at every scale (see *The print mesh is carved out of the surface*). With `TRELLIS2_SHELL=on`,
   the default, `make_manifold` runs on the shell instead and has nothing to
   close; the sewn manifold is what `TRELLIS2_SHELL=off` gives.
 - **Half the faces are wound the other way** (49.2 % at 512). Correcting that
