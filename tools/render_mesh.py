@@ -92,6 +92,141 @@ def _render_one(
     return img
 
 
+def _sample_bilinear(image: np.ndarray, uv: np.ndarray) -> np.ndarray:
+    """Read the texture at `uv`, mixing the four texels around each sample.
+
+    **Nearest sampling hides what this is for.** A seam shows itself as the
+    neighbouring chart's colour bleeding across the cut, and bleeding only
+    happens once neighbouring texels are mixed - which is what a renderer does.
+
+    The convention is trimesh's, so that what is drawn here and what
+    `visual.material.to_color` returns agree: u to the right, v up from the
+    bottom of the image.
+    """
+    height, width = image.shape[:2]
+    x = np.clip(uv[:, 0], 0.0, 1.0) * (width - 1)
+    y = (1.0 - np.clip(uv[:, 1], 0.0, 1.0)) * (height - 1)
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    x1 = np.minimum(x0 + 1, width - 1)
+    y1 = np.minimum(y0 + 1, height - 1)
+    fx = (x - x0)[:, None]
+    fy = (y - y0)[:, None]
+    top = image[y0, x0] * (1.0 - fx) + image[y0, x1] * fx
+    bottom = image[y1, x0] * (1.0 - fx) + image[y1, x1] * fx
+    return top * (1.0 - fy) + bottom * fy
+
+
+def _covered_pixels(corners: np.ndarray, size: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Which pixels each triangle covers, and where inside it each one falls.
+
+    Walks the triangles' bounding boxes and keeps the pixel centres inside the
+    triangle. **A triangle smaller than a pixel keeps the pixel its centroid is
+    in**: at 200,000 faces in a 512-pixel view most triangles are sub-pixel, and
+    dropping them would draw the model full of holes.
+
+    Returns the flat pixel index, the triangle index and the barycentric weights.
+    """
+    low = np.clip(np.floor(corners.min(axis=1)).astype(np.int64), 0, size - 1)
+    high = np.clip(np.ceil(corners.max(axis=1)).astype(np.int64), 0, size)
+    span = np.maximum(high - low, 0)
+    counts = span[:, 0] * span[:, 1]
+
+    total = int(counts.sum())
+    triangle = np.repeat(np.arange(len(corners)), counts)
+    starts = np.cumsum(counts) - counts
+    offset = np.arange(total) - starts[triangle]
+    width = np.maximum(span[triangle, 0], 1)
+    x = low[triangle, 0] + offset % width
+    y = low[triangle, 1] + offset // width
+
+    point = np.stack([x + 0.5, y + 0.5], axis=1)
+    tri = corners[triangle]
+    v0, v1, v2 = tri[:, 0], tri[:, 1], tri[:, 2]
+    e1, e2, ep = v1 - v0, v2 - v0, point - v0
+    area = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+    safe = np.where(np.abs(area) < 1e-12, 1.0, area)
+    beta = (ep[:, 0] * e2[:, 1] - ep[:, 1] * e2[:, 0]) / safe
+    gamma = (e1[:, 0] * ep[:, 1] - e1[:, 1] * ep[:, 0]) / safe
+    alpha = 1.0 - beta - gamma
+    inside = (alpha >= 0) & (beta >= 0) & (gamma >= 0) & (np.abs(area) >= 1e-12)
+
+    pixel = (y * size + x)[inside]
+    hit = triangle[inside]
+    weights = np.stack([alpha, beta, gamma], axis=1)[inside]
+
+    drawn = np.zeros(len(corners), dtype=bool)
+    drawn[hit] = True
+    missed = np.nonzero(~drawn)[0]
+    if missed.size:
+        centre = corners[missed].mean(axis=1)
+        cx = np.clip(centre[:, 0].astype(np.int64), 0, size - 1)
+        cy = np.clip(centre[:, 1].astype(np.int64), 0, size - 1)
+        pixel = np.concatenate([pixel, cy * size + cx])
+        hit = np.concatenate([hit, missed])
+        weights = np.concatenate([weights, np.full((missed.size, 3), 1.0 / 3.0)])
+    return pixel, hit, weights
+
+
+def _render_textured(
+    verts: np.ndarray,
+    normals: np.ndarray,
+    uvs: np.ndarray,
+    faces: np.ndarray,
+    image: np.ndarray,
+    size: int,
+    yaw: float,
+    pitch: float,
+    two_sided: bool = False,
+    chunk: int = 1 << 17,
+) -> np.ndarray:
+    """Draw one view by rasterizing the triangles and sampling the texture per pixel.
+
+    **Splatting the vertices cannot answer a texture question.** A vertex
+    carries one UV, so a point-splatted view shows the atlas sampled once per
+    vertex - which is vertex colours again, and exactly what a texture map is
+    meant to beat. Here the UV is interpolated over the triangle and the atlas
+    is read at every pixel, so a seam, a fold or a black gutter shows up.
+
+    The triangles are taken in chunks because the pixel list is built whole.
+    """
+    rot = _rotation(yaw, pitch)
+    p = verts @ rot.T
+    n = normals @ rot.T
+
+    margin = 0.08
+    scale = (size * (1.0 - 2.0 * margin)) / 2.0
+    screen = np.stack([p[:, 0] * scale + size / 2.0, -p[:, 1] * scale + size / 2.0], axis=1)
+
+    light = np.array([0.4, 0.6, 1.0])
+    light /= np.linalg.norm(light)
+
+    img = np.zeros((size * size, 3), dtype=np.float64)
+    zbuf = np.full(size * size, -np.inf, dtype=np.float64)
+    for start in range(0, len(faces), chunk):
+        block = faces[start : start + chunk]
+        pixel, triangle, weights = _covered_pixels(screen[block], size)
+        if pixel.size == 0:
+            continue
+        corner = block[triangle]
+        depth = (p[corner, 2] * weights).sum(axis=1)
+        uv = (uvs[corner] * weights[:, :, None]).sum(axis=1)
+        normal = (n[corner] * weights[:, :, None]).sum(axis=1)
+        normal /= np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1e-12)
+        facing = np.abs(normal @ light) if two_sided else np.clip(normal @ light, 0.0, 1.0)
+        shade = (np.clip(facing, 0.0, 1.0) * 0.75 + 0.25)[:, None]
+        colour = _sample_bilinear(image, uv) * shade
+
+        # Nearest last: sorted by depth, the later write to a pixel is the one
+        # in front, so duplicates inside this chunk settle themselves.
+        order = np.argsort(depth)
+        pixel, depth, colour = pixel[order], depth[order], colour[order]
+        keep = depth > zbuf[pixel]
+        zbuf[pixel[keep]] = depth[keep]
+        img[pixel[keep]] = colour[keep]
+    return img.reshape(size, size, 3)
+
+
 def render(
     mesh_path: Path,
     out_path: Path,
@@ -102,6 +237,7 @@ def render(
     largest_only: bool = False,
     two_sided: bool = False,
     color: bool = False,
+    texture: bool = False,
 ) -> None:
     """Draw the mesh from several viewpoints into a single PNG strip.
 
@@ -114,8 +250,14 @@ def render(
         color: If true, use the mesh's vertex colours instead of grey. **It
             raises when the mesh has none** rather than returning a grey image
             that looks like a texture stage that produced nothing.
+        texture: If true, rasterize the triangles and sample the mesh's texture
+            map at every pixel. **This is the only way to judge an atlas**: the
+            splatted views draw one atlas sample per vertex, which cannot show
+            a seam. It raises when the mesh carries no texture.
     """
-    mesh = trimesh.load(mesh_path, process=False)
+    # `force="mesh"` because a GLB arrives as a scene, and its one mesh is what
+    # is being looked at.
+    mesh = trimesh.load(mesh_path, process=False, force="mesh")
     if largest_only:
         parts = mesh.split(only_watertight=False)
         if len(parts):
@@ -138,10 +280,32 @@ def render(
         colors = np.asarray(raw, dtype=np.float64)[:, :3] / 255.0
 
     angles = [(i * 2.0 * np.pi / views, np.deg2rad(15.0)) for i in range(views)]
-    tiles = [
-        _render_one(verts, normals, size, yaw, pitch, splat, two_sided, colors)
-        for yaw, pitch in angles
-    ]
+    if texture:
+        visual = getattr(mesh, "visual", None)
+        uvs = getattr(visual, "uv", None)
+        picture = getattr(getattr(visual, "material", None), "baseColorTexture", None)
+        if uvs is None or picture is None or len(uvs) != len(verts):
+            raise ValueError(f"{mesh_path} carries no texture map")
+        image = np.asarray(picture.convert("RGB"), dtype=np.float64) / 255.0
+        tiles = [
+            _render_textured(
+                verts,
+                normals,
+                np.asarray(uvs, dtype=np.float64),
+                faces,
+                image,
+                size,
+                yaw,
+                pitch,
+                two_sided,
+            )
+            for yaw, pitch in angles
+        ]
+    else:
+        tiles = [
+            _render_one(verts, normals, size, yaw, pitch, splat, two_sided, colors)
+            for yaw, pitch in angles
+        ]
     strip = np.concatenate(tiles, axis=1)
     Image.fromarray((strip.squeeze() * 255).astype(np.uint8)).save(out_path)
 
@@ -167,6 +331,11 @@ def main() -> int:
         action="store_true",
         help="shade the mesh's own vertex colours (fails if it has none)",
     )
+    parser.add_argument(
+        "--texture",
+        action="store_true",
+        help="rasterize and sample the mesh's texture map per pixel (fails if it has none)",
+    )
     args = parser.parse_args()
     render(
         Path(args.mesh),
@@ -178,6 +347,7 @@ def main() -> int:
         args.largest_only,
         args.two_sided,
         args.color,
+        args.texture,
     )
     print(f"wrote {args.out}")
     return 0
