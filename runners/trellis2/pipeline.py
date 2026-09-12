@@ -931,6 +931,7 @@ def _postprocess(
             visibility=config.SHELL_VISIBILITY,
             thickness=config.SHELL_THICKNESS,
             fill_cavities=config.SHELL_FILL_CAVITIES,
+            island_corners=config.SHELL_ISLAND_CORNERS,
         )
         report["shell"] = shell_report.as_dict()
         report["shell_sec"] = round(time.perf_counter() - mark, 2)
@@ -944,6 +945,24 @@ def _postprocess(
                 )
             mesh = decimate(mesh, target)
             report["shell_decimate_sec"] = round(time.perf_counter() - mark, 2)
+        # **The debris is dropped a second time, because the carve and the
+        # decimation make their own.** The first pass left one part; what is
+        # detached now was made here: strays the rays could not reach, and
+        # two-face slivers the decimation pinches off the surface (measured
+        # 2026-09-12 on the 512 specimen: 229 of them at 1.5 M faces, 2,827
+        # at 1.0 M; 18,699 at 1024). Each part is a term in the manifold
+        # repair downstream, which paid 578 s for 4,729 of them at 1024. The
+        # same pass with the same thresholds leaves 1 part and moves the
+        # volume by 2.5e-4. It sits before the bake so that the atlas is not
+        # spent on them either.
+        if config.DROP_SMALL_PARTS > 0:
+            mark = time.perf_counter()
+            mesh, dropped = drop_debris(mesh, config.DROP_SMALL_PARTS, config.DROP_THIN_PARTS)
+            report["shell_parts_before"] = dropped["parts_before"]
+            report["shell_parts_after"] = dropped["parts_after"]
+            report["shell_dropped_parts"] = dropped["dropped_parts"]
+            report["shell_dropped_faces"] = dropped["dropped_faces"]
+            report["shell_drop_parts_sec"] = round(time.perf_counter() - mark, 2)
 
     # **The bake goes after the carve, and the position is the whole design.**
     # A UV atlas belongs to the vertices and faces it was built for, so it has
