@@ -222,11 +222,17 @@ def load_pipeline(progress: Callable[..., None] | None = None) -> Any:
 
     started = time.perf_counter()
     say("weights", "loading the weights")
-    pipeline = Trellis2ImageTo3DPipeline.from_pretrained(
-        str(config.WEIGHTS_DIR), config_file=config.PIPELINE_CONFIG
-    )
-    pipeline.cuda()
-    _adapt(pipeline)
+    # **The heartbeat has to run through the load.** Eight checkpoints take
+    # about sixty-five seconds and say nothing while they do, which a caller
+    # watching for liveness cannot tell from a hang: hearth's harness ends a
+    # runner that has been silent for sixty, and the switch test did exactly
+    # that (2026-09-12). The watcher is the one generation already uses.
+    with _DeviceWatch(progress=progress, stage="loading the weights"):
+        pipeline = Trellis2ImageTo3DPipeline.from_pretrained(
+            str(config.WEIGHTS_DIR), config_file=config.PIPELINE_CONFIG
+        )
+        pipeline.cuda()
+        _adapt(pipeline)
     _LOAD_SEC = time.perf_counter() - started
 
     # **Count the sampling steps.** Both samplers loop inside `flow_euler` over
@@ -276,7 +282,8 @@ def load_encoder(progress: Callable[..., None] | None = None) -> Any:
     if progress is not None:
         progress("encoder", "loading the shape encoder")
     started = time.perf_counter()
-    encoder = upstream_models.from_pretrained(str(checkpoint)).eval()
+    with _DeviceWatch(progress=progress, stage="loading the shape encoder"):
+        encoder = upstream_models.from_pretrained(str(checkpoint)).eval()
     if progress is not None:
         progress("encoder", f"shape encoder loaded ({time.perf_counter() - started:.1f}s)")
     _SHAPE_ENCODER = encoder

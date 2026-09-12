@@ -356,6 +356,37 @@ def test_texture_mesh_refuses_a_setting_it_does_not_know() -> None:
     raise AssertionError("an unknown setting was accepted")
 
 
+def test_the_weight_load_reports_liveness() -> None:
+    """**Eighty silent seconds is a stall to anything watching.**
+
+    Loading eight checkpoints takes about ninety-five seconds here and used to
+    say nothing for all of it; hearth's harness ends a runner that has been
+    silent for sixty, and the five-model switch test did exactly that
+    (2026-09-12). This checks the plumbing rather than the watcher: without the
+    callback reaching the load, no beat can come out of it.
+    """
+    import ast
+
+    # **The source, not the module.** The pipeline is replaced by a stand-in
+    # above so that none of this needs torch; reading the file keeps it that way.
+    source = (REPO_ROOT / "runners" / "trellis2" / "pipeline.py").read_text(encoding="utf-8")
+    bodies = {
+        node.name: ast.get_source_segment(source, node)
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef)
+    }
+
+    for name in ("load_pipeline", "load_encoder"):
+        assert name in bodies, sorted(bodies)
+        assert "progress" in bodies[name].split(")")[0], f"{name} takes no progress callback"
+        assert "_DeviceWatch(" in bodies[name], f"{name} does not wrap the load in the watcher"
+
+    # **And the generating paths have to pass their own through**, or a
+    # generation that loads first is silent for the load even though `load`
+    # is not.
+    for name in ("generate_mesh", "texture_mesh"):
+        assert "load_pipeline(progress)" in bodies[name], f"{name} does not pass progress in"
+
 
 def main() -> int:
     """Run every test."""
