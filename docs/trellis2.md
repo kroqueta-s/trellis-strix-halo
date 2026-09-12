@@ -9,6 +9,8 @@ thousands** — and it needs six CUDA-only packages to do it.
 This runner (`runners/trellis2/`) runs the image-to-mesh half of it on
 Windows + ROCm with **nothing compiled**: the CUDA halves are replaced at launch
 time, the same way the TRELLIS.1 runner replaces `spconv` and `flash_attn`.
+(One optional module can be compiled for the `texture_mesh` path — see
+`native/o_voxel_cpu/` — and the runner works without it.)
 **A texture map is not implemented; colour per vertex is** — see
 [Vertex colours](#vertex-colours).
 
@@ -52,6 +54,7 @@ carelessly is off by an order of magnitude.
 | `o_voxel.convert.flexible_dual_grid_to_mesh` | Same file — the extraction, reimplemented | With closing off it reproduces upstream **to the face**: 3,454,810 |
 | `flex_gemm.ops.grid_sample` (sparse trilinear sampling) | Same file — the CUDA kernel's rule in torch, over the same hashmap | `F.grid_sample` agrees on a full grid; a dictionary states the sparse rule (`tests/test_shims2.py`) |
 | `cumesh`, `nvdiffrast` | Stands-in that **raise when called** | Nothing on the image-to-mesh path calls them |
+| `o_voxel._C.mesh_to_flexible_dual_grid_cpu` (mesh → dual grid, for `texture_mesh`) | **Optional compiled module**, `native/o_voxel_cpu/` — upstream's CPU-only C++ built alone with MSVC | A box and a sphere round-trip through the runner's own extraction within a cell (`tests/test_o_voxel_cpu.py`); the mecha's 1.34 M faces convert in 7.7 s |
 
 **The dense attention needs no shim at all**: upstream accepts
 `ATTN_BACKEND=sdpa`, and on gfx1151 the AOTriton flash kernels are available in
