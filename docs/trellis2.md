@@ -108,12 +108,22 @@ runs instead is decimation, debris removal and hole closing. On the mecha at
 | Close holes | 70.3 s | **10.0 s** |
 | **Total** | **125.5 s** | **63.3 s** |
 
-With `make_manifold` on as well, a 512 run of the mecha spends 3.1 s
+With `make_manifold` on as well, a 512 run of the mecha spent 3.1 s
 decimating, 34.9 s dropping debris, 9.3 s closing holes and **59.7 s becoming a
-manifold**, against 44.0 s to generate. **The post-processing is the expensive
-half again**, and the two stages worth attacking are the debris removal — it
-scales with the component count rather than the faces — and the manifold
-conversion.
+manifold**, against 44.0 s to generate — the post-processing was the expensive
+half again. **Those numbers were the implementation's, not the problem's**
+(measured 2026-09-12, same specimens):
+
+| Stage | Before | After | What it was |
+|---|--:|--:|---|
+| Drop debris, 28,608 parts (1.5 M faces) | 12.7 s | **0.8 s** | `trimesh.split` built a `Trimesh` per part, and ran `fill_holes()` on each |
+| `make_manifold`, six steps (1.34 M faces) | 36.0 s | **6.4 s** | `np.unique(axis=0)` over 4 M edge rows, 2.1 s a call, a dozen calls |
+| `orient_faces`, 200 k faces in 9,973 components | 56.9 s | **0.2 s** | One breadth-first search per component, each allocating the whole mesh |
+
+The debris removal no longer depends on the part count, and it no longer fills
+holes as a side effect — that was never asked of it, and `close_holes` is the
+stage that does it on purpose. `tests/test_edge_keys.py` holds the replaced
+implementations and checks that every answer is unchanged.
 
 **Decimation runs first because everything after it is proportional to
 something it reduces.** It costs 3.3 s to take 3.33 M faces to 700 k, for a
@@ -122,8 +132,9 @@ within 0.9 % — and it *improves* the topology on the way: non-manifold edges
 15,860 → 10,097, boundary edges 118,777 → 26,959, because the slivers collapse.
 `target_faces` controls it; **0 turns it off**.
 
-Dropping debris scales with the **component count**, not the face count (87,630
-parts on that mesh), which is why it barely moves between the two columns.
+Dropping debris used to scale with the **component count** (87,630 parts on
+that mesh), which is why it barely moved between the two columns; see the
+table above for what that cost actually was.
 
 ### What comes out
 

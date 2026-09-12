@@ -30,8 +30,7 @@ import trimesh
 from PIL import Image
 
 from runners.trellis import close_holes as holes
-from runners.trellis import split_manifold
-from runners.trellis import postprocess, shims
+from runners.trellis import postprocess, shims, split_manifold
 from runners.trellis.steps import StepCounter, count_tqdm
 
 from . import config, texture
@@ -284,10 +283,10 @@ def _topology(mesh: trimesh.Trimesh) -> dict[str, Any]:
     flags carry no inside or outside, and correcting that costs more than the
     generation - so it is downstream work, after decimation.
     """
-    _, counts = np.unique(mesh.edges_sorted, axis=0, return_counts=True)
+    boundary, non_manifold = split_manifold.count_non_manifold(mesh)
     return {
-        "boundary_edges": int((counts == 1).sum()),
-        "non_manifold_edges": int((counts > 2).sum()),
+        "boundary_edges": boundary,
+        "non_manifold_edges": non_manifold,
         "watertight": bool(mesh.is_watertight),
         "winding_consistent": bool(mesh.is_winding_consistent),
         "volume": float(mesh.volume),
