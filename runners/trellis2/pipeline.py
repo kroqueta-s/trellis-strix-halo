@@ -453,6 +453,7 @@ def generate_mesh(
             stages["decode_sec"] = time.perf_counter() - mark
 
             voxels = None
+            colours: _MeshColours | None = None
             if want_voxels:
                 watch.stage = "tex_slat"
                 say("tex_slat", "sampling the texture latent")
@@ -464,12 +465,21 @@ def generate_mesh(
                     _STEPS.bind(None, "tex_slat")
                 stages["tex_slat_sec"] = time.perf_counter() - mark
 
-                watch.stage = "tex_decode"
-                say("tex_decode", "decoding the texture latent into voxel colours")
-                mark = time.perf_counter()
-                voxels = pipeline.decode_tex_slat(tex_slat, subs)[0]
-                stages["tex_decode_sec"] = time.perf_counter() - mark
-                del tex_slat
+                # **The decode waits for the carve when it can.** Guided by the
+                # shape decoder's subdivisions the colours land on the surface
+                # the decoder drew, which is not the surface that gets printed;
+                # guided by the carved mesh's own grid they land on that one
+                # (`_MeshColours`). Without the compiled converter there is no
+                # way to build that grid, so the old path stays.
+                if config.COLOUR_ON_MESH and config.native_o_voxel_present():
+                    colours = _MeshColours(pipeline, tex_slat, target)
+                else:
+                    watch.stage = "tex_decode"
+                    say("tex_decode", "decoding the texture latent into voxel colours")
+                    mark = time.perf_counter()
+                    voxels = pipeline.decode_tex_slat(tex_slat, subs)[0]
+                    stages["tex_decode_sec"] = time.perf_counter() - mark
+                    del tex_slat
             del subs, slat
             gen_sec = time.perf_counter() - started
 
@@ -490,8 +500,12 @@ def generate_mesh(
     )
     with _DeviceWatch(progress=progress, stage="postprocess"):
         mesh, post, textured, bake_report = _postprocess(
-            mesh, progress, target_faces, bake_query, atlas
+            mesh, progress, target_faces, bake_query, atlas, colours, want_texture
         )
+        if colours is not None:
+            voxels = colours.voxels
+            query = colours.query(("base_color",))
+            stages["tex_decode_sec"] = colours.sec
 
         colors: dict[str, Any] = {"enabled": bool(want_colors)}
         if voxels is not None and want_colors:
@@ -499,7 +513,7 @@ def generate_mesh(
             say("vertex_colors", f"colouring {len(mesh.vertices):,} vertices")
             mesh, colors = _apply_vertex_colors(mesh, query)
             colors["sec"] = round(time.perf_counter() - mark, 2)
-        del voxels, query, bake_query
+        del voxels, query, bake_query, colours
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -799,6 +813,85 @@ def _sample_texture(pipeline: Any, cond: dict[str, Any], slat: Any, target: int)
 PBR_CHANNELS = ("base_color", "metallic", "roughness", "alpha")
 
 
+class _MeshColours:
+    """The texture latent, decoded onto a mesh's own grid instead of the decoder's.
+
+    **The decode waits for the mesh.** Upstream decodes the latent as soon as
+    it is sampled, guided by the shape decoder's subdivisions, which puts the
+    colours on the surface the decoder drew. The surface that gets printed is
+    the carve's, rebuilt on a lattice, and at 1024 that left 52% of its
+    vertices outside every active voxel. So the latent is kept until the carve
+    has run, the carved mesh is turned back into a dual grid, and the decoder
+    is guided onto that instead (`guides`).
+
+    **Both meshes go into the same grid.** The print mesh and the coarser
+    surface the atlas is baked from are different tessellations of the same
+    solid, and a voxel set built for one is a voxel or two off the other -
+    which is the whole problem restated. Voxelizing them together costs one
+    conversion and covers both.
+    """
+
+    def __init__(self, pipeline: Any, latent: Any, target: int) -> None:
+        self._pipeline = pipeline
+        self._latent = latent
+        self._target = int(target)
+        self.voxels: Any = None
+        self.sec: float = 0.0
+
+    def on_grid(self, meshes: Sequence[trimesh.Trimesh]) -> dict[str, Any]:
+        """Decode the latent onto the dual grid of `meshes`, and say what it reached."""
+        import o_voxel
+
+        from .guides import SubdivisionGuides, decode_on_grid
+
+        mark = time.perf_counter()
+        vertices: list[np.ndarray] = []
+        faces: list[np.ndarray] = []
+        offset = 0
+        for mesh in meshes:
+            vertices.append(np.asarray(mesh.vertices, dtype=np.float32))
+            faces.append(np.asarray(mesh.faces, dtype=np.int64) + offset)
+            offset += len(mesh.vertices)
+        coords, _dual, _flags = o_voxel.convert.mesh_to_flexible_dual_grid(
+            torch.from_numpy(np.concatenate(vertices)),
+            torch.from_numpy(np.concatenate(faces)),
+            grid_size=self._target,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            # Upstream's own weights, from `encode_shape_slat`. Only the
+            # coordinates are used here; the fitted points are the encoder's
+            # business.
+            face_weight=1.0,
+            boundary_weight=0.2,
+            regularization_weight=1e-2,
+            timing=False,
+        )
+        voxelize_sec = time.perf_counter() - mark
+
+        decoder = self._pipeline.models["tex_slat_decoder"]
+        guides = SubdivisionGuides(coords[:, :3].cpu(), len(decoder.blocks) - 1)
+        counted = guides.reachable(self._latent.coords[:, 1:].cpu())
+        guides.to(self._latent.device)
+        if getattr(self._pipeline, "low_vram", False):
+            decoder.to(self._pipeline.device)
+        self.voxels = (decode_on_grid(decoder, self._latent, guides) * 0.5 + 0.5)[0]
+        if getattr(self._pipeline, "low_vram", False):
+            decoder.cpu()
+        self.sec = time.perf_counter() - mark
+        return {
+            "grid": "mesh",
+            "faces_in": int(offset and sum(len(f) for f in faces)),
+            "voxelize_sec": round(voxelize_sec, 2),
+            "decode_sec": round(self.sec - voxelize_sec, 2),
+            "decoded_voxels": int(self.voxels.coords.shape[0]),
+            **counted,
+            "reached": round(counted["reachable_voxels"] / max(counted["target_voxels"], 1), 4),
+        }
+
+    def query(self, names: Sequence[str]) -> Callable[..., torch.Tensor]:
+        """The colour query over what was decoded."""
+        return _colour_query(self.voxels, self._pipeline, self._target, names)
+
+
 def _nearest_voxels(
     feats: torch.Tensor,
     tree: Any,
@@ -992,6 +1085,8 @@ def _postprocess(
     target_faces: int | None = None,
     bake_query: Callable[..., torch.Tensor] | None = None,
     texture_size: int = 2048,
+    colours: _MeshColours | None = None,
+    want_texture: bool = False,
 ) -> tuple[trimesh.Trimesh, dict[str, Any], trimesh.Trimesh | None, dict[str, Any]]:
     """Drop the debris and close the holes. **The visibility pass is not used.**
 
@@ -1104,17 +1199,31 @@ def _postprocess(
     # right surface to take it from: its winding is consistent, which is half
     # of why xatlas shattered the raw output, and its silhouette is the same.
     # `make_manifold` after this only welds; it does not move the outside.
+    # **A coarser mesh than the one that gets printed** carries the atlas,
+    # because the picture holds the detail the triangles no longer do. It is
+    # made here rather than inside the bake so that the colours can be decoded
+    # onto it as well as onto the print mesh - they are different tessellations
+    # of one solid, and a grid built for one misses the other by a voxel or two.
+    surface: trimesh.Trimesh | None = None
+    if want_texture:
+        budget = int(config.TEXTURE_TARGET_FACES)
+        surface = decimate(mesh, budget) if 0 < budget < len(mesh.faces) else mesh
+
+    if colours is not None:
+        mark = time.perf_counter()
+        if progress is not None:
+            progress("colours", "decoding the colours onto the carved mesh's own grid")
+        wanted = [mesh] if surface is None or surface is mesh else [mesh, surface]
+        report["colours"] = colours.on_grid(wanted)
+        report["colours_sec"] = round(time.perf_counter() - mark, 2)
+        bake_query = colours.query(PBR_CHANNELS) if want_texture else None
+
     textured: trimesh.Trimesh | None = None
     bake_report: dict[str, Any] = {"enabled": bake_query is not None}
-    if bake_query is not None:
+    if bake_query is not None and surface is not None:
         mark = time.perf_counter()
         if progress is not None:
             progress("texture", f"charting and baking a {texture_size}x{texture_size} texture")
-        # **A coarser mesh than the one that gets printed**, because the atlas
-        # carries the detail the triangles no longer do - and the packing cost
-        # follows the face count.
-        budget = int(config.TEXTURE_TARGET_FACES)
-        surface = decimate(mesh, budget) if 0 < budget < len(mesh.faces) else mesh
         textured, bake_report = texture.bake(
             surface, bake_query, texture_size, config.TEXTURE_DILATE
         )
