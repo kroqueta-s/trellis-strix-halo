@@ -169,11 +169,15 @@ TEXTURE_SIZE: int = _int("TRELLIS2_TEXTURE_SIZE", 2048)
 # Reduce to this many faces **before unwrapping**. The textured GLB is a thing
 # to look at; `mesh_path` is the thing to print, and it keeps every face.
 #
-# **This is what makes the unwrap affordable.** Measured 2026-09-12 on the mesh
-# at the bake point: 13.0 s at 100 k faces, 31.9 s at 200 k, and the full
-# 1.34 M was still running after ten minutes. The atlas is what carries the
-# detail here, not the triangles - 200 k faces under a 2048 texture is 21 texels
-# per triangle, against 2.8 at 1.5 M. 0 unwraps the mesh as it stands.
+# **The unwrap is no longer what this protects.** When xatlas cut the charts it
+# took 31.9 s at 200 k faces and had not finished the full 1.34 M after ten
+# minutes (2026-09-12); with the charts cut by direction and xatlas only
+# packing, the whole unwrap is 1.7 s at 200 k, 3.0 s at 600 k and 5.8 s at the
+# full 1.5 M (2026-09-13, the 1024 print mesh). What the budget decides now is
+# texels per triangle: 200 k faces under a 2048 texture is about 11 covered
+# texels per triangle, 600 k is 4, the full mesh 1.5 - fewer than the mesh
+# already resolves. Unwrapping every face makes sense with a 4096 texture, not
+# a 2048 one. 0 unwraps the mesh as it stands.
 TEXTURE_TARGET_FACES: int = _int("TRELLIS2_TEXTURE_TARGET_FACES", 200_000)
 
 # How many times the face normals are averaged over the adjacency before the
