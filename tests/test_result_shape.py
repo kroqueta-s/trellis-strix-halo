@@ -223,6 +223,140 @@ def test_every_setting_it_accepts_is_one_it_declares() -> None:
         assert not missing, f"{method} accepts but does not declare: {missing}"
 
 
+# --- the TRELLIS.2 runner ----------------------------------------------------
+#
+# **Nothing checked this runner's contract surface until now.** The tests above
+# drive `runners.trellis`, so a key that changed name in `runners.trellis2` -
+# or a method offered without its settings - went unnoticed. These use the same
+# stand-in trick: the pipeline module is replaced before the runner imports it,
+# so no torch, no weights and no GPU.
+
+
+class _TextureResult(_Anything):
+    """What `pipeline.texture_mesh` hands back."""
+
+    def __init__(self) -> None:
+        self.mesh = _Mesh()
+        self.textured = None
+        self.resolution = 512
+        self.seed = 0
+        self.stages = {}
+        self.vertex_colors = {"enabled": True}
+        self.texture = {"enabled": False}
+        self.vram_over = False
+
+
+def _install_trellis2_stubs() -> Any:
+    """Replace the torch-backed pipeline, then import the second runner."""
+    _stub_windows_only("runners.trellis2")
+
+    pipeline = types.ModuleType("runners.trellis2.pipeline")
+    pipeline.generate_mesh = lambda *a, **k: _Result()  # type: ignore[attr-defined]
+    pipeline.texture_mesh = lambda *a, **k: _TextureResult()  # type: ignore[attr-defined]
+    pipeline.blas_backend = lambda: "stub"  # type: ignore[attr-defined]
+    sys.modules["runners.trellis2.pipeline"] = pipeline
+
+    from runners.trellis2 import __main__ as runner
+
+    return runner
+
+
+RUNNER2 = _install_trellis2_stubs()
+
+
+def _texture_mesh() -> dict[str, Any]:
+    """Run `texture_mesh` against the stand-in and return its result."""
+    WRITES.clear()
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp) / "out"
+        mesh = Path(tmp) / "in.ply"
+        image = Path(tmp) / "in.png"
+        mesh.write_bytes(b"ply\n")
+        image.write_bytes(b"")
+        return RUNNER2.m_texture_mesh(
+            {"mesh_path": str(mesh), "image_path": str(image), "out_dir": str(out_dir)},
+            _progress,
+        )
+
+
+def test_trellis2_declares_settings_for_every_method_it_offers() -> None:
+    """Contract §3. **An offered method with no settings table is unusable.**
+
+    A caller that finds `texture_mesh: true` and no entry in `method_params`
+    has to guess, and the guess it makes is `params` - the generating method's
+    settings, which mean nothing here.
+    """
+    caps = RUNNER2.m_capabilities({}, _progress)
+    able = caps["capabilities"]
+    per_method = caps.get("method_params", {})
+    for method, flag in {"texture_mesh": "texture_mesh"}.items():
+        if not able.get(flag, False):
+            continue
+        assert method in per_method, f"{method} is offered but declares no settings"
+        for key, spec in per_method[method].items():
+            assert "type" in spec and "default" in spec, (method, key, spec)
+
+
+def test_trellis2_accepts_only_what_it_declares() -> None:
+    """**Accepted and undeclared is the same fault as declared and ignored.**"""
+    caps = RUNNER2.m_capabilities({}, _progress)
+    for table, accepted in (
+        ("params", getattr(RUNNER2, "_ALLOWED", frozenset())),
+        ("texture_mesh", getattr(RUNNER2, "_TEXTURE_MESH_ALLOWED", frozenset())),
+    ):
+        if not accepted:
+            continue
+        declared = caps["params"] if table == "params" else caps["method_params"][table]
+        undeclared = sorted(set(accepted) - set(declared))
+        assert not undeclared, f"{table}: accepted but not declared: {undeclared}"
+
+
+def test_texture_mesh_reports_what_the_contract_asks_for() -> None:
+    """The result's shape, so a key cannot quietly change name."""
+    out = _texture_mesh()
+    for key in ("mesh_path", "n_vertices", "n_faces", "metrics", "params_used", "up_axis"):
+        assert key in out, (key, sorted(out))
+    assert out["up_axis"] in (None, "x", "y", "z"), out["up_axis"]
+    assert out.get("forward_axis") in (None, "x", "y", "z")
+    # **The axis it was read as** is part of reproducing the run.
+    assert "up_axis" in out["params_used"], sorted(out["params_used"])
+
+
+def test_texture_mesh_renames_the_mesh_into_place() -> None:
+    """Contract §9. A run killed while writing must not leave a finished file."""
+    out = _texture_mesh()
+    written = [p for p in WRITES if p.name.startswith("textured.ply")]
+    assert written, WRITES
+    assert all(p.name != "textured.ply" for p in written), (
+        f"written straight to its name: {written}"
+    )
+    assert Path(out["mesh_path"]).name == "textured.ply", out["mesh_path"]
+
+
+def test_texture_mesh_refuses_a_setting_it_does_not_know() -> None:
+    """**A misspelled setting must fail, not be ignored.**"""
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp) / "out"
+        mesh = Path(tmp) / "in.ply"
+        image = Path(tmp) / "in.png"
+        mesh.write_bytes(b"ply\n")
+        image.write_bytes(b"")
+        try:
+            RUNNER2.m_texture_mesh(
+                {
+                    "mesh_path": str(mesh),
+                    "image_path": str(image),
+                    "out_dir": str(out_dir),
+                    "steps": 30,
+                },
+                _progress,
+            )
+        except ValueError:
+            return
+    raise AssertionError("an unknown setting was accepted")
+
+
+
 def main() -> int:
     """Run every test."""
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

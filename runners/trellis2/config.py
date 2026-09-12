@@ -181,6 +181,29 @@ def texture_weights_present() -> bool:
     return any(name.startswith("tex_slat_flow_model") for name in models)
 
 
+def encoder_weights_present() -> bool:
+    """Whether the mesh-to-latent encoder is downloaded. **Reads no weights.**
+
+    Only `texture_mesh` needs it, and it is not in the pipeline description, so
+    it is checked as a file rather than through the models table.
+    """
+    return (WEIGHTS_DIR / "ckpts" / "shape_enc_next_dc_f16c32_fp16.safetensors").is_file()
+
+
+def native_o_voxel_present() -> bool:
+    """Whether the compiled mesh -> dual grid conversion was built.
+
+    `texture_mesh` cannot start without it: upstream's
+    `mesh_to_flexible_dual_grid` is C++ with no torch equivalent here, unlike
+    the extraction the other way, which the shims reimplement. **This looks for
+    the file**; whether it loads is settled at import time.
+    """
+    if not NATIVE_DIR:
+        return False
+    directory = Path(NATIVE_DIR).expanduser()
+    return directory.is_dir() and any(directory.glob("o_voxel_cpu*.pyd"))
+
+
 # --- Post-processing -------------------------------------------------------
 # Decimate to this many faces **before anything else is done to the mesh**.
 # 0 turns it off and the model's own tessellation is kept.
