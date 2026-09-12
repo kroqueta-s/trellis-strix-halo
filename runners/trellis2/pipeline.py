@@ -559,14 +559,24 @@ def _to_model_frame(vertices: np.ndarray, up_axis: str | None) -> np.ndarray:
     The normalization is upstream's: centre the bounding box and scale the
     longest side to just under one, because the encoder's grid is the unit cube.
     """
-    axis = (up_axis or "z").lower().lstrip("-")
+    name = (up_axis or "z").lower()
+    axis = name.lstrip("-")
     x, y, z = vertices[:, 0], vertices[:, 1], vertices[:, 2]
+    # Each case is a rotation (determinant +1), never a swap; a leading minus
+    # means the file's down is that axis, and the rotation is the other way.
     if axis == "x":
-        vertices = np.column_stack([-z, y, x])
+        vertices = (
+            np.column_stack([z, y, -x]) if name.startswith("-") else np.column_stack([-z, y, x])
+        )
     elif axis == "y":
-        vertices = np.column_stack([x, -z, y])
-    elif axis != "z":
-        raise ValueError(f"up_axis must be one of x, y, z (got {up_axis!r})")
+        vertices = (
+            np.column_stack([x, z, -y]) if name.startswith("-") else np.column_stack([x, -z, y])
+        )
+    elif axis == "z":
+        if name.startswith("-"):
+            vertices = np.column_stack([x, -y, -z])
+    else:
+        raise ValueError(f"up_axis must be one of x, y, z, -x, -y, -z (got {up_axis!r})")
 
     low, high = vertices.min(axis=0), vertices.max(axis=0)
     scale = 0.99999 / max(float((high - low).max()), 1e-12)
@@ -702,13 +712,10 @@ def texture_mesh(
             say("texture", f"charting and baking a {atlas}x{atlas} texture")
             budget = int(config.TEXTURE_TARGET_FACES)
             surface = decimate(mesh, budget) if 0 < budget < len(mesh.faces) else mesh
-            textured, bake_report = texture.bake(
-                surface,
-                _colour_query(voxels, pipeline, target, PBR_CHANNELS),
-                atlas,
-                config.TEXTURE_DILATE,
-            )
+            bake_query = _colour_query(voxels, pipeline, target, PBR_CHANNELS)
+            textured, bake_report = texture.bake(surface, bake_query, atlas, config.TEXTURE_DILATE)
             bake_report["enabled"] = True
+            bake_report.update(_search_summary(bake_query.stats))  # type: ignore[attr-defined]
             stages["texture_sec"] = time.perf_counter() - mark
     del voxels, query
     if torch.cuda.is_available():
@@ -792,11 +799,47 @@ def _sample_texture(pipeline: Any, cond: dict[str, Any], slat: Any, target: int)
 PBR_CHANNELS = ("base_color", "metallic", "roughness", "alpha")
 
 
+def _nearest_voxels(
+    feats: torch.Tensor,
+    tree: Any,
+    points: torch.Tensor,
+    reach: float,
+    neighbours: int = 8,
+) -> tuple[torch.Tensor, np.ndarray]:
+    """Average the nearest active voxels of each point, the nearest weighted most.
+
+    For the points the trilinear sample found nothing around. `tree` is a
+    `cKDTree` over the voxel centres in voxel units; the `neighbours` nearest
+    within `reach` voxels are taken, each weighing the inverse square of its
+    distance. **A tree rather than a widening cube search**, because the
+    distance is not small: the carve's input was decimated first (mean error
+    0.17 % of the longest side, 1.7 voxels at 1024) and then quantized to a
+    lattice, so a cube two cells wide left a third of the vertices black at
+    1024 where a tree reaches whatever is there in one query.
+
+    Returns the attributes, zero where nothing lay within `reach`, and the
+    distance to the nearest voxel of every point (infinite where none was).
+    """
+    where = points.detach().cpu().numpy().astype(np.float64)
+    distance, index = tree.query(where, k=neighbours, distance_upper_bound=float(reach))
+    distance = np.asarray(distance, dtype=np.float64).reshape(len(where), -1)
+    index = np.asarray(index, dtype=np.int64).reshape(len(where), -1)
+    found = np.isfinite(distance)
+    weight = np.where(found, 1.0 / np.maximum(distance, 1e-3) ** 2, 0.0)
+    total = weight.sum(axis=1, keepdims=True)
+    weight = np.where(total > 0, weight / np.maximum(total, 1e-30), 0.0)
+    rows = torch.as_tensor(np.where(found, index, 0), device=feats.device)
+    gathered = feats.index_select(0, rows.reshape(-1)).reshape(len(where), -1, feats.shape[1])
+    weights = torch.as_tensor(weight, dtype=torch.float32, device=feats.device)
+    return (gathered * weights.unsqueeze(-1)).sum(dim=1), distance[:, 0]
+
+
 def _colour_query(
     voxels: Any,
     pipeline: Any,
     resolution: int,
     names: Sequence[str] = ("base_color",),
+    reach: int | None = None,
 ) -> Callable[..., torch.Tensor]:
     """A function from positions to base colour. **The one place either path asks.**
 
@@ -816,6 +859,21 @@ def _colour_query(
     the colour**, so the vertex-colour path asks for that alone; a glTF has a
     place for all four, so the bake asks for all four (`PBR_CHANNELS`). The
     extra channels ride the same trilinear sample and cost nothing.
+
+    **A point the eight corners miss is given its nearest voxels instead.** The
+    carved solid's surface is a lattice's own, not the decoder's: the input was
+    decimated (1.7 voxels of error at 1024) and quantized to a cell of the 512
+    lattice (two voxels at 1024), so measured 2026-09-12, 52 % of the print
+    mesh's vertices and 44 % of the covered texels came back black at 1024,
+    12 % and 10 % at 512, against 0.15 % on the decoder's own mesh. The voxels
+    are still there, a few voxels away, so the query reaches for them - up to
+    `reach` voxels (`TRELLIS2_COLOUR_REACH`; 0 is the plain trilinear sample).
+    Where the carve bridged a gap the decoder left, there is nothing near: a
+    quarter of the vertices at 1024 lie more than 8 voxels from the decoded
+    surface, and the nearest drawn colour within 32 voxels is what they get
+    (measured 2026-09-13: 52 % black to 5.1 % at 1024, 12 % to 0.4 % at 512).
+    `query.stats` counts the points that needed the search, the ones it could
+    not help, and how far the search had to go.
     """
     layout = pipeline.pbr_attr_layout
     wanted = [layout[name] for name in names]
@@ -823,14 +881,51 @@ def _colour_query(
     # `origin` is -0.5 and `voxel_size` is 1/resolution, as upstream sets them
     # in `decode_latent`, so this is the same mapping into voxel units.
     scale = float(resolution)
+    reach = float(config.COLOUR_REACH if reach is None else reach)
+    feats = voxels.feats.float()
+    # A channel of ones rides the trilinear sample: its weights are renormalized
+    # over the corners that exist, so it comes back exactly 1 wherever anything
+    # was found and 0 where nothing was - which is the only sure test, since a
+    # colour can be black on purpose.
+    marked = torch.cat([feats, torch.ones(len(feats), 1, device=feats.device)], dim=1)
+    stats: dict[str, Any] = {"searched": 0, "unreached": 0, "distances": []}
+    tree: list[Any] = []
 
     def query(points: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            grid = ((points.to(voxels.feats.device) + 0.5) * scale).reshape(1, -1, 3)
-            attrs = shims._grid_sample_3d(voxels.feats, voxels.coords, shape, grid)[0]
+            grid = ((points.to(feats.device) + 0.5) * scale).reshape(1, -1, 3)
+            attrs = shims._grid_sample_3d(marked, voxels.coords, shape, grid)[0]
+            missed = attrs[:, -1] <= 0
+            if reach > 0 and bool(missed.any()):
+                if not tree:
+                    from scipy.spatial import cKDTree
+
+                    centres = voxels.coords[:, 1:].detach().cpu().numpy().astype(np.float64)
+                    tree.append(cKDTree(centres + 0.5))
+                near, distance = _nearest_voxels(feats, tree[0], grid[0][missed], reach)
+                attrs[missed, :-1] = near
+                stats["searched"] += int(missed.sum())
+                stats["unreached"] += int((~np.isfinite(distance)).sum())
+                stats["distances"].append(distance[np.isfinite(distance)])
+            else:
+                stats["unreached"] += int(missed.sum())
         return torch.cat([attrs[:, part] for part in wanted], dim=1).clamp(0, 1).float()
 
+    query.stats = stats  # type: ignore[attr-defined]
     return query
+
+
+def _search_summary(stats: dict[str, Any]) -> dict[str, Any]:
+    """What the nearest-voxel search did, for a report: counts and how far it went."""
+    distances = [d for d in stats.get("distances", []) if len(d)]
+    joined = np.concatenate(distances) if distances else np.zeros(0)
+    return {
+        "searched": int(stats.get("searched", 0)),
+        "search_unreached": int(stats.get("unreached", 0)),
+        "search_distance_p50": round(float(np.median(joined)), 2) if len(joined) else 0.0,
+        "search_distance_p90": round(float(np.percentile(joined, 90)), 2) if len(joined) else 0.0,
+        "search_distance_max": round(float(joined.max()), 2) if len(joined) else 0.0,
+    }
 
 
 def _apply_vertex_colors(
@@ -855,10 +950,16 @@ def _apply_vertex_colors(
     # the texture decoder never saw, which is the only way to tell a black model
     # from a failed one.
     unreached = int((base.abs().sum(dim=1) == 0).sum())
+    # How many vertices the eight corners missed, how many the search around
+    # them could not help either, and how far it had to go (in voxels): the
+    # difference between `searched` and `unreached_vertices` is what
+    # `TRELLIS2_COLOUR_REACH` did.
+    search = _search_summary(getattr(query, "stats", {}))
     return mesh, {
         "enabled": True,
         "n_vertices": int(len(mesh.vertices)),
         "unreached_vertices": unreached,
+        **search,
         "mean_rgb": [round(float(v), 4) for v in base.float().mean(dim=0).tolist()],
     }
 
@@ -1018,6 +1119,9 @@ def _postprocess(
             surface, bake_query, texture_size, config.TEXTURE_DILATE
         )
         bake_report["enabled"] = True
+        # The bake asks the same query, so the same search counts apply: texels
+        # the eight corners missed, texels nothing lay near, and how far it went.
+        bake_report.update(_search_summary(getattr(bake_query, "stats", {})))
         report["texture_sec"] = round(time.perf_counter() - mark, 2)
 
     if config.MAKE_MANIFOLD:
