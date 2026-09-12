@@ -205,16 +205,32 @@ keeps every copy 1e-5 of the longest side apart, the crossings sit a quarter
 of the way along their edges, and pillows are dropped whole — measured
 through `forge.prepare_mesh` at 80 mm:
 
-| Resolution | Runner post-processing | forge repair | Watertight | Size (mm) | Faces |
+| Resolution | Parts handed to forge | forge repair | Watertight | Size (mm) | Faces |
 |---|--:|--:|---|---|--:|
-| 512 | 27 s | 36 s | yes, no warnings | 80.0 × 36.7 × 65.8 | 1,516,508 |
-| 1024 (generation 157 s) | 37 s | 354 s | yes, no warnings | 80.0 × 37.9 × 67.2 | 1,595,448 |
+| 512 | 1 (was 453) | 4.4 s (was 36 s) | yes, no warnings | 80.0 × 36.7 × 65.8 | 1,508,632 |
+| 1024 | 1 (was 4,729) | 5.2 s (was 354 s) | yes, no warnings | 80.0 × 37.9 × 67.2 | 1,502,124 |
 
-The 1024 repair is `manifold3d`'s decompose-and-union on 1.6 M faces, on
-forge's side; the runner's own part is the 37 s.
+**The repair used to be paid per part.** The 354 s were `manifold3d`'s
+`decompose`, which scans the whole mesh once for every connected component
+(0.12 s a part on 1.5 M faces, whatever the part's size), and the 4,729
+parts were not the model. Two things made them, measured 2026-09-12 on the
+512 specimen: **strays the rays could not reach** - 254 detached pieces of
+solid, 213 of them a single lattice corner, floating 2-11 cells from the body
+in the shadows of struts - and **slivers the decimation of the solid pinches
+off its surface**, 229 two-face pairs at 1.5 M faces and 2,827 at 1.0 M,
+which `close_holes` then sealed into four- and six-face bits. So the carve
+drops every detached piece of solid under `TRELLIS2_SHELL_ISLAND_CORNERS`
+(64, four cells across; 1.0-1.4 s at 512, `metrics.post.shell.islands_dropped`
+counts them: 248 at 512, 1,327 at 1024), and **the debris pass runs a second
+time after the solid's decimation**, with the same thresholds as the first
+(`metrics.post.shell_dropped_parts`: 232 at 512, 6,658 at 1024, 2.0 s), and
+what reaches forge is one part with the volume unchanged to four digits.
+forge's `repair_manifold` also stopped calling `decompose` and labels the
+parts itself in one pass, so a mesh from elsewhere with many parts no longer
+costs minutes there either.
 
-Both meshes were then sliced in Bambu Studio as they came, with no repair
-and no error (2026-09-12).
+The earlier two meshes, the unions of those 453 and 4,729 parts, were sliced
+in Bambu Studio as they came, with no repair and no error (2026-09-12).
 
 `TRELLIS2_SHELL_MODE=band` is the older construction: every point within
 half of `TRELLIS2_SHELL_THICKNESS` of the surface is solid, which guarantees a

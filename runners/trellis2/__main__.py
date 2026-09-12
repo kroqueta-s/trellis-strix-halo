@@ -40,6 +40,10 @@ if config.PREFER_HIPBLASLT:
     os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "1")
     os.environ.setdefault("ROCBLAS_USE_HIPBLASLT", "1")
 
+# Same rule. The HIP runtime reads it once, when it initializes.
+if config.HIP_LOG_LEVEL >= 0:
+    os.environ.setdefault("AMD_LOG_LEVEL", str(config.HIP_LOG_LEVEL))
+
 NAME = "trellis2"
 VERSION = "4B"
 

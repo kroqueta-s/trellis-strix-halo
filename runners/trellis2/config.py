@@ -95,6 +95,16 @@ FAST_ATTENTION: bool = _bool("TRELLIS2_FAST_ATTENTION", True)
 # TFLOPS. `metrics.blas_backend` records which one served.
 PREFER_HIPBLASLT: bool = _bool("TRELLIS2_PREFER_HIPBLASLT", True)
 
+# AMD_LOG_LEVEL for the HIP runtime (before torch is imported): 0 silent,
+# 1 errors, 2 warnings, 3 information, 4 debug. **A kernel fault is reported
+# asynchronously, at the next synchronization, and when a second failure hits
+# during the unwinding the process aborts without a message** - seen once at
+# 1024 (2026-09-12), inside `nonzero`, with nothing to say what failed. At 1
+# the runtime names the failing call and the error on stderr, which hearth
+# keeps; the cost is four lines at start-up (measured 2026-09-12). -1 leaves
+# the environment alone.
+HIP_LOG_LEVEL: int = _int("TRELLIS2_HIP_LOG_LEVEL", 1)
+
 # Dedicated VRAM is 32 GB; `torch.cuda.mem_get_info` reports 43.87 GB because it
 # counts shared memory. Without a cap, spilling into shared memory is silent and
 # several times slower, so the limit is passed to torch as well. **Measured
@@ -286,6 +296,15 @@ SHELL_GRID: int = _int("TRELLIS2_SHELL_GRID", 512)
 # Band only: fill every enclosed pocket. Carving always fills them - a print
 # wants a solid, and `forge.hollow` is where a hollow one is made.
 SHELL_FILL_CAVITIES: bool = _bool("TRELLIS2_SHELL_FILL_CAVITIES", True)
+
+# Carve only: a piece of solid detached from the rest and smaller than this
+# many lattice corners is air. **The rays leave specks in the shadows**
+# (measured 2026-09-12 at 512: 254 detached pieces, 213 of them one corner,
+# 2-11 cells from the body), and each speck is a part the manifold repair pays
+# for. 64 corners is 4 cells across - 0.6 mm on an 80 mm print at 512 - and
+# dropping everything under it leaves the volume unchanged to five digits.
+# 0 keeps every piece. `metrics.post.shell.islands_dropped` counts them.
+SHELL_ISLAND_CORNERS: int = _int("TRELLIS2_SHELL_ISLAND_CORNERS", 64)
 
 # Separate the touching sheets, cut what cannot be oriented, and close the
 # seams, so that the mesh is a closed orientable manifold. **After the shell

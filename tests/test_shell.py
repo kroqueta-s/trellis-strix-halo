@@ -158,6 +158,49 @@ def test_the_wall_is_never_thinner_than_asked() -> None:
     assert made.extents[2] >= 2 * report.half_cells * cell * 0.9, (made.extents, report)
 
 
+def test_islands_smaller_than_the_threshold_become_air() -> None:
+    """A speck of solid detached from the body is dropped; the body is kept whatever its size."""
+    from scipy import ndimage
+
+    from runners.trellis2.shell import _drop_islands
+
+    six = ndimage.generate_binary_structure(3, 1)
+    solid = np.zeros((20, 20, 20), dtype=bool)
+    solid[2:8, 2:8, 2:8] = True  # the body, 216 corners
+    solid[15, 15, 15] = True  # a single stray corner
+    solid[12:14, 2:4, 2:4] = True  # a 2x2x2 speck, 8 corners
+    solid[15:18, 2:6, 2:6] = True  # 48 corners, only 6-connected to nothing
+    out, dropped, corners = _drop_islands(solid, 64, six)
+    assert (dropped, corners) == (3, 1 + 8 + 48), (dropped, corners)
+    assert out.sum() == 216, out.sum()
+    # Nothing is dropped at 0, and the largest piece survives any threshold.
+    same, dropped, _ = _drop_islands(solid, 0, six)
+    assert dropped == 0 and same.sum() == solid.sum()
+    only_body, dropped, _ = _drop_islands(solid, 10_000, six)
+    assert dropped == 3 and only_body.sum() == 216
+
+
+def test_a_speck_in_the_air_is_not_part_of_the_carved_solid() -> None:
+    """A tetrahedron smaller than a cell, floating beside a sphere, leaves no part behind.
+
+    Its samples mark one corner of the lattice, which the carve would keep as
+    a one-corner solid; the report counts it, and the mesh has one part.
+    """
+    sphere = _sphere()
+    speck = trimesh.creation.icosphere(subdivisions=0, radius=0.005)
+    speck.apply_translation((1.4, 0.0, 0.0))
+    soup = trimesh.util.concatenate([sphere, speck])
+    grid = 64
+    kept, report_kept = solidify(soup, grid=grid, mode="carve", device=CPU, island_corners=0)
+    assert report_kept.islands_dropped == 0
+    assert len(trimesh.graph.connected_components(kept.face_adjacency)) == 2
+    solid, report = solidify(soup, grid=grid, mode="carve", device=CPU)
+    assert report.islands_dropped == 1, report.as_dict()
+    assert report.island_corners_dropped >= 1, report.as_dict()
+    assert len(trimesh.graph.connected_components(solid.face_adjacency)) == 1
+    assert report.solid_corners == report_kept.solid_corners - report.island_corners_dropped
+
+
 def main() -> int:
     """Run every test."""
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

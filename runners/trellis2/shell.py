@@ -93,6 +93,8 @@ class ShellReport:
     solid_corners: int = 0
     exterior_fraction: float = 0.0
     pockets_filled: int = 0
+    islands_dropped: int = 0
+    island_corners_dropped: int = 0
     sheet_corners: int = 0
     crossing_edges: int = 0
     faces: int = 0
@@ -282,6 +284,30 @@ def _surface_nets(
     return trimesh.Trimesh(vertices=position, faces=triangles, process=False), int(len(quad))
 
 
+def _drop_islands(
+    solid: np.ndarray, min_corners: int, structure: np.ndarray
+) -> tuple[np.ndarray, int, int]:
+    """Turn every connected piece of the solid smaller than `min_corners` into air.
+
+    Returns the solid, the number of pieces dropped and the corners they held.
+    The largest piece is always kept, whatever its size.
+    """
+    if min_corners <= 0:
+        return solid, 0, 0
+    labels, count = ndimage.label(solid, structure=structure)
+    if count <= 1:
+        return solid, 0, 0
+    sizes = np.bincount(labels.ravel())
+    sizes[0] = 0
+    keep = sizes >= min_corners
+    keep[int(sizes.argmax())] = True
+    dropped = int(count - keep[1:].sum())
+    if dropped == 0:
+        return solid, 0, 0
+    corners = int(sizes[~keep].sum())
+    return keep[labels], dropped, corners
+
+
 def solidify(
     mesh: trimesh.Trimesh,
     grid: int = 512,
@@ -290,6 +316,7 @@ def solidify(
     thickness: float = 0.0375,
     fill_cavities: bool = True,
     device: str | None = None,
+    island_corners: int = 64,
 ) -> tuple[trimesh.Trimesh, ShellReport]:
     """Turn a surface into a closed solid.
 
@@ -310,6 +337,11 @@ def solidify(
         fill_cavities: Band only. Fill every pocket the outside cannot reach.
             Carving always fills them.
         device: Where the rays run; `None` picks the GPU when there is one.
+        island_corners: Carving only. A piece of solid not connected to the
+            rest and smaller than this many corners is air. **Measured 64**
+            (2026-09-12, 512 specimen): the strays are 1-4 cells across, and
+            dropping everything under 8 or under 64 corners leaves the volume
+            unchanged to five digits. 0 keeps every piece.
 
     Returns:
         A closed, consistently wound triangle mesh, and the report. Sheets
@@ -378,6 +410,17 @@ def solidify(
         # off puts the boundary back on the surface's own corners.
         solid = ndimage.binary_erosion(~exterior, structure=six, iterations=1) | thin
         del barrier, exterior, count
+        # **Specks of "solid" hang in the air where the rays could not
+        # reach.** A corner in the shadow of a strut sees the outside in
+        # fewer directions than the threshold, and the erosion above strips
+        # a layer off such a pocket, not its middle. Measured on the 512
+        # specimen (2026-09-12): 254 connected pieces of solid, 213 of them
+        # a single corner, 2-11 cells away from the body and none on the
+        # sampled surface. Each becomes a part of its own, and parts are
+        # what the manifold repair downstream pays for.
+        solid, report.islands_dropped, report.island_corners_dropped = _drop_islands(
+            solid, int(island_corners), six
+        )
         # **Sheets one corner thick are counted, not thickened.** Where the
         # model drew a single skin with air on both sides, the solid is that
         # skin alone - a slab half a cell thick once extracted. Growing it
