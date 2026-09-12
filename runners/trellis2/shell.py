@@ -93,6 +93,7 @@ class ShellReport:
     solid_corners: int = 0
     exterior_fraction: float = 0.0
     pockets_filled: int = 0
+    sheet_corners: int = 0
     crossing_edges: int = 0
     faces: int = 0
     vertices: int = 0
@@ -377,9 +378,30 @@ def solidify(
         # off puts the boundary back on the surface's own corners.
         solid = ndimage.binary_erosion(~exterior, structure=six, iterations=1) | thin
         del barrier, exterior, count
-        # A chamfer distance is enough to place a crossing on the surface
-        # corner rather than beside it, and it costs a tenth of the exact one.
-        distance = ndimage.distance_transform_cdt(~thin, metric="taxicab").astype(np.float32)
+        # **Sheets one corner thick are counted, not thickened.** Where the
+        # model drew a single skin with air on both sides, the solid is that
+        # skin alone - a slab half a cell thick once extracted. Growing it
+        # would not make it printable (three corners is 0.5 mm on an 80 mm
+        # print) and would move a surface the operator asked to keep; the
+        # count says how much of the model is like that.
+        core = ndimage.binary_erosion(solid, structure=six, iterations=1)
+        sheet = solid & ~ndimage.binary_dilation(core, structure=six, iterations=1)
+        report.sheet_corners = int(sheet.sum())
+        del core, sheet
+        # A chamfer distance is enough here, at a tenth of the exact one's cost.
+        # **Half a corner is added so that no crossing lands on a lattice
+        # corner.** With the surface's own corners at distance 0, every edge
+        # leaving one would cross at that corner, and two cells whose crossing
+        # edges leave the same corners - the two sides of a convex edge, the
+        # two sides of a thin sheet - would average to one point. That is a
+        # zero-thickness slab, and welding vertices by position (forge's repair
+        # does, first thing) turned it into non-manifold edges: measured
+        # 2026-09-12, 6,527 coincident vertices and 15,693 such edges on the
+        # 512 specimen. At 0.5 the crossing sits a quarter of the way along
+        # the edge, unique to it, and the surface moves out by a quarter of a
+        # cell - 0.04 mm on an 80 mm print.
+        chamfer = ndimage.distance_transform_cdt(~thin, metric="taxicab")
+        distance = chamfer.astype(np.float32) + 0.5
     del thin
     report.solid_corners = int(solid.sum())
     report.occupancy_sec = round(time.perf_counter() - mark, 2)

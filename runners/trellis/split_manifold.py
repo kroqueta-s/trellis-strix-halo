@@ -227,6 +227,105 @@ def split_non_manifold(
     )
 
 
+def separate_coincident(
+    mesh: trimesh.Trimesh, distance: float = 1e-5, rounds: int = 4
+) -> tuple[trimesh.Trimesh, int]:
+    """Nudge every vertex that shares its exact position with another, so none does.
+
+    **Whatever leaves this module gets welded by position downstream** - forge's
+    `repair_manifold` starts with `merge_vertices()` - and two vertices at one
+    point become one, taking their faces' edges with them. The split above
+    keeps its own copies apart; this catches the rest, which arrive from
+    elsewhere (decimation collapsing two vertices onto one point, a fan apex
+    landing on a vertex, a copy whose faces surround it symmetrically): 260
+    of 7,710 copies and 14 from decimation on the 512 specimen, measured
+    2026-09-12, enough for `manifold3d` to refuse the welded mesh.
+
+    Each such vertex moves `distance` (a fraction of the longest side) towards
+    the middle of its own faces, which keeps it on its own sheet; a vertex
+    whose faces surround it symmetrically moves along a fixed direction
+    instead. A few rounds cover the unlikely case of two moves landing on
+    one point again.
+
+    Returns:
+        The mesh with the moved vertices, and how many were moved.
+    """
+    vertices = np.asarray(mesh.vertices, dtype=np.float64).copy()
+    faces = np.asarray(mesh.faces)
+    extent = float(np.ptp(vertices, axis=0).max())
+    step = distance * extent
+    moved_total = 0
+    for _ in range(rounds):
+        # Within 1e-7 of the longest side counts as one point: closer than a
+        # float32 file keeps apart, and still a hundred times finer than the
+        # nudge, so a moved vertex is never caught again.
+        _, inverse, counts = np.unique(
+            np.round(vertices / max(extent, 1e-12), 7),
+            axis=0,
+            return_inverse=True,
+            return_counts=True,
+        )
+        shared = counts[inverse.ravel()] > 1
+        if not shared.any():
+            break
+        centres = np.zeros_like(vertices)
+        weights = np.zeros(len(vertices))
+        face_centre = vertices[faces].mean(axis=1)
+        for corner in range(3):
+            np.add.at(centres, faces[:, corner], face_centre)
+            np.add.at(weights, faces[:, corner], 1.0)
+        direction = centres / np.maximum(weights, 1)[:, None] - vertices
+        length = np.linalg.norm(direction, axis=1)
+        flat = length < 1e-12
+        direction[flat] = np.array([1.0, 1.0, 1.0])
+        length[flat] = np.sqrt(3.0)
+        # Two vertices of one group can have the same direction - copies of
+        # a split vertex whose sheets mirror each other do - so each member
+        # also steps a different distance, by its rank within the group.
+        order = np.argsort(inverse.ravel(), kind="stable")
+        group = inverse.ravel()[order]
+        first = np.r_[0, np.flatnonzero(group[1:] != group[:-1]) + 1]
+        rank = np.empty(len(vertices), dtype=np.int64)
+        sizes = np.diff(np.r_[first, len(vertices)])
+        rank[order] = np.arange(len(vertices)) - np.repeat(first, sizes)
+        scale = step * (1.0 + rank)
+        nudge = direction / length[:, None] * scale[:, None]
+        vertices[shared] += nudge[shared]
+        moved_total += int(shared.sum())
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False), moved_total
+
+
+def drop_pillows(mesh: trimesh.Trimesh) -> tuple[trimesh.Trimesh, int]:
+    """Drop faces that repeat a vertex, and every face whose vertex set another face repeats.
+
+    Two faces on the same three vertices are a pillow: a closed sliver of no
+    volume that the edge counts call manifold (each edge has its two faces)
+    and that a downstream `unique_faces()` then opens by keeping one of them
+    - measured 2026-09-12 on the 512 specimen, 87 pairs became 265 boundary
+    edges in forge's repair. They come from fans closed over three-vertex
+    loops and from decimation, and they touch nothing else (0 of their 261
+    edges were shared), so both faces of each pair go.
+
+    Returns:
+        The mesh without them, and how many faces went.
+    """
+    faces = np.asarray(mesh.faces)
+    repeated = (
+        (faces[:, 0] == faces[:, 1]) | (faces[:, 1] == faces[:, 2]) | (faces[:, 2] == faces[:, 0])
+    )
+    vertex_count = int(faces.max()) + 1 if faces.size else 1
+    key = np.sort(faces, axis=1).astype(np.int64)
+    key = (key[:, 0] * vertex_count + key[:, 1]) * vertex_count + key[:, 2]
+    _, inverse, counts = np.unique(key, return_inverse=True, return_counts=True)
+    duplicated = counts[inverse.ravel()] > 1
+    drop = repeated | duplicated
+    if not drop.any():
+        return mesh, 0
+    kept = trimesh.Trimesh(vertices=np.asarray(mesh.vertices), faces=faces[~drop], process=False)
+    kept.remove_unreferenced_vertices()
+    return kept, int(drop.sum())
+
+
 def conflicting_edges(mesh: trimesh.Trimesh) -> np.ndarray:
     """Which paired edges still disagree once the orientation has been propagated.
 
@@ -375,6 +474,12 @@ def make_manifold(
     # in the model, and leaving them open would make the whole exercise moot.
     work, close_stats = close_holes(work, max_extent=0.0)
     report["close"] = close_stats.as_dict()
+
+    # **Last, because everything above can leave two vertices on one point.**
+    work, moved = separate_coincident(work, distance=separation)
+    report["coincident_moved"] = moved
+    work, dropped = drop_pillows(work)
+    report["pillow_faces_dropped"] = dropped
 
     boundary, non_manifold = count_non_manifold(work)
     report["boundary_edges"] = boundary
