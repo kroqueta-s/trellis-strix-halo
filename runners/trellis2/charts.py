@@ -23,7 +23,10 @@ limit) and no seam inside a chart. Blender's *Smart UV Project* is the
 same idea. Measured on the carved 512 mecha at 200,000 faces: smoothing
 alone moved the share of faces in charts of fifty or more from 50 % to
 73 %, and merging the rest takes it further (see `tests/test_charts.py`
-and `docs/trellis2.md`).
+and `docs/trellis2.md`). A face whose own normal points away from its
+chart's axis would fold over in projection; those are moved to a chart
+they do not fold in (`_unfold`), and the slivers that cannot be are left
+to read the atlas without writing it.
 
 What comes out is one vertex per (vertex, chart) pair with its projected
 coordinates in **world units**, so texel density is the same in every chart
@@ -64,7 +67,10 @@ class ChartReport:
     merge_rounds: int = 0
     faces_in_large_charts: float = 0.0
     median_faces_per_chart: float = 0.0
+    folds_moved: int = 0
+    folds_own_chart: int = 0
     folded_faces: int = 0
+    folded_area_fraction: float = 0.0
     vertices_before: int = 0
     vertices_after: int = 0
 
@@ -175,11 +181,71 @@ def _merge_small(
     return chart.ravel(), rounds
 
 
+def _unfold(
+    chart: np.ndarray,
+    chart_direction: np.ndarray,
+    normals: np.ndarray,
+    area: np.ndarray,
+    left: np.ndarray,
+    right: np.ndarray,
+    min_area: float,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """Move each face that folds under its chart's projection to a chart it does not fold in.
+
+    A face folds when its own normal points away from its chart's axis: its
+    projection turns over and lands on its neighbours. **The surface is rough
+    at the scale of a triangle**, so the smoothed normal that chose the chart
+    and the face's own can disagree by more than a right angle - measured on
+    the 200 k specimen, 4,250 faces (2.1 %), 2,488 of them against their own
+    smoothed direction. Among the charts across the face's edges, the one its
+    normal points along best takes it (a cosine above 0.1, so that it does not
+    fold there either; 1,215 of the 4,250). A face with no such neighbour gets
+    a chart of its own along its own normal **when it is at least `min_area`**,
+    and is otherwise left where it is: the rest are slivers (median area a
+    third of the median face), and a chart each would have more than doubled
+    the chart count. A sliver left folded reads the atlas where it lands and
+    writes nothing (`texture.bake`).
+
+    Returns the charts, their directions (extended by the new ones), and how
+    many faces moved and how many got a chart of their own.
+    """
+    dot = (normals * _AXIS_VECTORS[chart_direction[chart]]).sum(axis=1)
+    folded = np.flatnonzero(dot <= 0)
+    if len(folded) == 0:
+        return chart, chart_direction, 0, 0
+    is_folded = np.zeros(len(chart), dtype=bool)
+    is_folded[folded] = True
+    a = np.concatenate([left, right])
+    b = np.concatenate([right, left])
+    keep = is_folded[a]
+    src, dst = a[keep], chart[b[keep]]
+    gain = (normals[src] * _AXIS_VECTORS[chart_direction[dst]]).sum(axis=1)
+    ok = gain > 0.1
+    src, dst, gain = src[ok], dst[ok], gain[ok]
+    chart = chart.copy()
+    moved = np.zeros(0, dtype=np.int64)
+    if len(src):
+        order = np.lexsort((-gain, src))
+        first = np.r_[True, src[order][1:] != src[order][:-1]]
+        moved = src[order][first]
+        chart[moved] = dst[order][first]
+    rest = folded[~np.isin(folded, moved)]
+    own = rest[area[rest] >= min_area]
+    if len(own):
+        axis = np.abs(normals[own]).argmax(axis=1)
+        negative = normals[own, axis] < 0
+        chart[own] = len(chart_direction) + np.arange(len(own))
+        chart_direction = np.concatenate([chart_direction, axis * 2 + negative.astype(np.int64)])
+    labels, chart = np.unique(chart, return_inverse=True)
+    return chart.ravel(), chart_direction[labels], int(len(moved)), int(len(own))
+
+
 def project_charts(
     mesh: trimesh.Trimesh,
     smoothing_rounds: int = 10,
     min_faces: int = 50,
     max_merge_rounds: int = 30,
+    fold_area: float = 2.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, ChartReport]:
     """Cut `mesh` into axis-projected charts.
 
@@ -193,6 +259,11 @@ def project_charts(
         min_faces: Charts smaller than this are merged into a neighbour.
         max_merge_rounds: A bound on the merging, which normally converges in
             a few rounds.
+        fold_area: A face that folds under its chart's projection and has no
+            neighbouring chart to take it gets a chart of its own when its
+            area is at least this many times the median face's (`_unfold`).
+            **Measured 2**: on the 200 k specimen 73 faces qualify and hold
+            0.08 % of the area; the 2,962 slivers below it hold 0.4 %.
 
     Returns:
         `(vertices, faces, uvs, report)`: one vertex per (vertex, chart) pair,
@@ -230,13 +301,18 @@ def project_charts(
     )
     report.merge_rounds = int(merge_rounds)
     count = int(chart.max()) + 1
+
+    # A merged chart projects along the direction its area faces on average;
+    # the faces that would fold under it are then moved out of it.
+    chart_direction, _mean = _chart_directions(chart, normals, area, count)
+    chart, chart_direction, report.folds_moved, report.folds_own_chart = _unfold(
+        chart, chart_direction, normals, area, left, right, fold_area * float(np.median(area))
+    )
+    count = int(chart.max()) + 1
     report.charts = count
     sizes = np.bincount(chart, minlength=count)
     report.faces_in_large_charts = round(float(sizes[sizes >= min_faces].sum() / len(faces)), 4)
     report.median_faces_per_chart = float(np.median(sizes))
-
-    # A merged chart projects along the direction its area faces on average.
-    chart_direction, _mean = _chart_directions(chart, normals, area, count)
     chart_axis = chart_direction // 2
     chart_negative = chart_direction % 2 == 1
 
@@ -263,13 +339,15 @@ def project_charts(
     # by the cyclic projection; mirroring u again puts it right.
     uvs[chart_negative[split_chart], 0] *= -1.0
 
-    # A face that folds over in projection would overlap its chart: counted,
-    # because a bake writes the later triangle over the earlier one there.
+    # The faces still folded after `_unfold` are the slivers it left: counted,
+    # with the area they hold, because they overlap their chart in the atlas.
     p = uvs[split_faces]
     signed = (p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1]) - (p[:, 1, 1] - p[:, 0, 1]) * (
         p[:, 2, 0] - p[:, 0, 0]
     )
-    report.folded_faces = int((signed < 0).sum())
+    folded = signed < 0
+    report.folded_faces = int(folded.sum())
+    report.folded_area_fraction = round(float(area[folded].sum() / max(area.sum(), 1e-20)), 5)
     report.vertices_before = int(len(vertices))
     report.vertices_after = int(len(split_vertex))
     return position, split_faces, uvs.astype(np.float32), report
