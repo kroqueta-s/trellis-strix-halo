@@ -54,9 +54,12 @@ class BakeReport:
     folded_faces: int = 0
     vertices_before: int = 0
     vertices_after: int = 0
+    channels: int = 0
     texels_covered: int = 0
     texels_total: int = 0
     texels_unreached: int = 0
+    texels_black: int = 0
+    texels_black_after_dilate: int = 0
     dilate_rounds: int = 0
     chart_sec: float = 0.0
     pack_sec: float = 0.0
@@ -255,6 +258,38 @@ def _dilate(colour: torch.Tensor, filled: torch.Tensor, rounds: int) -> tuple[to
     return colour, done
 
 
+def _material(baked: np.ndarray, image: Image.Image) -> Any:
+    """The material the atlas describes: base colour alone, or the full PBR set.
+
+    glTF puts roughness in the green channel of one texture and metallic in its
+    blue, and the opacity in the base colour's alpha - **the layout is the
+    format's, not a choice made here** (upstream writes the same one in
+    `trellis2_texturing.py`). With only three channels baked there is nothing
+    to say, and the plain colour material is what the GLB carries.
+    """
+    if baked.shape[2] < 6:
+        return trimesh.visual.material.SimpleMaterial(image=image)
+    base, metallic, roughness, alpha = (
+        baked[:, :, :3],
+        baked[:, :, 3:4],
+        baked[:, :, 4:5],
+        baked[:, :, 5:6],
+    )
+    return trimesh.visual.material.PBRMaterial(
+        baseColorTexture=Image.fromarray(np.concatenate([base, alpha], axis=2), mode="RGBA"),
+        metallicRoughnessTexture=Image.fromarray(
+            np.concatenate([np.zeros_like(metallic), roughness, metallic], axis=2), mode="RGB"
+        ),
+        metallicFactor=1.0,
+        roughnessFactor=1.0,
+        # **Opaque even though the alpha is carried**: the decoder's alpha is
+        # material information, and a viewer that blended on it would make
+        # holes in a mesh that is meant to be printed.
+        alphaMode="OPAQUE",
+        doubleSided=True,
+    )
+
+
 def bake(
     mesh: trimesh.Trimesh,
     query: Any,
@@ -268,8 +303,12 @@ def bake(
         mesh: The mesh to texture. **Its vertices are replaced** by the
             unwrapped ones, which is why the result is returned rather than the
             original being changed.
-        query: Takes `[N, 3]` positions on the device and returns `[N, 3]` RGB
-            in 0..1. `pipeline` passes the texture decoder's voxels.
+        query: Takes `[N, 3]` positions on the device and returns `[N, C]` in
+            0..1, the first three channels being RGB. `pipeline` passes the
+            texture decoder's voxels, which carry metallic, roughness and
+            alpha after the colour; whatever else arrives is written into the
+            atlas the same way, and the channel count decides what material
+            the GLB gets.
         size: The texture is `size` x `size`.
         dilate: How many rounds to spread the colours past the chart edges.
 
@@ -286,7 +325,10 @@ def bake(
     face_t = torch.as_tensor(faces, dtype=torch.long, device=device)
     vert_t = torch.as_tensor(vertices, dtype=torch.float32, device=device)
 
-    colour = torch.zeros(size * size, 3, dtype=torch.float32, device=device)
+    # **The channel count comes from the query, not from here.** Three is a
+    # base colour; six is the decoder's full PBR vector, and the extra ones
+    # ride the same trilinear sample, so they cost nothing to carry.
+    colour: torch.Tensor | None = None
     filled = torch.zeros(size * size, dtype=torch.bool, device=device)
     # A folded face keeps its UVs - it reads the atlas where it lands - but
     # writes nothing, so that it does not paint over the faces it overlaps.
@@ -298,18 +340,33 @@ def bake(
             continue
         corners = vert_t[chunk[triangle]]  # [M, 3, 3]
         point = (corners * weights.unsqueeze(-1)).sum(dim=1)
-        colour[texel] = query(point)
+        values = query(point)
+        if colour is None:
+            colour = torch.zeros(size * size, values.shape[1], dtype=torch.float32, device=device)
+        colour[texel] = values
         filled[texel] = True
+    if colour is None:
+        colour = torch.zeros(size * size, 3, dtype=torch.float32, device=device)
 
+    channels = int(colour.shape[1])
+    report.channels = channels
     report.texels_covered = int(filled.sum())
-    colour = colour.view(size, size, 3)
-    colour, rounds = _dilate(colour, filled.view(size, size), dilate)
+    # **A texel the decoder never saw comes back exactly zero**, the same test
+    # `_apply_vertex_colors` counts vertices with. Black paint is a different
+    # thing and does not land on exactly zero, so the two are separable - and
+    # the dilation cannot help here, because it fills only what nothing wrote.
+    report.texels_black = int((filled & (colour[:, :3].abs().sum(dim=1) == 0)).sum())
+    colour = colour.view(size, size, channels)
+    filled_grid = filled.view(size, size)
+    colour, rounds = _dilate(colour, filled_grid, dilate)
     report.dilate_rounds = rounds
     report.texels_unreached = report.texels_total - int(filled.sum())
-
-    image = Image.fromarray(
-        (colour.clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy(), mode="RGB"
+    report.texels_black_after_dilate = int(
+        (filled_grid & (colour[:, :, :3].abs().sum(dim=2) == 0)).sum()
     )
+
+    eight_bit = (colour.clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
+    image = Image.fromarray(eight_bit[:, :, :3], mode="RGB")
     # **The atlas's V axis points the other way from an image's rows**, so the
     # coordinate is flipped here rather than the picture being stored upside
     # down: a texture that looks wrong when opened is one nobody can check.
@@ -317,7 +374,7 @@ def bake(
     textured = trimesh.Trimesh(
         vertices=vertices,
         faces=faces,
-        visual=trimesh.visual.TextureVisuals(uv=flipped, image=image),
+        visual=trimesh.visual.TextureVisuals(uv=flipped, material=_material(eight_bit, image)),
         process=False,
     )
     report.bake_sec = round(time.perf_counter() - mark, 2)

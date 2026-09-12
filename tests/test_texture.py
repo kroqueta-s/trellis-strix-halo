@@ -243,6 +243,68 @@ def test_the_packed_atlas_fits_and_fills() -> None:
     assert report["texels_covered"] > 0, report
 
 
+def test_six_channels_become_a_pbr_material() -> None:
+    """Metallic, roughness and alpha come back out of the GLB material.
+
+    **glTF decides the layout, not this code**: roughness is the green channel
+    of one texture, metallic its blue, and the opacity is the base colour's
+    alpha. A bake that writes them anywhere else looks right in a viewer that
+    ignores them and wrong in one that does not.
+    """
+    try:
+        import trimesh
+        import xatlas  # noqa: F401
+    except ImportError as exc:
+        print(f"  skipped (no {exc.name})")
+        return
+    mesh = trimesh.creation.icosphere(subdivisions=2)
+
+    def query(points: torch.Tensor) -> torch.Tensor:
+        values = torch.tensor([1.0, 0.0, 0.0, 0.2, 0.6, 0.8], device=points.device)
+        return values.expand(len(points), 6)
+
+    textured, baked = texture.bake(mesh, query, 64, dilate=0, in_process=True)
+    assert baked["channels"] == 6, baked
+    material = textured.visual.material
+    base = np.asarray(material.baseColorTexture)
+    rough_metal = np.asarray(material.metallicRoughnessTexture)
+    assert base.shape[2] == 4, base.shape
+    assert material.alphaMode == "OPAQUE", material.alphaMode
+
+    written = np.asarray(np.nonzero(base[:, :, 0])).T
+    assert len(written), "nothing was baked"
+    y, x = written[0]
+    assert list(base[y, x]) == [255, 0, 0, 204], list(base[y, x])
+    # Red is zero, green is roughness, blue is metallic.
+    assert list(rough_metal[y, x]) == [0, 153, 51], list(rough_metal[y, x])
+
+
+def test_a_texel_the_decoder_never_saw_is_counted_black() -> None:
+    """**Black from an empty query is not black paint**, and dilation cannot fix it.
+
+    The dilation fills texels nothing wrote; a texel a face wrote black is
+    filled already. Counting the two separately is what says whether an atlas
+    came out dark because the model is dark or because the colours never
+    arrived.
+    """
+    try:
+        import trimesh
+        import xatlas  # noqa: F401
+    except ImportError as exc:
+        print(f"  skipped (no {exc.name})")
+        return
+    mesh = trimesh.creation.icosphere(subdivisions=2)
+
+    def query(points: torch.Tensor) -> torch.Tensor:
+        lit = (points[:, 0] > 0).float().unsqueeze(1)
+        return lit.expand(len(points), 3).contiguous()
+
+    _textured, baked = texture.bake(mesh, query, 64, dilate=4, in_process=True)
+    assert baked["texels_black"] > 0, baked
+    assert baked["texels_black"] < baked["texels_covered"], baked
+    assert baked["texels_black_after_dilate"] == baked["texels_black"], baked
+
+
 def main() -> int:
     """Run every test."""
     print(f"device: {DEVICE}")
