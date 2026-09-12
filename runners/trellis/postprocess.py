@@ -45,6 +45,8 @@ from typing import Any
 import numpy as np
 import torch
 import trimesh
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 
 from . import config, raster, shims
 
@@ -207,23 +209,45 @@ def drop_small_parts(
     """
     if min_ratio <= 0 and min_thick_ratio <= 0:
         return mesh
-    parts = mesh.split(only_watertight=False)
-    if stats is not None:
-        stats.parts_before = len(parts)
-    if len(parts) <= 1:
-        if stats is not None:
-            stats.parts_after = len(parts)
+    faces = np.asarray(mesh.faces)
+    vertices = np.asarray(mesh.vertices)
+    if len(faces) == 0:
         return mesh
 
-    whole = max(float(np.max(mesh.bounding_box.extents)), 1e-12)
-    face_counts = np.array([len(p.faces) for p in parts])
-    keep = np.ones(len(parts), dtype=bool)
+    # **Components are labelled, never built.** `mesh.split()` makes one
+    # `Trimesh` per component - and runs `fill_holes()` on each, a repair
+    # nobody asked for - which on 28,608 parts took 12.7 s against 0.6 s for
+    # the same labelling and the same decision on arrays (measured 2026-09-12).
+    # The relation is the one `split()` uses: faces sharing an edge that
+    # exactly two faces use.
+    adjacency = np.asarray(mesh.face_adjacency)
+    graph = coo_matrix(
+        (np.ones(len(adjacency), dtype=np.int8), (adjacency[:, 0], adjacency[:, 1])),
+        shape=(len(faces), len(faces)),
+    )
+    part_count, labels = connected_components(graph, directed=False)
+    if stats is not None:
+        stats.parts_before = int(part_count)
+    if part_count <= 1:
+        if stats is not None:
+            stats.parts_after = int(part_count)
+        return mesh
+
+    # Each part's axis-aligned box, over the vertices its faces reference.
+    lows = np.full((part_count, 3), np.inf)
+    highs = np.full((part_count, 3), -np.inf)
+    for corner in range(3):
+        positions = vertices[faces[:, corner]]
+        np.minimum.at(lows, labels, positions)
+        np.maximum.at(highs, labels, positions)
+    extents = highs - lows
+    whole = max(float((highs.max(axis=0) - lows.min(axis=0)).max()), 1e-12)
+    face_counts = np.bincount(labels, minlength=part_count)
+    keep = np.ones(part_count, dtype=bool)
     if min_ratio > 0:
-        sizes = np.array([float(np.max(p.bounding_box.extents)) for p in parts])
-        keep &= sizes / whole >= min_ratio
+        keep &= extents.max(axis=1) / whole >= min_ratio
     if min_thick_ratio > 0:
-        thicks = np.array([float(np.min(p.bounding_box.extents)) for p in parts])
-        keep &= thicks / whole >= min_thick_ratio
+        keep &= extents.min(axis=1) / whole >= min_thick_ratio
     keep[int(np.argmax(face_counts))] = True  # always keep the largest component
 
     if stats is not None:
@@ -238,7 +262,9 @@ def drop_small_parts(
     )
     if not (~keep).any():
         return mesh
-    return trimesh.util.concatenate([p for p, k in zip(parts, keep, strict=True) if k])
+    kept_faces = faces[keep[labels]]
+    used, compact = np.unique(kept_faces.ravel(), return_inverse=True)
+    return trimesh.Trimesh(vertices=vertices[used], faces=compact.reshape(-1, 3), process=False)
 
 
 def clean(

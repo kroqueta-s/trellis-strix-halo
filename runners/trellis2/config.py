@@ -162,6 +162,7 @@ def texture_weights_present() -> bool:
         return False
     return any(name.startswith("tex_slat_flow_model") for name in models)
 
+
 # --- Post-processing -------------------------------------------------------
 # Decimate to this many faces **before anything else is done to the mesh**.
 # 0 turns it off and the model's own tessellation is kept.
@@ -202,8 +203,46 @@ CLOSE_HOLES: bool = _bool("TRELLIS2_CLOSE_HOLES", True)
 # 0 closes everything. `metrics.post.fan_area_fraction` reports what it cost.
 CLOSE_MAX_EXTENT: float = _float("TRELLIS2_CLOSE_MAX_EXTENT", 0.05)
 
+# Make a solid out of the surface before the manifold conversion. **The
+# decoder's output is a thin, incomplete, double-walled skin, not a solid**
+# (measured 2026-09-12: its cross-sections are open arcs, and no flood from
+# outside can tell the hollow from the air), and a manifold sewn out of it
+# encloses a tenth of the silhouette's volume. `metrics.post.shell` reports
+# what the solid took and holds.
+SHELL: bool = _bool("TRELLIS2_SHELL", True)
+
+# How the solid is decided. `carve` keeps the outer surface exactly where the
+# model put it and fills everything behind it: a corner is air only when it can
+# see the outside, unblocked, in enough of 98 directions. `band` makes every
+# point within half a wall of the surface solid, which guarantees a wall but
+# grows the silhouette by half of it and rounds off detail narrower than the
+# wall. Measured 2026-09-12 on the 512 mecha: carve keeps the hydraulics and
+# track links that a 3 mm band rounds away, and its rays take a few seconds
+# on the GPU.
+SHELL_MODE: str = _str("TRELLIS2_SHELL_MODE", "carve")
+
+# Carving: air must see the outside in at least this many of 98 directions.
+# **Measured 4**: a bowl twice as deep as it is wide keeps its hollow up to 4
+# and starts to fill at 6, while the specimen's interior is filled from 2 on
+# (its solid moves by 0.002 between 2 and 4).
+SHELL_VISIBILITY: int = _int("TRELLIS2_SHELL_VISIBILITY", 4)
+
+# Band only: the wall, as a fraction of the longest side. **The runner does
+# not know millimetres**: 0.0375 is 3 mm on an 80 mm print.
+SHELL_THICKNESS: float = _float("TRELLIS2_SHELL_THICKNESS", 0.0375)
+
+# Cells along the longest side for the lattice. Memory is about lattice^3 x a
+# dozen bytes: 512 peaks near 2.5 GB; 1024 would be eight times that.
+SHELL_GRID: int = _int("TRELLIS2_SHELL_GRID", 512)
+
+# Band only: fill every enclosed pocket. Carving always fills them - a print
+# wants a solid, and `forge.hollow` is where a hollow one is made.
+SHELL_FILL_CAVITIES: bool = _bool("TRELLIS2_SHELL_FILL_CAVITIES", True)
+
 # Separate the touching sheets, cut what cannot be oriented, and close the
-# seams, so that the mesh is a closed orientable manifold. **This is what makes
+# seams, so that the mesh is a closed orientable manifold. **After the shell
+# this only separates surface-nets sheets that touch along an edge** and
+# closes nothing (measured 2026-09-12: `fan_area_fraction` 0.0). **This is what makes
 # `manifold3d` - and therefore forge's `repair_manifold` - accept it**:
 # measured 2026-09-12, `Error.NoError`, 1,517,778 triangles, genus 1207, where
 # without it manifold3d refuses and forge reports "repairing did not make this

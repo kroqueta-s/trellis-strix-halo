@@ -30,11 +30,10 @@ import trimesh
 from PIL import Image
 
 from runners.trellis import close_holes as holes
-from runners.trellis import split_manifold
-from runners.trellis import postprocess, shims
+from runners.trellis import postprocess, shims, split_manifold
 from runners.trellis.steps import StepCounter, count_tqdm
 
-from . import config, texture
+from . import config, shell, texture
 
 NAME = "trellis2"
 VERSION = "4B"
@@ -284,10 +283,10 @@ def _topology(mesh: trimesh.Trimesh) -> dict[str, Any]:
     flags carry no inside or outside, and correcting that costs more than the
     generation - so it is downstream work, after decimation.
     """
-    _, counts = np.unique(mesh.edges_sorted, axis=0, return_counts=True)
+    boundary, non_manifold = split_manifold.count_non_manifold(mesh)
     return {
-        "boundary_edges": int((counts == 1).sum()),
-        "non_manifold_edges": int((counts > 2).sum()),
+        "boundary_edges": boundary,
+        "non_manifold_edges": non_manifold,
         "watertight": bool(mesh.is_watertight),
         "winding_consistent": bool(mesh.is_winding_consistent),
         "volume": float(mesh.volume),
@@ -676,6 +675,42 @@ def _postprocess(
         bake_report["faces"] = int(len(surface.faces))
         bake_report["enabled"] = True
         report["texture_sec"] = round(time.perf_counter() - mark, 2)
+
+    # **The print mesh is a solid made from the surface, not the surface
+    # sewn shut.** The decoder's output is a thin, incomplete, double-walled
+    # skin (see `shell`), so sewing it gives a manifold that encloses a tenth
+    # of the silhouette's volume with a quarter of it wound inside-out. Carving
+    # the exterior out by visibility keeps the outer surface where the model
+    # put it and fills everything behind it.
+    if config.SHELL:
+        mark = time.perf_counter()
+        if progress is not None:
+            what = (
+                f"carving the exterior by visibility ({config.SHELL_VISIBILITY} of 98 rays)"
+                if config.SHELL_MODE == "carve"
+                else f"thickening into a wall {config.SHELL_THICKNESS:.4f} of the longest side"
+            )
+            progress("shell", f"{what} on a {config.SHELL_GRID} grid")
+        mesh, shell_report = shell.solidify(
+            mesh,
+            grid=config.SHELL_GRID,
+            mode=config.SHELL_MODE,
+            visibility=config.SHELL_VISIBILITY,
+            thickness=config.SHELL_THICKNESS,
+            fill_cavities=config.SHELL_FILL_CAVITIES,
+        )
+        report["shell"] = shell_report.as_dict()
+        report["shell_sec"] = round(time.perf_counter() - mark, 2)
+        # The offset surface has about as many faces as the input; the same
+        # budget applies to it.
+        if 0 < target < len(mesh.faces):
+            mark = time.perf_counter()
+            if progress is not None:
+                progress(
+                    "decimate", f"reducing the shell's {len(mesh.faces):,} faces to {target:,}"
+                )
+            mesh = decimate(mesh, target)
+            report["shell_decimate_sec"] = round(time.perf_counter() - mark, 2)
 
     if config.MAKE_MANIFOLD:
         mark = time.perf_counter()

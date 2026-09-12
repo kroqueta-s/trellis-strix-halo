@@ -108,12 +108,22 @@ runs instead is decimation, debris removal and hole closing. On the mecha at
 | Close holes | 70.3 s | **10.0 s** |
 | **Total** | **125.5 s** | **63.3 s** |
 
-With `make_manifold` on as well, a 512 run of the mecha spends 3.1 s
+With `make_manifold` on as well, a 512 run of the mecha spent 3.1 s
 decimating, 34.9 s dropping debris, 9.3 s closing holes and **59.7 s becoming a
-manifold**, against 44.0 s to generate. **The post-processing is the expensive
-half again**, and the two stages worth attacking are the debris removal — it
-scales with the component count rather than the faces — and the manifold
-conversion.
+manifold**, against 44.0 s to generate — the post-processing was the expensive
+half again. **Those numbers were the implementation's, not the problem's**
+(measured 2026-09-12, same specimens):
+
+| Stage | Before | After | What it was |
+|---|--:|--:|---|
+| Drop debris, 28,608 parts (1.5 M faces) | 12.7 s | **0.8 s** | `trimesh.split` built a `Trimesh` per part, and ran `fill_holes()` on each |
+| `make_manifold`, six steps (1.34 M faces) | 36.0 s | **6.4 s** | `np.unique(axis=0)` over 4 M edge rows, 2.1 s a call, a dozen calls |
+| `orient_faces`, 200 k faces in 9,973 components | 56.9 s | **0.2 s** | One breadth-first search per component, each allocating the whole mesh |
+
+The debris removal no longer depends on the part count, and it no longer fills
+holes as a side effect — that was never asked of it, and `close_holes` is the
+stage that does it on purpose. `tests/test_edge_keys.py` holds the replaced
+implementations and checks that every answer is unchanged.
 
 **Decimation runs first because everything after it is proportional to
 something it reduces.** It costs 3.3 s to take 3.33 M faces to 700 k, for a
@@ -122,8 +132,73 @@ within 0.9 % — and it *improves* the topology on the way: non-manifold edges
 15,860 → 10,097, boundary edges 118,777 → 26,959, because the slivers collapse.
 `target_faces` controls it; **0 turns it off**.
 
-Dropping debris scales with the **component count**, not the face count (87,630
-parts on that mesh), which is why it barely moves between the two columns.
+Dropping debris used to scale with the **component count** (87,630 parts on
+that mesh), which is why it barely moved between the two columns; see the
+table above for what that cost actually was.
+
+### The print mesh is carved out of the surface, because the model does not produce a solid
+
+**What the decoder emits is a thin, double-walled, incomplete skin.**
+Cross-sections of the 512 specimen on the primal lattice show every part
+outlined twice — an outer and an inner surface two or three cells apart — and
+the outlines are open arcs as often as closed loops. So the space between the
+walls and the space inside are connected to the outside through gaps at every
+scale: flooding the lattice from outside reaches the interior with the floor
+sealed, and with every opening up to 24 cells wide closed. That is why sewing
+the surface shut (`make_manifold` alone) gave a manifold enclosing a volume of
+0.0023 against a silhouette near 0.05, with a quarter of the points near the
+surface at winding number −1: a surface that does not separate an inside from
+an outside has no orientation to propagate, and no fill can say which side is
+which.
+
+**Visibility can.** A point of the exterior is seen from far away in many
+directions; a point in the hollow behind the skin is seen, if at all, only
+through a gap, from a few. `runners/trellis2/shell.py` casts rays in 98
+directions across the lattice with the surface as the occluder and keeps, as
+air, every corner that escapes in at least `TRELLIS2_SHELL_VISIBILITY` of them
+(the space carving of a visual hull); everything else is solid, and the
+boundary of that solid is extracted with surface nets. **The outer surface
+stays where the model put it, nothing grows outward, and the inside is
+filled** — what a slicer wants, and what `forge.hollow` takes apart again
+downstream when a print should be hollow. Closed by construction, and
+oriented by which side is solid.
+
+The threshold is measured. On the specimen the count of visible directions is
+sharply bimodal — 3.2 M corners see none, a plateau from twelve to sixteen,
+the exterior at ninety and more — and the solid moves by 0.002 between a
+threshold of 2 and 4. A bowl twice as deep as it is wide (an annulus with a
+floor, `tests/test_shell.py`) keeps its hollow up to 4 and starts to fill at 6.
+So the default is 4: deep concavities stay open, gaps do not let the inside
+leak out.
+
+Measured on the 512 mecha (1.34 M faces at the input, a 516-cell lattice):
+
+| Step | Seconds |
+|---|--:|
+| Rasterize the surface (13 samples per triangle, a half-cell grid on any wider one) | 3.0 |
+| 98 rays on the GPU, pockets, erosion, chamfer distance | 7.2 |
+| Surface nets (2.26 M faces) | 1.3 |
+| Decimate to 1.5 M | 1.5 |
+| `make_manifold` (nothing to close) | 5.3 |
+
+`manifold3d` accepts it (`NoError`), the volume is 0.042, and the solid's
+surface sits within a cell of the input's (median 0.94 cells, 95th percentile
+3.6 — the larger distances are the caps over gaps, where there was no input
+surface to be near). Hydraulics, track links and panel lines survive by eye.
+
+Through the runner on the same image at 512: generation 51.1 s, then
+decimation 2.7 s, debris 1.5 s (71,473 parts), holes 1.3 s, **carving
+12.8 s**, decimation of the solid 1.3 s and `make_manifold` 5.4 s —
+**25 s of post-processing**, against 80 s before this work, for a mesh that
+is watertight, edge-manifold, consistently wound and 0.0423 in volume.
+
+`TRELLIS2_SHELL_MODE=band` is the older construction: every point within
+half of `TRELLIS2_SHELL_THICKNESS` of the surface is solid, which guarantees a
+wall thickness (0.0375 is 3 mm on an 80 mm print) but grows the silhouette by
+half a wall and rounds off detail narrower than the wall — measured on the
+same specimen, 17.5 s and a volume of 0.0977 at 3 mm, with the hydraulics
+rounded away. `metrics.post.shell` reports which mode ran, the threshold, the
+pockets filled and the solid's volume.
 
 ### What comes out
 
@@ -292,13 +367,14 @@ Read-only preset is enough.
   (`Error.NoError`, genus 1207), which is what meshforge's `repair_manifold`
   needs. `TRELLIS2_MAKE_MANIFOLD=off` returns the model's own surface instead.
 
-  **It costs, and the cost is in `metrics`.** Closing those seams adds patch
-  worth **2.2–2.5× the input surface area**
-  (`post.manifold.close.fan_area_fraction`), nearly all of it internal — the
-  silhouette and the detail survive, checked by eye — while the enclosed volume
-  comes out at 0.0023 against 0.024 for the open surface, which says the inside
-  is a nest of shells rather than a solid. **Topologically clean is not the same
-  as printable**, and that part is not verified yet.
+  **Sewn on its own it is not a solid.** Closing those seams adds patch worth
+  **2.2–2.5× the input surface area**
+  (`post.manifold.close.fan_area_fraction`), nearly all of it internal, and
+  the enclosed volume comes out at 0.0023 with a quarter of the space near the
+  surface wound inside-out — because the surface is a double-walled skin with
+  gaps at every scale (see *The print mesh is carved out of the surface*). With `TRELLIS2_SHELL=on`,
+  the default, `make_manifold` runs on the shell instead and has nothing to
+  close; the sewn manifold is what `TRELLIS2_SHELL=off` gives.
 - **Half the faces are wound the other way** (49.2 % at 512). Correcting that
   costs more than the generation on an undecimated mesh, so it is left to the
   caller, after decimation. `tools/render_mesh.py --two-sided` exists because a
