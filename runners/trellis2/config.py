@@ -141,6 +141,19 @@ TEXTURE_SIZE: int = _int("TRELLIS2_TEXTURE_SIZE", 2048)
 # per triangle, against 2.8 at 1.5 M. 0 unwraps the mesh as it stands.
 TEXTURE_TARGET_FACES: int = _int("TRELLIS2_TEXTURE_TARGET_FACES", 200_000)
 
+# How many times the face normals are averaged over the adjacency before the
+# chart direction is read off them (`charts.project_charts`). **Measured
+# 2026-09-12** on the carved 512 mecha at 200,000 faces: 3 rounds put 64% of the
+# faces in charts of fifty or more, 10 put 69%, 30 put 73% - diminishing
+# returns against a growing blur of genuinely different directions.
+CHART_SMOOTHING: int = _int("TRELLIS2_CHART_SMOOTHING", 10)
+
+# Charts smaller than this are merged into the neighbour they share the most
+# edges with. **A chart of five triangles carries no picture**, which is exactly
+# what xatlas produced when it chose the charts itself (50,052 of them from
+# 200,000 faces). 50 is the size at which a chart is worth a seam.
+CHART_MIN_FACES: int = _int("TRELLIS2_CHART_MIN_FACES", 50)
+
 # Rounds of spreading the colours past the edge of each chart. **Without it a
 # renderer filtering across a seam pulls in the empty background and draws a
 # black line along every cut.** 4 is enough for bilinear filtering at any

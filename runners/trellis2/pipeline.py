@@ -661,30 +661,6 @@ def _postprocess(
         report.update(stats.as_dict())
         report["close_holes_sec"] = round(time.perf_counter() - mark, 2)
 
-    # **The bake goes here, and the position is the whole design.** A UV atlas
-    # belongs to the vertices and faces it was built for, so it has to be made
-    # after everything that rewrites them and before anything else does. What
-    # comes next is `make_manifold`, which adds patch worth 2.2-2.5x the input
-    # surface area (measured 2026-09-12): an atlas built after it would spend
-    # about 69% of its texels on internal membrane nobody ever sees.
-    textured: trimesh.Trimesh | None = None
-    bake_report: dict[str, Any] = {"enabled": bake_query is not None}
-    if bake_query is not None:
-        mark = time.perf_counter()
-        if progress is not None:
-            progress("texture", f"unwrapping and baking a {texture_size}x{texture_size} texture")
-        # **A coarser mesh than the one that gets printed**, because the
-        # unwrap - not the bake - is what costs, and the texture carries the
-        # detail the triangles no longer do.
-        target = int(config.TEXTURE_TARGET_FACES)
-        surface = decimate(mesh, target) if 0 < target < len(mesh.faces) else mesh
-        textured, bake_report = texture.bake(
-            surface, bake_query, texture_size, config.TEXTURE_DILATE
-        )
-        bake_report["faces"] = int(len(surface.faces))
-        bake_report["enabled"] = True
-        report["texture_sec"] = round(time.perf_counter() - mark, 2)
-
     # **The print mesh is a solid made from the surface, not the surface
     # sewn shut.** The decoder's output is a thin, incomplete, double-walled
     # skin (see `shell`), so sewing it gives a manifold that encloses a tenth
@@ -720,6 +696,29 @@ def _postprocess(
                 )
             mesh = decimate(mesh, target)
             report["shell_decimate_sec"] = round(time.perf_counter() - mark, 2)
+
+    # **The bake goes after the carve, and the position is the whole design.**
+    # A UV atlas belongs to the vertices and faces it was built for, so it has
+    # to be made after everything that rewrites them. The carved solid is the
+    # right surface to take it from: its winding is consistent, which is half
+    # of why xatlas shattered the raw output, and its silhouette is the same.
+    # `make_manifold` after this only welds; it does not move the outside.
+    textured: trimesh.Trimesh | None = None
+    bake_report: dict[str, Any] = {"enabled": bake_query is not None}
+    if bake_query is not None:
+        mark = time.perf_counter()
+        if progress is not None:
+            progress("texture", f"charting and baking a {texture_size}x{texture_size} texture")
+        # **A coarser mesh than the one that gets printed**, because the atlas
+        # carries the detail the triangles no longer do - and the packing cost
+        # follows the face count.
+        budget = int(config.TEXTURE_TARGET_FACES)
+        surface = decimate(mesh, budget) if 0 < budget < len(mesh.faces) else mesh
+        textured, bake_report = texture.bake(
+            surface, bake_query, texture_size, config.TEXTURE_DILATE
+        )
+        bake_report["enabled"] = True
+        report["texture_sec"] = round(time.perf_counter() - mark, 2)
 
     if config.MAKE_MANIFOLD:
         mark = time.perf_counter()
