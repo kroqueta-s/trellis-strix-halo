@@ -44,7 +44,7 @@ runner reports `forward_axis: null` and why these were turned by hand
 
 ![TRELLIS.1 mesh](assets/trellis1_mesh.png)
 
-**TRELLIS.2 at 1024** — 1,496,458 faces, a solid carved out of the surface:
+**TRELLIS.2 at 1024** — 1,503,346 faces, a solid carved out of the surface:
 watertight, one part, and what gets printed.
 
 ![TRELLIS.2 mesh](assets/trellis2_mesh.png)
@@ -79,15 +79,19 @@ own surface comes out at 7,402,100 faces with the panel creases and the
 cylinders sharp. What blunts them is the carve, which rebuilds the model as a
 printable solid on a lattice of 512 cells - 0.16 mm on an 80 mm print - and
 leaves that quantisation behind as a fine corduroy on flat panels. Carving on
-the lattice the shape was decoded on (`TRELLIS2_SHELL_GRID=1024`) removes it,
-and cost 102 s more on the beetle; `TRELLIS2_SHELL=off` hands back the
-decoder's surface, which is sharper still and neither watertight nor
-printable. **And the colour comes out flatter than the image**: the beetle's
-red and blue trim is gone. Counting pixels whose strongest and weakest channel
+the lattice the shape was decoded on (`TRELLIS2_SHELL_GRID=1024`) takes the
+corduroy off and cost 102 s more on the beetle, **but it is not simply better**
+- the rays reach further through the gaps that are left, and the solid loses
+9-15% of its volume. It buys a different solid, not a finer one, which is why
+512 is the default. `TRELLIS2_SHELL=off` hands back the decoder's surface,
+which is sharper still and neither watertight nor printable.
+
+**And the colour comes out flatter than the image**: the beetle's red and blue
+trim is gone. Counting pixels whose strongest and weakest channel
 differ by more than a tenth, the beetle's texture has 1.1% against its image's
 4.9%, and the dragon's 0.3% against 8.6%.
 
-Generation took 115 s for the dragon and 237 s for the beetle, including the
+Generation took 105 s for the dragon and 212 s for the beetle, including the
 texture and the post-processing; GitHub renders a GIF in a README but not a
 GLB, which is why these turn rather than being models you can orbit.
 
@@ -192,22 +196,22 @@ is quoted is the median of the rest:
 | | TRELLIS.1 | TRELLIS.2 at 512 | TRELLIS.2 at 1024 |
 |---|--:|--:|--:|
 | Load the weights | 15.2 s | 63.6 s | 63.4 s |
-| Preprocess and condition | 0.4 s | 2.0 s | 3.4 s |
-| Sparse structure | 13.2 s | 17.1 s | 21.0 s |
-| Structured latent | 31.6 s | 22.6 s | 164.9 s |
-| Decode to a mesh | 2.6 s | 5.2 s | 19.8 s |
-| **Generate the shape** | **47.7 s** | **46.8 s** | **209.1 s** |
-| Sample the texture latent | — | 13.3 s | 94.3 s |
-| Post-processing | 22.4 s | 42.4 s | 95.4 s |
-| **End to end, weights already loaded** | **70.1 s** | **105.7 s** | **405.2 s** |
-| Faces out | 517,498 | 1,502,692 | 1,496,458 |
+| Preprocess and condition | 0.4 s | 1.9 s | 3.2 s |
+| Sparse structure | 13.2 s | 16.9 s | 19.9 s |
+| Structured latent | 31.6 s | 22.2 s | 163.0 s |
+| Decode to a mesh | 2.6 s | 5.2 s | 19.7 s |
+| **Generate the shape** | **47.7 s** | **46.2 s** | **205.6 s** |
+| Sample the texture latent | — | 13.2 s | 93.8 s |
+| Post-processing | 22.4 s | 40.5 s | 85.4 s |
+| **End to end, weights already loaded** | **70.1 s** | **103.1 s** | **387.0 s** |
+| Faces out | 517,498 | 1,503,006 | 1,503,346 |
 | Peak VRAM | 12.6 GB | 5.9 GB | 16.5 GB |
 
 **They are not the same job.** TRELLIS.1 generates a surface and cleans it;
 TRELLIS.2 also samples a second latent for colour, carves a printable solid
 out of the surface, decodes the colours onto that solid's own grid and bakes a
-2048² texture — which is where its post-processing goes (at 1024: 12.5 s to
-decimate, 15.1 s to carve, 46.7 s for the colours, 7.5 s for the atlas, 7.1 s
+2048² texture — which is where its post-processing goes (at 1024: 12.7 s to
+decimate, 15.8 s to carve, 40.4 s for the colours, 5.3 s for the atlas, 6.9 s
 to make it a manifold). Both come back watertight, in one part and
 consistently wound, checked on the meshes these numbers came from.
 

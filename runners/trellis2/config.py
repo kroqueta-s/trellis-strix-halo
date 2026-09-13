@@ -292,7 +292,17 @@ TARGET_FACES: int = _int("TRELLIS2_TARGET_FACES", 1_500_000)
 # Drop free-floating parts smaller than this fraction of the longest side.
 # **Measured 2026-09-11**: at 512 that is 18,893 parts and 121,716 faces (3.5%),
 # at 1024 it is 81,313 parts and 651,488 faces (4.4%). Set to 0 to keep them.
-DROP_SMALL_PARTS: float = _float("TRELLIS2_DROP_SMALL_PARTS", 0.10)
+#
+# **Lowered from 0.10 to 0.05 on 2026-09-13**, because 0.10 came from the
+# TRELLIS.1 robot, whose smallest real part was 15% of the longest side, and it
+# does not carry over: on the mechanical-beetle specimen a foot is 6% and the
+# pair of sensor spheres on its back 5.8%, so all of them were thrown away as
+# debris. They are separated from real debris by `DROP_THIN_PARTS` instead -
+# the spheres are 3.4% thick against the flakes' 0.1-1.4% - which is the test
+# that was doing the work all along. Measured on the beetle: the feet come back
+# (85 vertices in one foot's box against 2,138), the part count goes from 1 to
+# 4, and both the post-processing and the manifold repair take the same time.
+DROP_SMALL_PARTS: float = _float("TRELLIS2_DROP_SMALL_PARTS", 0.05)
 
 # Drop parts thinner than this fraction of the longest side. **The threshold is
 # the TRELLIS.1 runner's measured one** (flakes there came out 0.1-1.4% thick
@@ -351,6 +361,7 @@ SHELL_THICKNESS: float = _float("TRELLIS2_SHELL_THICKNESS", 0.0375)
 # times the plate one corner thick - 0.078 mm at that size - for 110.5 s of
 # carving against 17.3 s. Finer here buys a different solid, not a finer one.
 SHELL_GRID: int = _int("TRELLIS2_SHELL_GRID", 512)
+
 
 # Band only: fill every enclosed pocket. Carving always fills them - a print
 # wants a solid, and `forge.hollow` is where a hollow one is made.
