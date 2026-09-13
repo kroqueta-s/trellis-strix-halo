@@ -55,6 +55,29 @@ pixel here rather than per vertex, which is the only way to see a seam.
 
 ![TRELLIS.2 texture](assets/trellis2_texture.png)
 
+### What the detail is for
+
+A toy robot is smooth, and a million and a half faces do not show on it. These
+two ask more of the mesh: machinery with joints and panel lines, and an
+organic shape with membranes, scales and spines. Both are TRELLIS.2 at 1024,
+turning, shaded without their colour so that the geometry is what you see.
+
+| Input | The mesh, turning |
+|---|---|
+| ![beetle](assets/beetle.png) | ![beetle turning](assets/beetle_turntable.gif) |
+| ![dragon](assets/dragon.png) | ![dragon turning](assets/dragon_turntable.gif) |
+
+The legs keep their segments and the horn its curve; the wing membranes come
+through with the ribs in them, and the tail keeps its spikes. **Thin things
+are the hard case here** - the carve builds a printable solid on a lattice of
+512 cells, which is 0.16 mm on an 80 mm print, so anything thinner than that
+is thickened to it. What you are seeing is that solid, not the decoder's own
+surface.
+
+Generation took 115 s for the dragon and 237 s for the beetle, including the
+texture and the post-processing; GitHub renders a GIF in a README but not a
+GLB, which is why these turn rather than being models you can orbit.
+
 ## Prerequisites
 
 - Windows 11
