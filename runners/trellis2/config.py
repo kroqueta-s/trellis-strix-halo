@@ -292,7 +292,17 @@ TARGET_FACES: int = _int("TRELLIS2_TARGET_FACES", 1_500_000)
 # Drop free-floating parts smaller than this fraction of the longest side.
 # **Measured 2026-09-11**: at 512 that is 18,893 parts and 121,716 faces (3.5%),
 # at 1024 it is 81,313 parts and 651,488 faces (4.4%). Set to 0 to keep them.
-DROP_SMALL_PARTS: float = _float("TRELLIS2_DROP_SMALL_PARTS", 0.10)
+#
+# **Lowered from 0.10 to 0.05 on 2026-09-13**, because 0.10 came from the
+# TRELLIS.1 robot, whose smallest real part was 15% of the longest side, and it
+# does not carry over: on the mechanical-beetle specimen a foot is 6% and the
+# pair of sensor spheres on its back 5.8%, so all of them were thrown away as
+# debris. They are separated from real debris by `DROP_THIN_PARTS` instead -
+# the spheres are 3.4% thick against the flakes' 0.1-1.4% - which is the test
+# that was doing the work all along. Measured on the beetle: the feet come back
+# (85 vertices in one foot's box against 2,138), the part count goes from 1 to
+# 4, and both the post-processing and the manifold repair take the same time.
+DROP_SMALL_PARTS: float = _float("TRELLIS2_DROP_SMALL_PARTS", 0.05)
 
 # Drop parts thinner than this fraction of the longest side. **The threshold is
 # the TRELLIS.1 runner's measured one** (flakes there came out 0.1-1.4% thick
@@ -352,6 +362,7 @@ SHELL_THICKNESS: float = _float("TRELLIS2_SHELL_THICKNESS", 0.0375)
 # carving against 17.3 s. Finer here buys a different solid, not a finer one.
 SHELL_GRID: int = _int("TRELLIS2_SHELL_GRID", 512)
 
+
 # Band only: fill every enclosed pocket. Carving always fills them - a print
 # wants a solid, and `forge.hollow` is where a hollow one is made.
 SHELL_FILL_CAVITIES: bool = _bool("TRELLIS2_SHELL_FILL_CAVITIES", True)
@@ -364,6 +375,30 @@ SHELL_FILL_CAVITIES: bool = _bool("TRELLIS2_SHELL_FILL_CAVITIES", True)
 # dropping everything under it leaves the volume unchanged to five digits.
 # 0 keeps every piece. `metrics.post.shell.islands_dropped` counts them.
 SHELL_ISLAND_CORNERS: int = _int("TRELLIS2_SHELL_ISLAND_CORNERS", 64)
+
+# Carve only: rounds of Taubin smoothing on the extracted surface. **A surface
+# that crosses the lattice at a shallow angle comes out in steps**, and surface
+# nets cannot smooth them on a wall one or two cells thick - the dragon's wings
+# came out as flat terraces a cell apart. Taubin's second, negative pass is what
+# makes this safe: the volume moves 0.07-0.17% and the median vertex a fifth of
+# a cell, while the beetle's panel lines are still sharp at twice this many
+# rounds. **Measured 5** (2026-09-13): three already clears the terracing, five
+# is smoother, ten begins to soften a crease. 0 turns it off, and the surface is
+# then exactly the boundary of the lattice's occupancy.
+SHELL_SMOOTH: int = _int("TRELLIS2_SHELL_SMOOTH", 5)
+
+# Carve only: how far, in cells, a vertex may be moved back onto the surface it
+# was carved from. **The lattice settles what is solid; it does not have to
+# settle where the surface is.** Measured 2026-09-13 on the mechanical beetle:
+# the mesh going into the carve sits 0.23 of a cell from the decoder's own
+# surface and the mesh coming out sits 0.72, with creases at 0.97 - and none of
+# that is the decimation or the repair, which add nothing. Moving each vertex
+# back onto the rasterized surface brings the flats to 0.38 and the creases to
+# 0.49, which is what a softened edge was. 57% of the vertices move, the solid
+# loses 3.8% of its volume on the beetle and 11% on the dragon, whose membranes
+# stop straddling their own sheet and sit on it. 0 leaves the surface where the
+# lattice put it.
+SHELL_SNAP: float = _float("TRELLIS2_SHELL_SNAP", 1.5)
 
 # Separate the touching sheets, cut what cannot be oriented, and close the
 # seams, so that the mesh is a closed orientable manifold. **After the shell

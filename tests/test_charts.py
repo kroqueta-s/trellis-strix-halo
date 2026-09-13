@@ -64,13 +64,18 @@ def test_no_two_charts_occupy_the_same_coordinates() -> None:
     """
     box = trimesh.creation.box()
     _v, faces, uvs, report = project_charts(box, smoothing_rounds=0, min_faces=1)
-    boxes = [(uvs[chart].min(axis=0), uvs[chart].max(axis=0)) for chart in _chart_of(faces, report.charts)]
+    boxes = [
+        (uvs[chart].min(axis=0), uvs[chart].max(axis=0))
+        for chart in _chart_of(faces, report.charts)
+    ]
     for i, (low, high) in enumerate(boxes):
         for j, (other_low, other_high) in enumerate(boxes[i + 1 :], start=i + 1):
             apart = (high[0] <= other_low[0] or other_high[0] <= low[0]) or (
                 high[1] <= other_low[1] or other_high[1] <= low[1]
             )
-            assert apart, f"charts {i} and {j} overlap: {low}..{high} against {other_low}..{other_high}"
+            assert apart, (
+                f"charts {i} and {j} overlap: " f"{low}..{high} against {other_low}..{other_high}"
+            )
 
 
 def test_a_sphere_is_a_few_large_charts_with_no_folds() -> None:

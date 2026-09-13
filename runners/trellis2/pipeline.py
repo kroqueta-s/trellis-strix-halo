@@ -1100,19 +1100,71 @@ def _postprocess(
     """
     report: dict[str, Any] = {"faces_before": int(len(mesh.faces))}
 
-    # **First, because everything below is proportional to the face count.**
     target = int(config.TARGET_FACES if target_faces is None else target_faces)
-    if 0 < target < len(mesh.faces):
+
+    def _to_budget(m: trimesh.Trimesh, key: str) -> trimesh.Trimesh:
+        """Reduce to the face budget, timed under `key`."""
+        if not 0 < target < len(m.faces):
+            if target > 0:
+                # **Asked for more faces than there are.** Saying so beats
+                # silently doing nothing: the budget was not met for a reason.
+                report.setdefault(
+                    "decimate_skipped", f"already at {len(m.faces)} faces, target {target}"
+                )
+            return m
         mark = time.perf_counter()
         if progress is not None:
-            progress("decimate", f"reducing {len(mesh.faces):,} faces to {target:,}")
-        mesh = decimate(mesh, target)
+            progress("decimate", f"reducing {len(m.faces):,} faces to {target:,}")
+        out = decimate(m, target)
         report["decimate_to"] = target
-        report["decimate_sec"] = round(time.perf_counter() - mark, 2)
-    elif target > 0:
-        # **Asked for more faces than there are.** Saying so beats silently
-        # doing nothing, because the caller's budget was not met for a reason.
-        report["decimate_skipped"] = f"already at {len(mesh.faces)} faces, target {target}"
+        report[key] = round(time.perf_counter() - mark, 2)
+        return out
+
+    def _carve(m: trimesh.Trimesh) -> trimesh.Trimesh:
+        """The solid, then the budget, then the debris the first two made."""
+        mark = time.perf_counter()
+        if progress is not None:
+            what = (
+                f"carving the exterior by visibility ({config.SHELL_VISIBILITY} of 98 rays)"
+                if config.SHELL_MODE == "carve"
+                else f"thickening into a wall {config.SHELL_THICKNESS:.4f} of the longest side"
+            )
+            progress("shell", f"{what} on a {config.SHELL_GRID} grid")
+        m, shell_report = shell.solidify(
+            m,
+            grid=config.SHELL_GRID,
+            mode=config.SHELL_MODE,
+            visibility=config.SHELL_VISIBILITY,
+            thickness=config.SHELL_THICKNESS,
+            fill_cavities=config.SHELL_FILL_CAVITIES,
+            island_corners=config.SHELL_ISLAND_CORNERS,
+            smooth=config.SHELL_SMOOTH,
+            snap=config.SHELL_SNAP,
+        )
+        report["shell"] = shell_report.as_dict()
+        report["shell_sec"] = round(time.perf_counter() - mark, 2)
+        m = _to_budget(m, "shell_decimate_sec")
+        # **The debris is dropped after the carve, because the carve and the
+        # decimation make their own.** Strays the rays could not reach, and
+        # two-face slivers the decimation pinches off the surface (measured
+        # 2026-09-12 on the 512 specimen: 229 of them at 1.5 M faces, 2,827
+        # at 1.0 M; 18,699 at 1024). Each part is a term in the manifold
+        # repair downstream, which paid 578 s for 4,729 of them at 1024. It
+        # sits before the bake so that the atlas is not spent on them either.
+        if config.DROP_SMALL_PARTS > 0:
+            mark = time.perf_counter()
+            if progress is not None:
+                progress("drop_parts", "dropping free-floating debris")
+            m, dropped = drop_debris(m, config.DROP_SMALL_PARTS, config.DROP_THIN_PARTS)
+            report["shell_parts_before"] = dropped["parts_before"]
+            report["shell_parts_after"] = dropped["parts_after"]
+            report["shell_dropped_parts"] = dropped["dropped_parts"]
+            report["shell_dropped_faces"] = dropped["dropped_faces"]
+            report["shell_drop_parts_sec"] = round(time.perf_counter() - mark, 2)
+        return m
+
+    # **First, because everything below is proportional to the face count.**
+    mesh = _to_budget(mesh, "decimate_sec")
 
     if config.FIX_WINDING:
         mark = time.perf_counter()
@@ -1122,7 +1174,18 @@ def _postprocess(
         trimesh.repair.fix_normals(mesh)
         report["fix_winding_sec"] = round(time.perf_counter() - mark, 2)
 
-    if config.DROP_SMALL_PARTS > 0:
+    # **The debris pass belongs after the carve, not before it.** Judging a part
+    # before the carve judges it in the wrong state: the decimation above pinches
+    # thin joints apart, so a foot that the decoder had attached to its leg
+    # arrives here as a free piece of 6% of the longest side and is deleted as
+    # debris - while the carve, which is next, would have put it back into the
+    # solid. Measured 2026-09-13 on the mechanical-beetle specimen: with this
+    # pass one foot's box held 85 vertices, without it 2,337, and all six went
+    # the same way along with the antennae and the sensor spheres. Dropping it
+    # here costs nothing and the solid comes out 10% larger (0.03416 against
+    # 0.03754). **When nothing carves, it is the only pass there is**, so it
+    # still runs.
+    if config.DROP_SMALL_PARTS > 0 and not config.SHELL:
         mark = time.perf_counter()
         if progress is not None:
             progress("drop_parts", "dropping free-floating debris")
@@ -1138,60 +1201,14 @@ def _postprocess(
         report.update(stats.as_dict())
         report["close_holes_sec"] = round(time.perf_counter() - mark, 2)
 
-    # **The print mesh is a solid made from the surface, not the surface
-    # sewn shut.** The decoder's output is a thin, incomplete, double-walled
-    # skin (see `shell`), so sewing it gives a manifold that encloses a tenth
-    # of the silhouette's volume with a quarter of it wound inside-out. Carving
-    # the exterior out by visibility keeps the outer surface where the model
-    # put it and fills everything behind it.
+    # **The print mesh is a solid made from the surface, not the surface sewn
+    # shut.** The decoder's output is a thin, incomplete, double-walled skin
+    # (see `shell`), so sewing it gives a manifold that encloses a tenth of the
+    # silhouette's volume with a quarter of it wound inside-out. Carving the
+    # exterior out by visibility keeps the outer surface where the model put it
+    # and fills everything behind it.
     if config.SHELL:
-        mark = time.perf_counter()
-        if progress is not None:
-            what = (
-                f"carving the exterior by visibility ({config.SHELL_VISIBILITY} of 98 rays)"
-                if config.SHELL_MODE == "carve"
-                else f"thickening into a wall {config.SHELL_THICKNESS:.4f} of the longest side"
-            )
-            progress("shell", f"{what} on a {config.SHELL_GRID} grid")
-        mesh, shell_report = shell.solidify(
-            mesh,
-            grid=config.SHELL_GRID,
-            mode=config.SHELL_MODE,
-            visibility=config.SHELL_VISIBILITY,
-            thickness=config.SHELL_THICKNESS,
-            fill_cavities=config.SHELL_FILL_CAVITIES,
-            island_corners=config.SHELL_ISLAND_CORNERS,
-        )
-        report["shell"] = shell_report.as_dict()
-        report["shell_sec"] = round(time.perf_counter() - mark, 2)
-        # The offset surface has about as many faces as the input; the same
-        # budget applies to it.
-        if 0 < target < len(mesh.faces):
-            mark = time.perf_counter()
-            if progress is not None:
-                progress(
-                    "decimate", f"reducing the shell's {len(mesh.faces):,} faces to {target:,}"
-                )
-            mesh = decimate(mesh, target)
-            report["shell_decimate_sec"] = round(time.perf_counter() - mark, 2)
-        # **The debris is dropped a second time, because the carve and the
-        # decimation make their own.** The first pass left one part; what is
-        # detached now was made here: strays the rays could not reach, and
-        # two-face slivers the decimation pinches off the surface (measured
-        # 2026-09-12 on the 512 specimen: 229 of them at 1.5 M faces, 2,827
-        # at 1.0 M; 18,699 at 1024). Each part is a term in the manifold
-        # repair downstream, which paid 578 s for 4,729 of them at 1024. The
-        # same pass with the same thresholds leaves 1 part and moves the
-        # volume by 2.5e-4. It sits before the bake so that the atlas is not
-        # spent on them either.
-        if config.DROP_SMALL_PARTS > 0:
-            mark = time.perf_counter()
-            mesh, dropped = drop_debris(mesh, config.DROP_SMALL_PARTS, config.DROP_THIN_PARTS)
-            report["shell_parts_before"] = dropped["parts_before"]
-            report["shell_parts_after"] = dropped["parts_after"]
-            report["shell_dropped_parts"] = dropped["dropped_parts"]
-            report["shell_dropped_faces"] = dropped["dropped_faces"]
-            report["shell_drop_parts_sec"] = round(time.perf_counter() - mark, 2)
+        mesh = _carve(mesh)
 
     # **The bake goes after the carve, and the position is the whole design.**
     # A UV atlas belongs to the vertices and faces it was built for, so it has
