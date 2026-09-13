@@ -20,11 +20,13 @@ also runs standalone (see Quickstart).
 [TRELLIS.2](https://github.com/microsoft/TRELLIS.2)** (`runners/trellis2/`, in
 its own virtual environment). It reaches far more detail - millions of faces
 rather than hundreds of thousands - and upstream needs six CUDA-only packages
-to do it, none of which is compiled here either. What it costs, what it cannot
+to do it, none of which is compiled here either. It carries colour two ways,
+on the vertices and in a UV texture with its metallic, roughness and alpha
+channels, and what it writes for printing is a **solid carved out of the
+surface** rather than the surface sewn shut - watertight, one part, and sliced
+in Bambu Studio with no repair and no warnings. What it costs, what it cannot
 do, and the traps it took to get there are in
-[`docs/trellis2.md`](docs/trellis2.md). **It is not finished**: colour reaches
-the vertices but there is no texture map, and whether the watertight result is
-actually printable has not been checked.
+[`docs/trellis2.md`](docs/trellis2.md).
 
 | Input image | Mesh (4 views) |
 |---|---|
@@ -125,26 +127,44 @@ That is the reason this approach is trustworthy rather than merely plausible.
 
 ## Measurements (ASUS ProArt PX13: Ryzen AI MAX+ 395, Radeon 8060S / gfx1151, 32 GB dedicated VRAM, factory power limits)
 
-One image (`assets/sample.png`), upstream defaults
-`ss_steps = slat_steps = 25`, torch 2.13.0+rocm10.0.0 (the pins in
-`install.ps1`). **Median of 5 runs** (each a fresh process, reference GEMM
-and GPU clock recorded alongside every run), 2026-09-02:
+**Both runners on the same image** (`assets/sample.png`), upstream's own
+sampler defaults, torch 2.13.0+rocm10.0.0 (the pins in `install.ps1`),
+measured 2026-09-13. Each runner was loaded once and asked several times; the
+first answer is thrown away, because MIOpen tunes its kernels on it, and what
+is quoted is the median of the rest:
 
-| Stage | Time (median) |
-|---|--:|
-| Load weights | 13 s |
-| Conditioning | 0.8 s |
-| Sparse structure | 13.8 s |
-| Structured latent | 32.0 s |
-| Decode to mesh | 2.9 s |
-| **Generate total** | **49.6 s** (range 49.4–49.8) |
-| Post-processing (150 views, 1024²) | 60 s |
+| | TRELLIS.1 | TRELLIS.2 at 512 | TRELLIS.2 at 1024 |
+|---|--:|--:|--:|
+| Load the weights | 15.2 s | 63.6 s | 63.4 s |
+| Preprocess and condition | 0.4 s | 2.0 s | 3.4 s |
+| Sparse structure | 13.2 s | 17.1 s | 21.0 s |
+| Structured latent | 31.6 s | 22.6 s | 164.9 s |
+| Decode to a mesh | 2.6 s | 5.2 s | 19.8 s |
+| **Generate the shape** | **47.7 s** | **46.8 s** | **209.1 s** |
+| Sample the texture latent | — | 13.3 s | 94.3 s |
+| Post-processing | 22.4 s | 42.4 s | 95.4 s |
+| **End to end, weights already loaded** | **70.1 s** | **105.7 s** | **405.2 s** |
+| Faces out | 517,498 | 1,502,692 | 1,496,458 |
+| Peak VRAM | 12.6 GB | 5.9 GB | 16.5 GB |
 
-Peak VRAM 11.9 GB. Output 525,912 faces after post-processing, watertight, no
-boundary edges and no non-manifold edges after downstream repair. On the
-previous wheel stack (torch 2.9.1+rocm7.2.1) the same generation took 80 s;
+**They are not the same job.** TRELLIS.1 generates a surface and cleans it;
+TRELLIS.2 also samples a second latent for colour, carves a printable solid
+out of the surface, decodes the colours onto that solid's own grid and bakes a
+2048² texture — which is where its post-processing goes (at 1024: 12.5 s to
+decimate, 15.1 s to carve, 46.7 s for the colours, 7.5 s for the atlas, 7.1 s
+to make it a manifold). Both come back watertight, in one part and
+consistently wound, checked on the meshes these numbers came from.
+
+TRELLIS.1's post-processing was 60 s when this table was first written; the
+debris removal no longer scales with the part count (see
+[`docs/trellis2.md`](docs/trellis2.md), which measured it). On the previous
+wheel stack (torch 2.9.1+rocm7.2.1) the same TRELLIS.1 generation took 80 s;
 the history and the per-operator breakdown are in
 [`docs/gemm_profile.md`](docs/gemm_profile.md).
+
+**Wall-clock time is not a pass/fail signal**: the same settings vary by a few
+per cent run to run, and the first run of a session is slower while MIOpen
+tunes.
 
 Rasterizer throughput on a 697k-face mesh: 61 ms per view at 128², 244 ms at
 1024². Upstream's default of 1000 views would take 244 s, which is why the
@@ -189,8 +209,10 @@ three runners in this family.
   correctly and prints mirrored, so an assumed axis is not a harmless one.
   Real-world size is downstream work.
 
-- **No texture.** Texture baking needs `nvdiffrast` for real; only the
-  rasterizer used by hole filling is replaced here.
+- **No texture** — from this runner. Texture baking needs `nvdiffrast` for
+  real, and only the rasterizer used by hole filling is replaced here. The
+  TRELLIS.2 runner does produce one, by a different route
+  ([`docs/trellis2.md`](docs/trellis2.md)).
 - **No decimation.** Upstream reduces to 5 % of faces before post-processing.
   This runner keeps every face, because the mesh is an input to downstream
   scaling and repair.
