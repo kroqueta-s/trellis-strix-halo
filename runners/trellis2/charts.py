@@ -240,6 +240,26 @@ def _unfold(
     return chart.ravel(), chart_direction[labels], int(len(moved)), int(len(own))
 
 
+def _lay_out_charts(uvs: np.ndarray, chart: np.ndarray, count: int) -> np.ndarray:
+    """Move each chart into its own cell of a grid, keeping its scale.
+
+    The packer is what places the charts in the end; all this has to do is stop
+    two of them from occupying the same coordinates, which is what makes the
+    packer merge them. The cell is the largest chart's box, so nothing spills
+    into a neighbour, and the grid is square for no reason other than tidiness.
+    """
+    low = np.full((count, 2), np.inf)
+    high = np.full((count, 2), -np.inf)
+    np.minimum.at(low, chart, uvs)
+    np.maximum.at(high, chart, uvs)
+    # A chart with one degenerate axis still needs a cell.
+    cell = np.maximum((high - low).max(axis=0), 1e-6) * 1.05
+    columns = int(np.ceil(np.sqrt(count)))
+    index = np.arange(count)
+    origin = np.stack([(index % columns) * cell[0], (index // columns) * cell[1]], axis=1)
+    return uvs - low[chart] + origin[chart]
+
+
 def project_charts(
     mesh: trimesh.Trimesh,
     smoothing_rounds: int = 10,
@@ -267,8 +287,10 @@ def project_charts(
 
     Returns:
         `(vertices, faces, uvs, report)`: one vertex per (vertex, chart) pair,
-        faces over those, and each vertex's projected coordinates in world
-        units. Pack them (xatlas, `add_uv_mesh`) before baking.
+        faces over those, and each vertex's projected coordinates - in world
+        units, so every chart has the same texel density, and **moved so that
+        no two charts occupy the same coordinates** (`_lay_out_charts`). Pack
+        them (xatlas, `add_uv_mesh`) before baking.
     """
     vertices = np.asarray(mesh.vertices, dtype=np.float64)
     faces = np.asarray(mesh.faces, dtype=np.int64)
@@ -338,6 +360,17 @@ def project_charts(
     # Seen from its own side, a chart facing a negative direction is mirrored
     # by the cyclic projection; mirroring u again puts it right.
     uvs[chart_negative[split_chart], 0] *= -1.0
+
+    # **Each chart is moved into a cell of its own.** Projected in world
+    # coordinates, the two sides of a panel land on exactly the same
+    # coordinates - and the packer welds vertices by position, so it reads them
+    # as one chart and lays them on top of each other in the atlas, where each
+    # then reads the other's colour. Measured 2026-09-13 on the 200 k robot:
+    # 303,153 pairs of triangles from different charts shared a texel, and 4%
+    # of the faces came out with a colour that was not theirs. A translation
+    # per chart is enough to keep them apart, and it leaves the texel density
+    # alone - which is the whole reason these coordinates are in world units.
+    uvs = _lay_out_charts(uvs, split_chart, count)
 
     # The faces still folded after `_unfold` are the slivers it left: counted,
     # with the area they hold, because they overlap their chart in the atlas.
