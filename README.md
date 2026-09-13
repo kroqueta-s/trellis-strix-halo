@@ -36,9 +36,9 @@ made of it - front, right, back and left, standing as the image does - drawn by
 runner reports `forward_axis: null` and why these were turned by hand
 (`--rotx -90 --yaw 0 --pitch 0`).*
 
-| Input |
-|---|
-| ![input](assets/sample.png) |
+**Input**
+
+![input](assets/sample.png)
 
 **TRELLIS.1** — 517,498 faces, no colour: texture baking needs `nvdiffrast`.
 
@@ -60,19 +60,32 @@ pixel here rather than per vertex, which is the only way to see a seam.
 A toy robot is smooth, and a million and a half faces do not show on it. These
 two ask more of the mesh: machinery with joints and panel lines, and an
 organic shape with membranes, scales and spines. Both are TRELLIS.2 at 1024,
-turning, shaded without their colour so that the geometry is what you see.
+turning, and each row starts in the pose its own image has. The middle column
+is shaded without colour, so that the geometry is what you see; the right one
+samples the baked texture per pixel and stands on white, so that it can be
+held against the image it came from.
 
-| Input | The mesh, turning |
-|---|---|
-| ![beetle](assets/beetle.png) | ![beetle turning](assets/beetle_turntable.gif) |
-| ![dragon](assets/dragon.png) | ![dragon turning](assets/dragon_turntable.gif) |
+| Input | The mesh | The mesh with its texture |
+|---|---|---|
+| ![beetle](assets/beetle.png) | ![beetle turning](assets/beetle_turntable.gif) | ![beetle textured](assets/beetle_textured.gif) |
+| ![dragon](assets/dragon.png) | ![dragon turning](assets/dragon_turntable.gif) | ![dragon textured](assets/dragon_textured.gif) |
 
 The legs keep their segments and the horn its curve; the wing membranes come
-through with the ribs in them, and the tail keeps its spikes. **Thin things
-are the hard case here** - the carve builds a printable solid on a lattice of
-512 cells, which is 0.16 mm on an 80 mm print, so anything thinner than that
-is thickened to it. What you are seeing is that solid, not the decoder's own
-surface.
+through with the ribs in them, and the tail keeps its spikes.
+
+**Two things these do not do, both measured.** Corners read as softened, and
+**the decoder is not what softens them** - generated with the carve off, its
+own surface comes out at 7,402,100 faces with the panel creases and the
+cylinders sharp. What blunts them is the carve, which rebuilds the model as a
+printable solid on a lattice of 512 cells - 0.16 mm on an 80 mm print - and
+leaves that quantisation behind as a fine corduroy on flat panels. Carving on
+the lattice the shape was decoded on (`TRELLIS2_SHELL_GRID=1024`) removes it,
+and cost 102 s more on the beetle; `TRELLIS2_SHELL=off` hands back the
+decoder's surface, which is sharper still and neither watertight nor
+printable. **And the colour comes out flatter than the image**: the beetle's
+red and blue trim is gone. Counting pixels whose strongest and weakest channel
+differ by more than a tenth, the beetle's texture has 1.1% against its image's
+4.9%, and the dragon's 0.3% against 8.6%.
 
 Generation took 115 s for the dragon and 237 s for the beetle, including the
 texture and the post-processing; GitHub renders a GIF in a README but not a
