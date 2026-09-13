@@ -30,8 +30,11 @@ do, and the traps it took to get there are in
 
 *The bundled [`assets/sample.png`](assets/sample.png) (an SDXL-generated robot)
 is the reference specimen for everything below. These are what the two runners
-made of it, four views each, drawn by
-[`tools/render_mesh.py`](tools/render_mesh.py) with no external renderer.*
+made of it - front, right, back and left, standing as the image does - drawn by
+[`tools/render_mesh.py`](tools/render_mesh.py) with no external renderer.
+**Which way a mesh faces is not knowable from the mesh**, which is why the
+runner reports `forward_axis: null` and why these were turned by hand
+(`--rotx -90 --yaw 0 --pitch 0`).*
 
 | Input |
 |---|
