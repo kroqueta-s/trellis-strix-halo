@@ -34,10 +34,14 @@ from PIL import Image
 
 from . import config
 
-# Triangles rasterized at once. **This sets the bake's VRAM peak**: each one
-# holds every texel in its bounding box while it is tested. Measured nothing
-# here - it is a safety valve, not a tuned number.
-TRIANGLE_CHUNK = 1 << 18
+# Atlas texels rasterized at once. **This sets the bake's VRAM peak**: a batch
+# holds every texel in its triangles' bounding boxes while they are tested, and
+# those boxes are wildly uneven - a triangle whose parameterization went wrong
+# spans the whole atlas by itself. Counting triangles instead of texels is what
+# let one bake ask for 44 GB (measured 2026-09-13). At 2048 the whole atlas is
+# 4.2 M texels, so this is a couple of passes' worth, and bounded whatever the
+# atlas did.
+TEXEL_CHUNK = 8_000_000
 
 
 @dataclass
@@ -227,6 +231,33 @@ def _cover(
     return texel, index[triangle][inside], torch.stack([alpha, beta, gamma], dim=1)[inside]
 
 
+def _batches(
+    uvs: torch.Tensor, faces: torch.Tensor, size: int, budget: int
+) -> list[torch.Tensor]:
+    """Split `faces` so that no batch's atlas boxes hold more than `budget` texels.
+
+    The boxes are what `_cover` allocates for, and they are wildly uneven: most
+    triangles cover a handful of texels and a broken one covers the atlas. A
+    batch that is a fixed number of triangles is therefore a batch of unknown
+    size, which is how a bake comes to ask for tens of gigabytes. A triangle
+    bigger than the budget on its own still goes in a batch of its own - there
+    is nothing else to do with it - but it no longer takes its neighbours' work
+    with it.
+    """
+    corners = uvs[faces] * size
+    low = torch.floor(corners.amin(dim=1)).long().clamp(0, size - 1)
+    high = torch.ceil(corners.amax(dim=1)).long().clamp(0, size)
+    span = (high - low).clamp(min=0)
+    counts = (span[:, 0] * span[:, 1]).to(torch.float64)
+    running = torch.cumsum(counts, dim=0)
+    # Which batch each triangle falls in, by how much work came before it.
+    group = torch.div(running - counts, float(budget), rounding_mode="floor").long()
+    group = torch.cummax(group, dim=0).values
+    edges = torch.nonzero(group[1:] != group[:-1], as_tuple=False).squeeze(1) + 1
+    cuts = [0, *[int(e) for e in edges], int(faces.shape[0])]
+    return [faces[a:b] for a, b in zip(cuts[:-1], cuts[1:], strict=True) if b > a]
+
+
 def _dilate(colour: torch.Tensor, filled: torch.Tensor, rounds: int) -> tuple[torch.Tensor, int]:
     """Spread the edge colours outward, so filtering across a seam picks up the chart.
 
@@ -333,8 +364,14 @@ def bake(
     # A folded face keeps its UVs - it reads the atlas where it lands - but
     # writes nothing, so that it does not paint over the faces it overlaps.
     writers = face_t[torch.as_tensor(~folded, device=device)]
-    for start in range(0, int(writers.shape[0]), TRIANGLE_CHUNK):
-        chunk = writers[start : start + TRIANGLE_CHUNK]
+    # **A batch is a number of texels, not a number of triangles.** `_cover`
+    # walks each triangle's box in the atlas, so what it costs is the boxes and
+    # not the count: one triangle whose parameterization went wrong spans the
+    # whole atlas and asks for four million texels on its own. Measured
+    # 2026-09-13, a handful of those on one specimen asked for 44 GB at once
+    # and took the run out. Cutting the batches on the running total instead
+    # bounds that without dropping a triangle or changing a texel.
+    for chunk in _batches(uv_t, writers, size, TEXEL_CHUNK):
         texel, triangle, weights = _cover(uv_t, chunk, size)
         if texel.numel() == 0:
             continue

@@ -46,6 +46,7 @@ import numpy as np
 import torch
 import trimesh
 from scipy import ndimage
+from scipy.spatial import cKDTree
 
 # The four cells around a lattice edge, listed so that the quad's normal points
 # along the edge's axis (right-hand rule: for the edge axis a, the other two
@@ -102,6 +103,12 @@ class ShellReport:
     smooth_rounds: int = 0
     smooth_moved_cells: float = 0.0
     smooth_moved_p99_cells: float = 0.0
+    snap_reach_cells: float = 0.0
+    snapped: float = 0.0
+    snap_moved_cells: float = 0.0
+    snap_moved_p99_cells: float = 0.0
+    snap_held_back: int = 0
+    snap_sec: float = 0.0
     rasterize_sec: float = 0.0
     occupancy_sec: float = 0.0
     extract_sec: float = 0.0
@@ -288,6 +295,119 @@ def _surface_nets(
     return trimesh.Trimesh(vertices=position, faces=triangles, process=False), int(len(quad))
 
 
+def _snap_to_source(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    samples: np.ndarray,
+    cell: float,
+    reach: float,
+    share: float = 0.4,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Put the surface back where the model drew it, wherever that is safe.
+
+    **The carve decides what is solid; it does not have to decide where the
+    surface is.** The lattice settles the topology - which cells are inside,
+    which sheets exist - and that part it is good at. The position it then
+    hands out is a lattice position, and the model's own is better: measured
+    2026-09-13 on the mechanical beetle, the mesh going into the carve sits
+    0.23 of a cell from the decoder's surface and the mesh coming out sits
+    0.72, with creases at 0.97. None of that is the decimation or the repair;
+    every bit is added here.
+
+    So each vertex is moved onto the nearest point of the surface that was
+    rasterized, and the numbers come most of the way back: 0.72 to 0.38 on the
+    flats and 0.97 to 0.49 at the creases, with 57% of the vertices moving.
+
+    **Two limits keep it from closing a thin wall.** A vertex whose source is
+    further than `reach` cells away is left alone, because there is nothing
+    there to snap to and it is standing on a bridge the carve invented. And a
+    vertex may cross at most `share` of the room between it and the surface
+    facing back at it, since that surface is moving towards the same sheet -
+    without this the two sides of a membrane meet and the wall is gone.
+    """
+    if reach <= 0 or len(samples) == 0:
+        return vertices, {
+            "snapped": 0.0,
+            "moved_cells": 0.0,
+            "moved_p99_cells": 0.0,
+            "snap_held_back": 0,
+        }
+
+    normals = np.zeros_like(vertices)
+    tri = vertices[faces]
+    face_n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    for i in range(3):
+        np.add.at(normals, faces[:, i], face_n)
+    normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
+
+    # How much room each vertex has before it meets its own other side.
+    own = cKDTree(vertices, balanced_tree=False, compact_nodes=False)
+    gap, near = own.query(vertices, k=16, workers=-1)
+    facing = (normals[near] * normals[:, None, :]).sum(axis=2) < -0.3
+    room = np.where(facing & (gap > 0.0), gap, np.inf).min(axis=1)
+
+    # **The tree is built unbalanced on purpose.** The samples are a surface,
+    # so they are far from uniform in space, and scipy's balanced build turns
+    # that into a tree whose queries thrash: measured 2026-09-13 on 29,332,568
+    # of the beetle's samples, the balanced tree took 8.2 s to build and 107.5 s
+    # to answer 1,028,371 queries, and the unbalanced one 3.0 s and 0.7 s.
+    source = np.asarray(samples, dtype=np.float64)
+    tree = cKDTree(source, balanced_tree=False, compact_nodes=False)
+    distance, index = tree.query(vertices, workers=-1)
+    step = source[index] - vertices
+    limit = np.minimum(reach * cell, share * room)[:, None]
+    length = np.linalg.norm(step, axis=1, keepdims=True)
+    step = np.where(length > limit, step * (limit / np.maximum(length, 1e-12)), step)
+    step[distance > reach * cell] = 0.0
+
+    # **A vertex may not drag its own triangles through each other.** Two
+    # corners of one triangle can have the same nearest point - on a ridge a
+    # cell wide, or where the surface doubles back - and moving both onto it
+    # leaves a triangle with no area, or one wound the other way. Measured
+    # 2026-09-13 before this guard: 12,514 triangles of the beetle's 2,080,540
+    # came out with zero area and 8,317 wound backwards, and the atlas built on
+    # them asked for 44 GB. So the step is halved, for every vertex of every
+    # triangle that would spoil, until none do.
+    # **A sliver is as bad as a hole.** A triangle with area left but no width
+    # still cannot be laid flat, and the atlas spends the whole bake on it:
+    # measured 2026-09-13 on the dragon, 26 of them took the bake from 4.0 s to
+    # 14.0 s. A hundredth of a cell's area leaves none of them, and costs
+    # nothing measurable - the crease error moves 0.229 to 0.232 of a cell.
+    area_floor = 1e-2 * cell * cell
+    tri = vertices[faces]
+    before = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    spoiled = 0
+    for _ in range(8):
+        moved_tri = (vertices + step)[faces]
+        after = np.cross(moved_tri[:, 1] - moved_tri[:, 0], moved_tri[:, 2] - moved_tri[:, 0])
+        bad = (np.linalg.norm(after, axis=1) < area_floor) | ((after * before).sum(axis=1) <= 0.0)
+        spoiled = int(bad.sum())
+        if spoiled == 0:
+            break
+        touched = np.zeros(len(vertices), dtype=bool)
+        touched[faces[bad].ravel()] = True
+        step[touched] *= 0.5
+    if spoiled:
+        # Whatever a halving could not rescue does not move at all.
+        moved_tri = (vertices + step)[faces]
+        after = np.cross(moved_tri[:, 1] - moved_tri[:, 0], moved_tri[:, 2] - moved_tri[:, 0])
+        bad = (np.linalg.norm(after, axis=1) < area_floor) | ((after * before).sum(axis=1) <= 0.0)
+        stuck = np.zeros(len(vertices), dtype=bool)
+        stuck[faces[bad].ravel()] = True
+        step[stuck] = 0.0
+
+    moved = np.linalg.norm(step, axis=1)
+    live = moved > 0.0
+    return vertices + step, {
+        "snapped": round(float(live.mean()), 4),
+        "moved_cells": round(float(np.median(moved[live]) / cell) if live.any() else 0.0, 3),
+        "moved_p99_cells": round(
+            float(np.percentile(moved[live], 99) / cell) if live.any() else 0.0, 3
+        ),
+        "snap_held_back": int(spoiled),
+    }
+
+
 def _smooth_taubin(
     vertices: np.ndarray, faces: np.ndarray, rounds: int, lam: float = 0.5, mu: float = -0.53
 ) -> tuple[np.ndarray, float, float]:
@@ -366,6 +486,7 @@ def solidify(
     device: str | None = None,
     island_corners: int = 64,
     smooth: int = 5,
+    snap: float = 1.5,
 ) -> tuple[trimesh.Trimesh, ShellReport]:
     """Turn a surface into a closed solid.
 
@@ -386,6 +507,12 @@ def solidify(
         fill_cavities: Band only. Fill every pocket the outside cannot reach.
             Carving always fills them.
         device: Where the rays run; `None` picks the GPU when there is one.
+        snap: How far, in cells, a vertex may be moved back onto the surface it
+            was carved from (see `_snap_to_source`). **Measured 1.5**
+            (2026-09-13): the distance to the decoder's own surface falls from
+            0.72 of a cell to 0.38 on the flats and 0.97 to 0.49 at the
+            creases, for 57% of the vertices moving and 3.8% of the solid's
+            volume. 0 leaves the surface where the lattice put it.
         smooth: Rounds of Taubin smoothing on the extracted surface, which is
             what takes the lattice's terraces off a thin wall (see
             `_smooth_taubin`). **Measured 5** (2026-09-13): three already
@@ -426,6 +553,10 @@ def solidify(
     corner = corner.clip(0, lattice - 1)
     thin = np.zeros((lattice,) * 3, dtype=bool)
     thin[corner[:, 0], corner[:, 1], corner[:, 2]] = True
+    # **The samples are kept for the snap.** They are the surface as the carve
+    # saw it, already spaced at half a cell, so the snap costs a tree rather
+    # than a second pass over the mesh. float32 halves what that costs.
+    source = samples.astype(np.float32) if snap > 0 and mode == "carve" else None
     del samples, corner
     report.half_cells = half
     report.lattice = lattice
@@ -525,6 +656,24 @@ def solidify(
         report.smooth_moved_cells = round(median / cell, 3)
         report.smooth_moved_p99_cells = round(p99 / cell, 3)
         report.smooth_sec = round(time.perf_counter() - mark, 2)
+
+    if source is not None and snap > 0:
+        mark = time.perf_counter()
+        cell = 1.0 / max(int(grid), 1) * max(extent, 1e-12)
+        moved, stats = _snap_to_source(
+            np.asarray(shell.vertices, dtype=np.float64),
+            np.asarray(shell.faces, dtype=np.int64),
+            source,
+            cell,
+            float(snap),
+        )
+        shell = trimesh.Trimesh(vertices=moved, faces=shell.faces, process=False)
+        report.snap_reach_cells = float(snap)
+        report.snapped = stats["snapped"]
+        report.snap_moved_cells = stats["moved_cells"]
+        report.snap_moved_p99_cells = stats["moved_p99_cells"]
+        report.snap_held_back = int(stats["snap_held_back"])
+        report.snap_sec = round(time.perf_counter() - mark, 2)
 
     report.faces = int(len(shell.faces))
     report.vertices = int(len(shell.vertices))

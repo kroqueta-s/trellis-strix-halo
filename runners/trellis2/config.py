@@ -387,6 +387,19 @@ SHELL_ISLAND_CORNERS: int = _int("TRELLIS2_SHELL_ISLAND_CORNERS", 64)
 # then exactly the boundary of the lattice's occupancy.
 SHELL_SMOOTH: int = _int("TRELLIS2_SHELL_SMOOTH", 5)
 
+# Carve only: how far, in cells, a vertex may be moved back onto the surface it
+# was carved from. **The lattice settles what is solid; it does not have to
+# settle where the surface is.** Measured 2026-09-13 on the mechanical beetle:
+# the mesh going into the carve sits 0.23 of a cell from the decoder's own
+# surface and the mesh coming out sits 0.72, with creases at 0.97 - and none of
+# that is the decimation or the repair, which add nothing. Moving each vertex
+# back onto the rasterized surface brings the flats to 0.38 and the creases to
+# 0.49, which is what a softened edge was. 57% of the vertices move, the solid
+# loses 3.8% of its volume on the beetle and 11% on the dragon, whose membranes
+# stop straddling their own sheet and sit on it. 0 leaves the surface where the
+# lattice put it.
+SHELL_SNAP: float = _float("TRELLIS2_SHELL_SNAP", 1.5)
+
 # Separate the touching sheets, cut what cannot be oriented, and close the
 # seams, so that the mesh is a closed orientable manifold. **After the shell
 # this only separates surface-nets sheets that touch along an edge** and
