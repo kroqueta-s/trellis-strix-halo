@@ -727,7 +727,9 @@ def texture_mesh(
             budget = int(config.TEXTURE_TARGET_FACES)
             surface = decimate(mesh, budget) if 0 < budget < len(mesh.faces) else mesh
             bake_query = _colour_query(voxels, pipeline, target, PBR_CHANNELS)
-            textured, bake_report = texture.bake(surface, bake_query, atlas, config.TEXTURE_DILATE)
+            textured, bake_report = texture.bake(
+                surface, bake_query, atlas, config.TEXTURE_DILATE, fill=config.TEXTURE_FILL
+            )
             bake_report["enabled"] = True
             bake_report.update(_search_summary(bake_query.stats))  # type: ignore[attr-defined]
             stages["texture_sec"] = time.perf_counter() - mark
@@ -1242,7 +1244,11 @@ def _postprocess(
         if progress is not None:
             progress("texture", f"charting and baking a {texture_size}x{texture_size} texture")
         textured, bake_report = texture.bake(
-            surface, bake_query, texture_size, config.TEXTURE_DILATE
+            surface,
+            bake_query,
+            texture_size,
+            config.TEXTURE_DILATE,
+            fill=config.TEXTURE_FILL,
         )
         bake_report["enabled"] = True
         # The bake asks the same query, so the same search counts apply: texels
