@@ -73,25 +73,35 @@ held against the image it came from.
 The legs keep their segments and the horn its curve; the wing membranes come
 through with the ribs in them, and the tail keeps its spikes.
 
-**What the lattice costs, and what is done about it.** The carve rebuilds the
-model as a printable solid on a lattice of 512 cells, 0.16 mm on an 80 mm
-print, and a surface crossing that lattice at a shallow angle comes out in
-steps. Surface nets averages them away where a feature spans several cells and
-cannot where it does not: the dragon's wings are one or two cells thick, and
-they came out as flat terraces. **Five rounds of Taubin smoothing take those
-off** (`TRELLIS2_SHELL_SMOOTH`), which is the second pass being a push back out
-rather than a second pull in - the volume moves 0.07-0.17% and the median
-vertex a fifth of a cell, and the beetle's panel lines are still sharp at twice
-as many rounds. It costs about 5 s.
+**The lattice settles what is solid; the model says where its surface is.**
+The carve rebuilds the model on a lattice of 512 cells, 0.16 mm on an 80 mm
+print, and it used to hand out lattice positions with them. That is the whole
+of the error: the mesh going into the carve sits 0.23 of a cell from the
+decoder's own surface, the mesh coming out sat 0.72 and its creases 0.97, and
+the decimation and the repair after it add nothing at all. It read as softened
+edges, which is exactly what makes a part-split boundary hard to find on a
+large print.
+
+So the surface goes back where it was drawn. Each vertex moves onto the nearest
+point of the surface that was rasterized, within `TRELLIS2_SHELL_SNAP` cells,
+and the flats come to 0.38 of a cell with the creases at 0.49. **The solid also
+stops being fat**: comparing silhouette area against the decoder's, the carve
+covered 1.96% more on the beetle and 2.60% more on the dragon, and now covers
+-0.02% and +0.02%. Before that, five rounds of Taubin smoothing take off the
+terracing a shallow crossing leaves on a wall one or two cells thick
+(`TRELLIS2_SHELL_SMOOTH`), which the snap cannot reach because it does not move
+a vertex with nothing to move to. Together they cost about 15 s.
 
 Two things that do not work, both measured. Carving on the lattice the shape
-was decoded on (`TRELLIS2_SHELL_GRID=1024`) takes the steps off too, **but it
-is not simply better**: the rays reach further through the gaps that are left,
-and the solid loses 13-14% of its volume. And putting the surface back exactly
-where the decoder drew it collapses every thin wall to nothing, because the
-decoder's membranes have no thickness to begin with and both sides of the slab
-land on the same sheet. `TRELLIS2_SHELL=off` hands back that surface, which is
-sharper than anything here and neither watertight nor printable.
+was decoded on (`TRELLIS2_SHELL_GRID=1024`) takes the terracing off too, **but
+it is not simply better**: the walls are relatively thinner on a finer lattice,
+the rays get behind them, and the solid loses 13-14% of its volume. And snapping
+without a limit closes every thin wall, because **the decoder's membranes are
+thinner than a voxel** - measured 0.30 to 0.48 of a cell, which 1024 would not
+resolve either - so both sides of a slab land on the same sheet. A vertex may
+therefore cross only part of the room to the surface facing back at it.
+`TRELLIS2_SHELL=off` hands back the decoder's surface, which is sharper than
+anything here and neither watertight nor printable.
 
 **And the colour comes out flatter than the image**: the beetle's red and blue
 trim is gone. Counting pixels whose strongest and weakest channel
@@ -203,23 +213,23 @@ is quoted is the median of the rest:
 | | TRELLIS.1 | TRELLIS.2 at 512 | TRELLIS.2 at 1024 |
 |---|--:|--:|--:|
 | Load the weights | 15.2 s | 63.6 s | 63.4 s |
-| Preprocess and condition | 0.4 s | 1.9 s | 3.2 s |
-| Sparse structure | 13.2 s | 16.9 s | 19.8 s |
-| Structured latent | 31.6 s | 22.2 s | 163.0 s |
-| Decode to a mesh | 2.6 s | 5.2 s | 19.7 s |
-| **Generate the shape** | **47.7 s** | **46.3 s** | **205.6 s** |
-| Sample the texture latent | — | 13.2 s | 93.9 s |
-| Post-processing | 22.4 s | 46.3 s | 90.5 s |
-| **End to end, weights already loaded** | **70.1 s** | **108.4 s** | **391.9 s** |
-| Faces out | 517,498 | 1,502,212 | 1,502,600 |
-| Peak VRAM | 12.6 GB | 5.8 GB | 16.5 GB |
+| Preprocess and condition | 0.4 s | 1.9 s | 4.1 s |
+| Sparse structure | 13.2 s | 17.0 s | 20.3 s |
+| Structured latent | 31.6 s | 22.3 s | 163.3 s |
+| Decode to a mesh | 2.6 s | 5.2 s | 19.8 s |
+| **Generate the shape** | **47.7 s** | **46.6 s** | **207.5 s** |
+| Sample the texture latent | — | 13.1 s | 93.9 s |
+| Post-processing | 22.4 s | 53.6 s | 98.3 s |
+| **End to end, weights already loaded** | **70.1 s** | **116.1 s** | **399.2 s** |
+| Faces out | 517,498 | 1,501,652 | 1,502,210 |
+| Peak VRAM | 12.6 GB | 5.9 GB | 16.5 GB |
 
 **They are not the same job.** TRELLIS.1 generates a surface and cleans it;
 TRELLIS.2 also samples a second latent for colour, carves a printable solid
 out of the surface, decodes the colours onto that solid's own grid and bakes a
-2048² texture — which is where its post-processing goes (at 1024: 13.0 s to
-decimate, 22.2 s to carve and smooth, 39.4 s for the colours, 5.4 s for the
-atlas, 6.2 s to make it a manifold). Both come back watertight, in one part and
+2048² texture — which is where its post-processing goes (at 1024: 13.4 s to
+decimate, 31.2 s to carve, smooth and snap, 37.2 s for the colours, 5.5 s for
+the atlas, 6.8 s to make it a manifold). Both come back watertight, in one part and
 consistently wound, checked on the meshes these numbers came from.
 
 TRELLIS.1's post-processing was 60 s when this table was first written; the
