@@ -21,7 +21,12 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.render_mesh import _covered_pixels, _render_textured, _sample_bilinear  # noqa: E402
+from tools.render_mesh import (  # noqa: E402
+    _covered_pixels,
+    _render_one,
+    _render_textured,
+    _sample_bilinear,
+)
 
 SIZE = 64
 
@@ -104,6 +109,26 @@ def test_the_nearer_surface_wins() -> None:
     view = _render_textured(verts, normals, scaled, all_faces, image, SIZE, 0.0, 0.0, True)
     centre = view[SIZE // 2, SIZE // 2]
     assert centre[2] > centre[0], centre
+
+
+def test_the_background_is_what_nothing_covers() -> None:
+    """**A dark model on black hides its own silhouette.**
+
+    The showcase renders put the model on white, to sit beside the image it was
+    generated from. Both rasterizers have to honour it, and the corner of the
+    view is a pixel no quad in the middle can reach.
+    """
+    verts, normals, uvs, faces = _quad()
+    small = verts * 0.25
+    image = np.zeros((2, 2, 3))
+    for view in (
+        _render_textured(small, normals, uvs, faces, image, SIZE, 0.0, 0.0, True, background=1.0),
+        # `_render_one` draws the vertices, so the middle of the quad is empty
+        # and only the corners of the small quad are covered.
+        _render_one(small, normals, SIZE, 0.0, 0.0, 1, True, None, 1.0),
+    ):
+        assert np.allclose(view[0, 0], 1.0), view[0, 0]
+        assert float(view.min()) < 1.0, float(view.min())
 
 
 def main() -> int:

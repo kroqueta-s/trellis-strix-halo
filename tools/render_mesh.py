@@ -49,6 +49,7 @@ def _render_one(
     splat: int,
     two_sided: bool = False,
     colors: np.ndarray | None = None,
+    background: float = 0.0,
 ) -> np.ndarray:
     """Draw one view: orthographic projection, z-buffer, flat Lambert shading.
 
@@ -78,7 +79,7 @@ def _render_one(
 
     zbuf = np.full((size, size), -np.inf, dtype=np.float64)
     value = shade[:, None] * colors if colors is not None else shade[:, None]
-    img = np.zeros((size, size, value.shape[1]), dtype=np.float64)
+    img = np.full((size, size, value.shape[1]), float(background), dtype=np.float64)
     # Draw back to front so nearer points win (last write to a pixel is fine).
     order = np.argsort(depth)
     for dy in range(-splat, splat + 1):
@@ -179,6 +180,7 @@ def _render_textured(
     pitch: float,
     two_sided: bool = False,
     chunk: int = 1 << 17,
+    background: float = 0.0,
 ) -> np.ndarray:
     """Draw one view by rasterizing the triangles and sampling the texture per pixel.
 
@@ -201,7 +203,7 @@ def _render_textured(
     light = np.array([0.4, 0.6, 1.0])
     light /= np.linalg.norm(light)
 
-    img = np.zeros((size * size, 3), dtype=np.float64)
+    img = np.full((size * size, 3), float(background), dtype=np.float64)
     zbuf = np.full(size * size, -np.inf, dtype=np.float64)
     for start in range(0, len(faces), chunk):
         block = faces[start : start + chunk]
@@ -240,6 +242,7 @@ def render(
     texture: bool = False,
     yaw: float = 0.0,
     pitch: float = 15.0,
+    background: float = 0.0,
 ) -> None:
     """Draw the mesh from several viewpoints into a single PNG strip.
 
@@ -262,6 +265,10 @@ def render(
             front is chosen by eye and named here.
         pitch: Degrees to look down from. 0 gives the elevations an orthographic
             drawing would have; the default 15 shows a little of the top.
+        background: What the pixels nothing covers hold, 0 black to 1 white.
+            **A dark model on black hides its own silhouette**; white is what
+            the images these models are generated from tend to have behind
+            them, which makes the two comparable.
     """
     # `force="mesh"` because a GLB arrives as a scene, and its one mesh is what
     # is being looked at.
@@ -306,12 +313,13 @@ def render(
                 yaw,
                 pitch,
                 two_sided,
+                background=background,
             )
             for yaw, pitch in angles
         ]
     else:
         tiles = [
-            _render_one(verts, normals, size, yaw, pitch, splat, two_sided, colors)
+            _render_one(verts, normals, size, yaw, pitch, splat, two_sided, colors, background)
             for yaw, pitch in angles
         ]
     strip = np.concatenate(tiles, axis=1)
@@ -350,6 +358,9 @@ def main() -> int:
     parser.add_argument(
         "--pitch", type=float, default=15.0, help="degrees to look down from (0 for elevations)"
     )
+    parser.add_argument(
+        "--background", type=float, default=0.0, help="what empty pixels hold, 0 black to 1 white"
+    )
     args = parser.parse_args()
     render(
         Path(args.mesh),
@@ -364,6 +375,7 @@ def main() -> int:
         args.texture,
         args.yaw,
         args.pitch,
+        args.background,
     )
     print(f"wrote {args.out}")
     return 0
