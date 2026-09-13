@@ -362,10 +362,32 @@ At 512 the lattice offset was the whole problem and 8 voxels ends it. At
 1024 the bridged surface has no colour of its own, and 32 voxels (2.5 mm)
 gives it the nearest drawn colour - a guess, and a better one than black;
 what is still black lies further than that from anything the decoder drew.
-Colouring the bridged surface from the model rather than its neighbours
-would mean decoding the texture latent on the carved mesh's own grid, which
-is what `texture_mesh` does for a mesh from outside (0.05 % black on the same
-carved mesh), and is not done here.
+
+**So the latent is decoded onto the carved mesh instead** (`TRELLIS2_COLOUR_ON_MESH`,
+on by default). The texture decoder subdivides four times and something has to
+say which children exist: upstream hands it the shape decoder's subdivisions,
+which is why the colours sit on the decoder's surface.
+`runners/trellis2/guides.py` builds those subdivisions from the carved mesh's
+own dual grid - the conversion `texture_mesh` already needs - so the decoder
+puts a voxel on the print mesh and on the surface the atlas is baked from,
+wherever the latent can reach one. The search above stays, for whatever is
+left:
+
+| Measured 2026-09-13 | 512 | 1024 |
+|---|--:|--:|
+| Of the carved grid, reachable from the latent | **99.9 %** | **77.7 %** |
+| Vertices black, decoder's grid + search | 0.38 % | 5.1 % |
+| **Vertices black, carved grid + search** | **0.02 %** | **2.1 %** |
+| **Covered texels black** | **0.01 %** | **1.6 %** |
+| Vertices the search had to help | 133 | 160,386 |
+| Cost (voxelize + decode, against the 4-14 s it replaces) | 12.7 s | 42.0 s |
+
+**It cannot do better than the latent.** A voxel of the carved surface whose
+ancestor is not among the latent's has nothing to subdivide, and at 1024 that
+is 22 % of them: the carve bridges gaps the decoder never drew, and nothing in
+the model says what colour they are. Those still get the nearest drawn colour.
+A runner without the compiled converter, or `TRELLIS2_COLOUR_ON_MESH=off`,
+decodes on the decoder's grid as before.
 
 `metrics.vertex_colors.unreached_vertices` counts what stayed black every
 run, because a model that is black because the texture stage failed and one

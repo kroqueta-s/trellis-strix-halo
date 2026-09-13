@@ -203,6 +203,21 @@ CHART_MIN_FACES: int = _int("TRELLIS2_CHART_MIN_FACES", 50)
 # (0.4%). A chart for every one would have doubled the chart count.
 CHART_FOLD_AREA: float = _float("TRELLIS2_CHART_FOLD_AREA", 2.0)
 
+# Decode the colours onto the mesh's **own** grid rather than the decoder's.
+# The texture decoder subdivides a latent four times, and something has to say
+# which children exist; upstream hands it the shape decoder's subdivisions, so
+# the colours land on the surface the decoder drew. **The mesh that gets
+# printed is not that surface** - the carve rebuilds it on a lattice - and at
+# 1024 that put 52% of its vertices outside every active voxel (measured
+# 2026-09-12). Building the subdivisions from the carved mesh instead puts a
+# voxel on it wherever the latent can reach one, which is 99.9% of it at 512
+# (measured 2026-09-13).
+#
+# **It needs the compiled `o_voxel_cpu`** for the mesh-to-dual-grid conversion,
+# the same one `texture_mesh` needs, and falls back to the decoder's own grid
+# when that is not there. `metrics.post.colours` reports which ran.
+COLOUR_ON_MESH: bool = _bool("TRELLIS2_COLOUR_ON_MESH", True)
+
 # Rounds of spreading the colours past the edge of each chart. **Without it a
 # renderer filtering across a seam pulls in the empty background and draws a
 # black line along every cut.** 4 is enough for bilinear filtering at any
