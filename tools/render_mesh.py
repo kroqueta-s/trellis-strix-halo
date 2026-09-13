@@ -238,6 +238,8 @@ def render(
     two_sided: bool = False,
     color: bool = False,
     texture: bool = False,
+    yaw: float = 0.0,
+    pitch: float = 15.0,
 ) -> None:
     """Draw the mesh from several viewpoints into a single PNG strip.
 
@@ -254,6 +256,12 @@ def render(
             map at every pixel. **This is the only way to judge an atlas**: the
             splatted views draw one atlas sample per vertex, which cannot show
             a seam. It raises when the mesh carries no texture.
+        yaw: Degrees to turn the model about the vertical axis before the first
+            view. **Which way a mesh faces is not knowable from the mesh** -
+            this runner reports `forward_axis: null` for that reason - so the
+            front is chosen by eye and named here.
+        pitch: Degrees to look down from. 0 gives the elevations an orthographic
+            drawing would have; the default 15 shows a little of the top.
     """
     # `force="mesh"` because a GLB arrives as a scene, and its one mesh is what
     # is being looked at.
@@ -279,7 +287,7 @@ def render(
             raise ValueError(f"{mesh_path} carries no vertex colours")
         colors = np.asarray(raw, dtype=np.float64)[:, :3] / 255.0
 
-    angles = [(i * 2.0 * np.pi / views, np.deg2rad(15.0)) for i in range(views)]
+    angles = [(np.deg2rad(yaw) + i * 2.0 * np.pi / views, np.deg2rad(pitch)) for i in range(views)]
     if texture:
         visual = getattr(mesh, "visual", None)
         uvs = getattr(visual, "uv", None)
@@ -336,6 +344,12 @@ def main() -> int:
         action="store_true",
         help="rasterize and sample the mesh's texture map per pixel (fails if it has none)",
     )
+    parser.add_argument(
+        "--yaw", type=float, default=0.0, help="degrees about the vertical axis before view one"
+    )
+    parser.add_argument(
+        "--pitch", type=float, default=15.0, help="degrees to look down from (0 for elevations)"
+    )
     args = parser.parse_args()
     render(
         Path(args.mesh),
@@ -348,6 +362,8 @@ def main() -> int:
         args.two_sided,
         args.color,
         args.texture,
+        args.yaw,
+        args.pitch,
     )
     print(f"wrote {args.out}")
     return 0
