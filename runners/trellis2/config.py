@@ -376,6 +376,17 @@ SHELL_FILL_CAVITIES: bool = _bool("TRELLIS2_SHELL_FILL_CAVITIES", True)
 # 0 keeps every piece. `metrics.post.shell.islands_dropped` counts them.
 SHELL_ISLAND_CORNERS: int = _int("TRELLIS2_SHELL_ISLAND_CORNERS", 64)
 
+# Carve only: rounds of Taubin smoothing on the extracted surface. **A surface
+# that crosses the lattice at a shallow angle comes out in steps**, and surface
+# nets cannot smooth them on a wall one or two cells thick - the dragon's wings
+# came out as flat terraces a cell apart. Taubin's second, negative pass is what
+# makes this safe: the volume moves 0.07-0.17% and the median vertex a fifth of
+# a cell, while the beetle's panel lines are still sharp at twice this many
+# rounds. **Measured 5** (2026-09-13): three already clears the terracing, five
+# is smoother, ten begins to soften a crease. 0 turns it off, and the surface is
+# then exactly the boundary of the lattice's occupancy.
+SHELL_SMOOTH: int = _int("TRELLIS2_SHELL_SMOOTH", 5)
+
 # Separate the touching sheets, cut what cannot be oriented, and close the
 # seams, so that the mesh is a closed orientable manifold. **After the shell
 # this only separates surface-nets sheets that touch along an edge** and

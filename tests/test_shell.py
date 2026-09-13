@@ -201,6 +201,43 @@ def test_a_speck_in_the_air_is_not_part_of_the_carved_solid() -> None:
     assert report.solid_corners == report_kept.solid_corners - report.island_corners_dropped
 
 
+def test_the_smoothing_takes_the_terraces_off_and_leaves_the_volume() -> None:
+    """Taubin's two passes remove the lattice's steps without shrinking the solid.
+
+    A sphere is the case that shows both halves: every step on it is the
+    lattice's, so roughness has to fall a long way, and a Laplacian alone would
+    pull it in. The volume is what says the negative pass is doing its job.
+    """
+    ball = trimesh.creation.icosphere(subdivisions=4)
+    rough, report = solidify(ball, grid=64, mode="carve", smooth=0)
+    smooth, smooth_report = solidify(ball, grid=64, mode="carve", smooth=5)
+
+    assert report.smooth_rounds == 0, report.smooth_rounds
+    assert smooth_report.smooth_rounds == 5, smooth_report.smooth_rounds
+    assert len(smooth.vertices) == len(rough.vertices), "smoothing must not retopologize"
+    assert len(smooth.faces) == len(rough.faces)
+
+    def roughness(mesh: trimesh.Trimesh) -> float:
+        """Mean distance from a vertex to the average of its neighbours."""
+        v = np.asarray(mesh.vertices, dtype=np.float64)
+        f = np.asarray(mesh.faces, dtype=np.int64)
+        e = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]])
+        e = np.concatenate([e, e[:, ::-1]])
+        total = np.zeros_like(v)
+        np.add.at(total, e[:, 0], v[e[:, 1]])
+        count = np.bincount(e[:, 0], minlength=len(v)).astype(np.float64)
+        live = count > 0
+        return float(np.linalg.norm(total[live] / count[live, None] - v[live], axis=1).mean())
+
+    before, after = roughness(rough), roughness(smooth)
+    assert after < 0.5 * before, (before, after)
+    assert 0.97 < smooth.volume / rough.volume < 1.03, smooth.volume / rough.volume
+    # **The report has to say how far it moved**, because that is the only
+    # number telling an operator whether the surface they asked to keep is
+    # still where they left it.
+    assert 0.0 < smooth_report.smooth_moved_cells < 1.0, smooth_report.smooth_moved_cells
+
+
 def main() -> int:
     """Run every test."""
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

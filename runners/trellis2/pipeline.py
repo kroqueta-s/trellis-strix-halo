@@ -1138,6 +1138,7 @@ def _postprocess(
             thickness=config.SHELL_THICKNESS,
             fill_cavities=config.SHELL_FILL_CAVITIES,
             island_corners=config.SHELL_ISLAND_CORNERS,
+            smooth=config.SHELL_SMOOTH,
         )
         report["shell"] = shell_report.as_dict()
         report["shell_sec"] = round(time.perf_counter() - mark, 2)
