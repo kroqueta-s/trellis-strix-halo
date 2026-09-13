@@ -28,12 +28,29 @@ in Bambu Studio with no repair and no warnings. What it costs, what it cannot
 do, and the traps it took to get there are in
 [`docs/trellis2.md`](docs/trellis2.md).
 
-| Input image | Mesh (4 views) |
-|---|---|
-| ![input](assets/sample.png) | ![mesh](assets/preview.png) |
-
 *The bundled [`assets/sample.png`](assets/sample.png) (an SDXL-generated robot)
-is the reference specimen for the measurements below.*
+is the reference specimen for everything below. These are what the two runners
+made of it, four views each, drawn by
+[`tools/render_mesh.py`](tools/render_mesh.py) with no external renderer.*
+
+| Input |
+|---|
+| ![input](assets/sample.png) |
+
+**TRELLIS.1** — 517,498 faces, no colour: texture baking needs `nvdiffrast`.
+
+![TRELLIS.1 mesh](assets/trellis1_mesh.png)
+
+**TRELLIS.2 at 1024** — 1,496,458 faces, a solid carved out of the surface:
+watertight, one part, and what gets printed.
+
+![TRELLIS.2 mesh](assets/trellis2_mesh.png)
+
+**TRELLIS.2's texture** — a second, coarser mesh (200,000 faces) carrying a
+2048² UV map with its metallic, roughness and alpha channels. Sampled per
+pixel here rather than per vertex, which is the only way to see a seam.
+
+![TRELLIS.2 texture](assets/trellis2_texture.png)
 
 ## Prerequisites
 

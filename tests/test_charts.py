@@ -34,7 +34,43 @@ def test_a_box_is_six_charts() -> None:
     # The projection is orthographic: within a chart, u and v are two of the
     # box's own coordinates, so a unit box gives unit-wide charts.
     assert uvs.shape == (24, 2)
-    assert np.allclose(np.ptp(uvs, axis=0), 1.0)
+    for chart in _chart_of(faces, report.charts):
+        assert np.allclose(np.ptp(uvs[chart], axis=0), 1.0), np.ptp(uvs[chart], axis=0)
+
+
+def _chart_of(faces: np.ndarray, count: int) -> list[np.ndarray]:
+    """The vertices of each chart, which is a connected run of faces."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    rows = np.repeat(np.arange(len(faces)), 3)
+    incidence = coo_matrix(
+        (np.ones(rows.size), (rows, faces.ravel())), shape=(len(faces), int(faces.max()) + 1)
+    )
+    found, label = connected_components(incidence @ incidence.T, directed=False)
+    assert found == count, (found, count)
+    return [np.unique(faces[label == i]) for i in range(found)]
+
+
+def test_no_two_charts_occupy_the_same_coordinates() -> None:
+    """**The packer welds by position**, so charts that coincide become one.
+
+    Projected in world coordinates, the two sides of a panel land on exactly
+    the same place; xatlas then reads them as a single chart and packs them on
+    top of each other, and each reads the other's colour where they overlap
+    (measured 2026-09-13: 303,153 pairs of triangles from different charts
+    sharing a texel, 4 % of the faces wrong). A box is the smallest case: its
+    six sides project onto three coincident pairs.
+    """
+    box = trimesh.creation.box()
+    _v, faces, uvs, report = project_charts(box, smoothing_rounds=0, min_faces=1)
+    boxes = [(uvs[chart].min(axis=0), uvs[chart].max(axis=0)) for chart in _chart_of(faces, report.charts)]
+    for i, (low, high) in enumerate(boxes):
+        for j, (other_low, other_high) in enumerate(boxes[i + 1 :], start=i + 1):
+            apart = (high[0] <= other_low[0] or other_high[0] <= low[0]) or (
+                high[1] <= other_low[1] or other_high[1] <= low[1]
+            )
+            assert apart, f"charts {i} and {j} overlap: {low}..{high} against {other_low}..{other_high}"
 
 
 def test_a_sphere_is_a_few_large_charts_with_no_folds() -> None:

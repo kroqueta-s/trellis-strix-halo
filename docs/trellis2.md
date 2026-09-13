@@ -481,6 +481,25 @@ Measured 2026-09-12 at 512 without the nearest-voxel search: 221,065 of
 carries the same `searched` and `search_distance_*` fields as the vertex
 colours, for the reason under Vertex colours.
 
+**Charts are moved apart before they are packed.** The projection leaves each
+chart in world coordinates, which is what gives them all the same texel
+density - and it also means the two sides of a panel land on exactly the same
+coordinates. xatlas welds vertices by position, so it read such charts as one
+and packed them on top of each other, where each then read the other's colour.
+Measured 2026-09-13 on the robot at 512, before and after giving every chart a
+cell of its own (`charts._lay_out_charts`):
+
+| | Before | After |
+|---|--:|--:|
+| Pairs of triangles from different charts sharing a texel | 303,153 | 0 |
+| Faces overlapping a stranger at all (folds included) | 40,020 (20 %) | 9,237 (4.6 %) |
+| **Faces reading a colour that is not theirs** | **8,068 (4.0 %)** | **219 (0.1 %)** |
+| Charts, coverage, unwrap time | 1,404, 0.646, 2.4 s | 1,404, 0.649, 2.4 s |
+
+It cost nothing: a translation per chart, and the packer does the rest. What
+is left is the folds - triangles that turn over inside their own chart, which
+the read-only rule above already keeps from writing.
+
 The bake runs **after the carve and before the manifold conversion**, on a mesh
 decimated to `TRELLIS2_TEXTURE_TARGET_FACES` (200,000). The textured GLB is
 therefore a different, coarser mesh than `mesh_path`: the PLY is the solid to
