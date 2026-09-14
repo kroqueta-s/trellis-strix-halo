@@ -279,13 +279,15 @@ def test_six_channels_become_a_pbr_material() -> None:
     assert list(rough_metal[y, x]) == [0, 153, 51], list(rough_metal[y, x])
 
 
-def test_a_texel_the_decoder_never_saw_is_counted_black() -> None:
-    """**Black from an empty query is not black paint**, and dilation cannot fix it.
+def test_a_texel_the_decoder_never_saw_is_a_hole_the_dilation_fills() -> None:
+    """**Black from an empty query is not black paint**, and it is not left there.
 
-    The dilation fills texels nothing wrote; a texel a face wrote black is
-    filled already. Counting the two separately is what says whether an atlas
-    came out dark because the model is dark or because the colours never
-    arrived.
+    A texel the query answered with exactly zero was written, so the dilation
+    used to step over it and the count came out the same on both sides. It is
+    handed back as unwritten instead, and the neighbours fill it. Both numbers
+    are still reported: how many there were says whether an atlas came out dark
+    because the model is dark or because the colours never arrived, and how many
+    are left says whether anything was near enough to fill them.
     """
     try:
         import trimesh
@@ -302,7 +304,13 @@ def test_a_texel_the_decoder_never_saw_is_counted_black() -> None:
     _textured, baked = texture.bake(mesh, query, 64, dilate=4, in_process=True)
     assert baked["texels_black"] > 0, baked
     assert baked["texels_black"] < baked["texels_covered"], baked
-    assert baked["texels_black_after_dilate"] == baked["texels_black"], baked
+    # **Half this sphere has no colour at all**, so the dilation cannot reach
+    # the middle of it in four rounds; what it must do is reduce the count.
+    assert baked["texels_black_after_dilate"] < baked["texels_black"], baked
+    # **The counting still adds up.** `texels_covered` is what the bake wrote
+    # and `texels_unreached` is the rest of the atlas, whatever the dilation
+    # was told afterwards.
+    assert baked["texels_covered"] + baked["texels_unreached"] == baked["texels_total"], baked
 
 
 def main() -> int:

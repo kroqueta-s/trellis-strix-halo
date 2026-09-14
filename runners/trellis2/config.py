@@ -224,6 +224,17 @@ COLOUR_ON_MESH: bool = _bool("TRELLIS2_COLOUR_ON_MESH", True)
 # reasonable mip level; it stops early when nothing is left to fill.
 TEXTURE_DILATE: int = _int("TRELLIS2_TEXTURE_DILATE", 4)
 
+# Rounds of closing the holes *inside* a chart: texels a face claimed and the
+# decoder had no colour for. **A different job from the dilation above**, which
+# only has to survive a bilinear tap across a seam - a hole is as wide as the
+# gap in the latent and needs as many rounds as it is deep. Measured 2026-09-13
+# on the reference robot at 1024: 35,983 such texels, of which four rounds
+# close 12,618 and sixteen close all but a few hundred. They sit in the
+# shoulders, the hips and behind the wheels, where a ray reaches a face and the
+# decoder's latent does not. **A texel the decoder had no colour for is exactly
+# zero** and a dark one is not, so the two are never confused. 0 leaves them.
+TEXTURE_FILL: int = _int("TRELLIS2_TEXTURE_FILL", 16)
+
 
 def texture_weights_present() -> bool:
     """Whether the pipeline description names a texture flow. **Reads no weights.**

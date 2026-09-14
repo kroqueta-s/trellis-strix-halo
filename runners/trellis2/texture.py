@@ -64,6 +64,7 @@ class BakeReport:
     texels_unreached: int = 0
     texels_black: int = 0
     texels_black_after_dilate: int = 0
+    fill_rounds: int = 0
     dilate_rounds: int = 0
     chart_sec: float = 0.0
     pack_sec: float = 0.0
@@ -231,9 +232,7 @@ def _cover(
     return texel, index[triangle][inside], torch.stack([alpha, beta, gamma], dim=1)[inside]
 
 
-def _batches(
-    uvs: torch.Tensor, faces: torch.Tensor, size: int, budget: int
-) -> list[torch.Tensor]:
+def _batches(uvs: torch.Tensor, faces: torch.Tensor, size: int, budget: int) -> list[torch.Tensor]:
     """Split `faces` so that no batch's atlas boxes hold more than `budget` texels.
 
     The boxes are what `_cover` allocates for, and they are wildly uneven: most
@@ -327,6 +326,7 @@ def bake(
     size: int,
     dilate: int = 4,
     in_process: bool = False,
+    fill: int = 16,
 ) -> tuple[trimesh.Trimesh, dict[str, Any]]:
     """Unwrap `mesh` and bake the colours `query` returns into a texture.
 
@@ -342,6 +342,11 @@ def bake(
             the GLB gets.
         size: The texture is `size` x `size`.
         dilate: How many rounds to spread the colours past the chart edges.
+        fill: How many rounds to close the holes *inside* a chart - texels a
+            face claimed and the decoder had no colour for. **A different job
+            from `dilate`**, which only has to survive a bilinear tap across a
+            seam; a hole is as wide as the latent's gap and needs as many
+            rounds as it is deep.
 
     Returns:
         The unwrapped mesh carrying the texture, and what the bake counted.
@@ -390,14 +395,32 @@ def bake(
     report.texels_covered = int(filled.sum())
     # **A texel the decoder never saw comes back exactly zero**, the same test
     # `_apply_vertex_colors` counts vertices with. Black paint is a different
-    # thing and does not land on exactly zero, so the two are separable - and
-    # the dilation cannot help here, because it fills only what nothing wrote.
-    report.texels_black = int((filled & (colour[:, :3].abs().sum(dim=1) == 0)).sum())
+    # thing and does not land on exactly zero, so the two are separable.
+    wrote_nothing = filled & (colour[:, :3].abs().sum(dim=1) == 0)
+    report.texels_black = int(wrote_nothing.sum())
+    # **One of those is a hole, not a black texel, so the dilation is told so.**
+    # It had been written, which is exactly what the dilation steps over, and
+    # the count came out identical on both sides of the pass for that reason.
+    # Handing it back as unwritten is all it takes for its neighbours to fill
+    # it. Measured 2026-09-13 on the reference robot: 35,992 of them, in the
+    # shoulders, the hips and behind the wheels - places a ray reaches and the
+    # decoder's latent does not. `texels_black` still counts them, because how
+    # much of the atlas was guessed at is worth knowing.
     colour = colour.view(size, size, channels)
-    filled_grid = filled.view(size, size)
-    colour, rounds = _dilate(colour, filled_grid, dilate)
+    # **The holes are closed first, from the inside out.** They sit in the
+    # middle of a chart, so the spreading that follows would reach only their
+    # rim; `fill` is sized for how deep they are, `dilate` for a bilinear tap.
+    has_colour = (filled & ~wrote_nothing).view(size, size)
+    colour, filled_rounds = _dilate(colour, has_colour, fill)
+    report.fill_rounds = filled_rounds
+    # Then the ordinary spreading past the chart edges, from everything that
+    # now has a colour.
+    colour, rounds = _dilate(colour, filled.view(size, size), dilate)
     report.dilate_rounds = rounds
+    # The report keeps counting what the bake itself wrote, so `texels_covered`
+    # and `texels_unreached` still add up.
     report.texels_unreached = report.texels_total - int(filled.sum())
+    filled_grid = filled.view(size, size)
     report.texels_black_after_dilate = int(
         (filled_grid & (colour[:, :, :3].abs().sum(dim=2) == 0)).sum()
     )
