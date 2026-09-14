@@ -103,6 +103,15 @@ def m_capabilities(params: dict[str, Any], progress: Any) -> dict[str, Any]:
             "slat_guidance": {"type": "float", "default": 5.0, "min": 0.0, "max": 20.0},
             "seed": {"type": "int", "default": 0, "min": 0},
         },
+        # **What this runner needs of the card at its defaults, weights included**
+        # (hearth runner contract §3), so hearth refuses a generation while other
+        # processes hold the room rather than starting a load the driver may
+        # abort. Measured 2026-09-15 from outside through hearth, the runner's
+        # process family sampled every 0.5 s: image_to_mesh peaked at 18.02 GB
+        # (sample image, the defaults above), rounded up by about 6%. The
+        # runner's own `vram_peak_gb` metric said 10.49 GB for the same run: it
+        # counts what torch allocated, not what the card gave the process.
+        "vram_peak_gb": {"image_to_mesh": 19.1},
         "notes": (
             "spconv, flash_attn, kaolin and open3d are replaced by pure-torch launch-time "
             "shims (no build exists for Windows + ROCm). Attention uses fp16 flash when "
