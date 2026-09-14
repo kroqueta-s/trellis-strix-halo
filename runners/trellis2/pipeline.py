@@ -52,6 +52,53 @@ _SHAPE_ENCODER: Any = None
 _STEPS = StepCounter()
 
 
+#: The stages whose memory is written to stderr every tick. **The decoders**,
+#: because that is where the process is taken away at 1024: four aborts on
+#: 2026-09-13 all came within the first ten seconds of `decode`, after PAL
+#: reported `ErrorOutOfGpuMemory` on submit - while a heartbeat every ten
+#: seconds said nothing at all about those seconds.
+_TRACED_STAGES = frozenset({"decode", "tex_decode"})
+
+
+def _trace_memory(stage: str, elapsed: float, used_gb: float) -> None:
+    """One line of what torch holds, **on stderr, not as progress**.
+
+    Progress goes to the caller and a line a second would bury it; stderr is
+    what hearth keeps beside the output when a runner dies, which is the only
+    time these lines are wanted. `allocated` is what tensors use, `reserved`
+    what torch's allocator has taken from the driver, `used` what the driver
+    says the device has in use (shared memory included), and `retries` how
+    often the allocator had to free its cache to satisfy a request.
+    """
+    stats = torch.cuda.memory_stats()
+    gb = 1024**3
+    print(
+        f"[trellis2:mem] {stage} t={elapsed:.1f}s used={used_gb:.2f}GB "
+        f"reserved={torch.cuda.memory_reserved() / gb:.2f}GB "
+        f"allocated={torch.cuda.memory_allocated() / gb:.2f}GB "
+        f"peak_reserved={stats.get('reserved_bytes.all.peak', 0) / gb:.2f}GB "
+        f"peak_allocated={stats.get('allocated_bytes.all.peak', 0) / gb:.2f}GB "
+        f"largest_segment={_largest_segment_gb():.2f}GB "
+        f"retries={stats.get('num_alloc_retries', 0)} ooms={stats.get('num_ooms', 0)}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _largest_segment_gb() -> float:
+    """The largest block torch's allocator holds from the driver, in GB.
+
+    **A single allocation the driver cannot place** is one of the ways a submit
+    runs out of GPU memory while the total is far below the card, so the size
+    of the largest request that has been made is worth seeing.
+    """
+    try:
+        segments = torch.cuda.memory_snapshot()
+    except (RuntimeError, AttributeError):
+        return 0.0
+    return max((s.get("total_size", 0) for s in segments), default=0) / 1024**3
+
+
 class _DeviceWatch:
     """Report liveness, and **catch the moment dedicated VRAM is exceeded**.
 
@@ -105,6 +152,8 @@ class _DeviceWatch:
                     f"{self.stage or 'running'} {now - started:.0f}s elapsed / "
                     f"VRAM {used:.2f}GB (peak {self.peak_used_gb:.2f}GB)",
                 )
+            if self.stage in _TRACED_STAGES:
+                _trace_memory(self.stage, now - started, used)
             self._stop.wait(self.interval)
 
     def __enter__(self) -> _DeviceWatch:
