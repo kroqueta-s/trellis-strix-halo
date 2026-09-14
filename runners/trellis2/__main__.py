@@ -143,6 +143,13 @@ def m_capabilities(params: dict[str, Any], progress: Any) -> dict[str, Any]:
                 "texture_size": {"type": "int", "default": config.TEXTURE_SIZE, "min": 256},
             },
         },
+        # **What this runner needs of the card at its defaults, weights included**
+        # (contract §3), so hearth refuses a generation while others hold the
+        # room instead of the driver aborting this process minutes in. Measured
+        # 2026-09-14 at resolution 1024: image_to_mesh peaked at 16.96 GB (texture
+        # on) and texture_mesh at 10.76 GB, from a one-second sample, so both
+        # are rounded up by about 6%. Resolutions above 1024 were not measured.
+        "vram_peak_gb": {"image_to_mesh": 18.0, "texture_mesh": 11.5},
         "notes": (
             "spconv, flash_attn, o_voxel's hashmap and flex_gemm's sparse convolution and "
             "grid sampling are replaced by pure-torch launch-time shims (no build exists for "
