@@ -217,20 +217,33 @@ is quoted is the median of the rest:
 | Sparse structure | 13.2 s | 17.0 s | 20.3 s |
 | Structured latent | 31.6 s | 22.3 s | 163.3 s |
 | Decode to a mesh | 2.6 s | 5.2 s | 19.8 s |
-| **Generate the shape** | **47.7 s** | **46.6 s** | **207.5 s** |
+| Post-processing: the solid | 22.4 s | 41.0 s | 55.6 s |
+| **The shape, ready to print** | **70.1 s** | **87.6 s** | **260.5 s** |
 | Sample the texture latent | — | 13.1 s | 93.9 s |
-| Post-processing | 22.4 s | 53.6 s | 98.3 s |
+| Post-processing: the colours and the atlas | — | 12.6 s | 42.7 s |
+| **The texture** | — | **25.8 s** | **137.2 s** |
 | **End to end, weights already loaded** | **70.1 s** | **116.1 s** | **399.2 s** |
 | Faces out | 517,498 | 1,501,652 | 1,502,210 |
 | Peak VRAM | 12.6 GB | 5.9 GB | 16.5 GB |
 
 **They are not the same job.** TRELLIS.1 generates a surface and cleans it;
-TRELLIS.2 also samples a second latent for colour, carves a printable solid
-out of the surface, decodes the colours onto that solid's own grid and bakes a
-2048² texture — which is where its post-processing goes (at 1024: 13.4 s to
-decimate, 31.2 s to carve, smooth and snap, 37.2 s for the colours, 5.5 s for
-the atlas, 6.8 s to make it a manifold). Both come back watertight, in one part and
+TRELLIS.2 also samples a second latent for colour, carves a printable solid out
+of the surface, decodes the colours onto that solid's own grid and bakes a
+2048² texture. **The post-processing is split above by what it serves**, because
+half of it is not about the shape at all: at 1024 the solid's share is 13.4 s to
+decimate, 31.2 s to carve, smooth and snap, 6.8 s to make it a manifold and
+about 4 s for the rest, and the colour's share is 37.2 s to decode the colours
+and 5.5 s for the atlas. Both runners come back watertight, in one part and
 consistently wound, checked on the meshes these numbers came from.
+
+**Two things to know before reading the split.** Decoding the colours is filed
+under the texture because that is what usually wants it, but it is what puts the
+vertex colours on the print mesh too - **ask for `vertex_colors` without a
+texture and that 37.2 s belongs to the shape**, which then costs more than the
+row above says. And **every figure is a median**, so the rows do not add up to
+the total: the median of a sum is not the sum of the medians. The gap is under
+three seconds everywhere in this table, and it is that and nothing else - not a
+stage nobody counted.
 
 TRELLIS.1's post-processing was 60 s when this table was first written; the
 debris removal no longer scales with the part count (see
