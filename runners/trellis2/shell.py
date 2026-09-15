@@ -45,7 +45,7 @@ from typing import Any
 import numpy as np
 import torch
 import trimesh
-from scipy import ndimage, sparse
+from scipy import ndimage
 from scipy.spatial import cKDTree
 
 # The four cells around a lattice edge, listed so that the quad's normal points
@@ -440,21 +440,13 @@ def _smooth_taubin(
     who = edges[:, 0]
     count = np.bincount(who, minlength=len(vertices)).astype(np.float64)
     live = count > 0
-    # **The neighbourhood is the same every round, so it is built once.** Doing
-    # the averaging with `np.add.at` instead means walking twelve million edge
-    # entries per pass through numpy's unbuffered scatter, which is its slow
-    # path: measured 2026-09-15 on a 1.5 M-face solid, 9.15 s of the carve
-    # against 0.92 s for one sparse matrix reused across the passes, agreeing
-    # to 5e-16. A row of `average` holds a vertex's neighbours, each weighted
-    # by one over how many there are, so a pass is a single matrix product.
-    adjacency = sparse.csr_matrix(
-        (np.ones(len(who)), (who, edges[:, 1])), shape=(len(vertices), len(vertices))
-    )
-    average = sparse.diags(1.0 / np.where(live, count, 1.0)) @ adjacency
+    safe = np.where(live, count, 1.0)[:, None]
     moving = vertices.copy()
     for _ in range(int(rounds)):
         for step in (lam, mu):
-            delta = np.where(live[:, None], average @ moving - moving, 0.0)
+            total = np.zeros_like(moving)
+            np.add.at(total, who, moving[edges[:, 1]])
+            delta = np.where(live[:, None], total / safe - moving, 0.0)
             moving += step * delta
     moved = np.linalg.norm(moving - vertices, axis=1)
     return moving, float(np.median(moved)), float(np.percentile(moved, 99))
